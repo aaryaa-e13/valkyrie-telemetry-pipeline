@@ -102,8 +102,61 @@ services:
       TOPIC_NAME: ${TOPIC_NAME:-game-events}
       LOG_LEVEL: ${SIM_LOG_LEVEL:-INFO}
     volumes:
-      - ./manifests:/app/manifests
+      # Long syntax with create_host_path: false -> fail loudly if the folder is
+      # missing, instead of Docker silently creating it owned by root.
+      # `make dirs` creates it with your user.
+      - type: bind
+        source: ./manifests
+        target: /app/manifests
+        bind:
+          create_host_path: false
     mem_limit: 256m
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Spark Structured Streaming: Kafka -> raw Parquet (profile: spark).
+  # Local mode inside one container: driver + executors share one JVM.
+  # Memory: 2g JVM heap + ~1g headroom (off-heap, metaspace, Python) = 3g limit.
+  # ---------------------------------------------------------------------------
+  spark:
+    profiles: ["spark"]
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+    image: valkyrie-spark:dev
+    container_name: valkyrie-spark
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      SPARK_MASTER: ${SPARK_MASTER:-local[4]}
+      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-2g}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TOPIC_NAME: ${TOPIC_NAME:-game-events}
+      TRIGGER_INTERVAL: ${TRIGGER_INTERVAL:-10 seconds}
+      MAX_OFFSETS_PER_TRIGGER: ${MAX_OFFSETS_PER_TRIGGER:-50000}
+      RAW_OUTPUT_PATH: /data/lake/raw/game_events
+      RAW_CHECKPOINT_PATH: /data/checkpoints/raw_to_parquet
+      LOG_LEVEL: ${SPARK_JOB_LOG_LEVEL:-INFO}
+    volumes:
+      # Parquet output + checkpoints (git-ignored). See simulator for why long syntax.
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false
+      # Run manifests, read-only, for verify_manifest.
+      - type: bind
+        source: ./manifests
+        target: /app/manifests
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - "${SPARK_UI_PORT:-4040}:4040"         # Spark UI: http://localhost:4040
+    mem_limit: ${SPARK_MEM_LIMIT:-3g}
+    init: true                                # forwards SIGTERM so the job stops cleanly
+    stop_grace_period: 60s                    # time to finish/abort the current batch
     restart: "no"
 
 volumes:

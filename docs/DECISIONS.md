@@ -146,6 +146,49 @@ Short decision records: context, decision, tradeoffs. Newest phase last.
 - Kafka (and `kafka-init`) are *core* services with no profile. Spark (`spark`) and the simulator
   (`sim`) each get a profile, so only what is needed runs.
 
+### D1.12 Raw job details (slice c)
+- **Connector JARs are baked into the image at build time** (`docker/spark/fetch_kafka_jars.sh`).
+  It resolves `spark-sql-kafka-0-10_2.13:4.1.4`, adds `kafka-clients-3.9.1`, `commons-pool2-2.12.1`
+  and the token provider, and skips JARs Spark already ships (lz4, snappy, slf4j, hadoop), so a
+  library is never on the classpath in two versions. The container needs no internet at runtime.
+  The alternative, `--packages` at startup, downloads on every fresh container and fails offline.
+- **Connector vs broker:** `kafka-clients` 3.9.1 with broker 4.3.2 is verified working. Kafka 4.x
+  dropped support only for clients older than 2.1.
+- **`failOnDataLoss=true`:** if retention deletes offsets we have not read yet, the job stops
+  instead of silently skipping data. Losing data should be loud.
+- **`startingOffsets=earliest`** applies only to the very first run. After that the checkpoint
+  decides where to start. Changing the option later has no effect, a common surprise.
+- **Parse failures never fail a batch.** `from_json` runs in PERMISSIVE mode, and timestamps use
+  `try_to_timestamp`, because Spark 4 has ANSI mode on by default, where `to_timestamp` throws on
+  bad input. `parse_ok=false` and `raw_value` is kept. A real dead-letter queue comes in Phase 3.
+- **`ingest_time = current_timestamp()`** is one value per micro-batch, not per row. The session
+  time zone is forced to UTC so `ingest_date` doesn't depend on the container's time zone.
+- **Started with plain `python -m`, not `spark-submit`:** Python is then PID 1 (via `init: true`)
+  and receives SIGTERM, so it can stop the query cleanly (exit 0, "query stopped").
+  `spark.driver.memory` still applies, because PySpark passes builder configs to the JVM launcher.
+- **Measured (2026-11-14, tiny data):** Spark 626 MiB of 3 GiB, Kafka 523 MiB of 1 GiB.
+- **Small files observed:** the first batch wrote 5 Parquet files for 37 rows (one per Kafka
+  partition with data). See D1.8.
+
+### D1.14 Phase 1 produces duplicate rows. This is why Phase 2 exists.
+- **Shown in slice (c):** seed 501 was sent twice (two producer sessions, identical `event_id`s).
+  The raw job wrote both copies. `verify_manifest` against the first seed-501 manifest:
+  13 expected ids, 13 found, **26 rows, 13 duplicate rows** (every id twice). That is PASS for
+  "nothing lost" but **FAIL with `--fail-on-duplicates`**.
+- **Why nothing upstream prevented it:**
+  - Producer idempotence removes duplicates only from one producer session's internal retries.
+    A re-run, a crashed and restarted simulator, or a client that retries at the application
+    level creates a new session.
+  - Spark's checkpoint plus the file sink prevent duplicate *files* from a re-run *batch*
+    (exactly-once *processing* of Kafka offsets). They know nothing about two different Kafka
+    messages that carry the same event.
+- **Consequence:** the raw layer is "at-least-once per event". Counting rows would double-count.
+- **Phase 2 fix:** Delta Lake + `MERGE` on `event_id` (idempotent upsert) and streaming dedupe
+  with a watermark. The Phase 2 bar is `verify_manifest --fail-on-duplicates` = PASS after
+  deliberately sending duplicates.
+- **How to say it:** "Kafka plus Spark checkpoints give exactly-once *processing* of offsets.
+  End-to-end *effectively-once* needs a stable event id and an idempotent sink."
+
 ### D1.13 Plan: simulator pacing modes + deliberate lateness (not built yet; before Phase 2)
 Rule: **the event content stays deterministic; only *when* it is sent changes.** The generator
 stays a pure function that builds the timeline. A new *scheduler* layer decides send times.

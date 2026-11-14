@@ -12,7 +12,12 @@ UV := $(shell command -v uv 2>/dev/null || echo $(HOME)/.local/bin/uv)
 SEED ?= 42
 
 .DEFAULT_GOAL := help
-.PHONY: help env up down ps logs topics describe-topic venv sim-dry sim-local sim-tiny sim consume test-unit lint
+
+.PHONY: dirs
+dirs: ## Create bind-mount folders owned by you (Docker would create them as root)
+	mkdir -p data manifests
+
+.PHONY: help env up down ps logs topics describe-topic venv sim-dry sim-local sim-tiny sim consume test-unit lint spark-build spark-up spark-stop spark-logs verify test-spark
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -54,13 +59,13 @@ venv: ## Create .venv (Python 3.11 via uv) and install pinned dev dependencies
 sim-dry: ## Print tiny-run events without Kafka (SEED=42)
 	$(PY) -m simulator.main --config simulator/config.tiny.yaml --seed $(SEED) --dry-run
 
-sim-tiny: ## Send a tiny run (~10-14 events) from the laptop via localhost:9092 (SEED=42)
+sim-tiny: dirs ## Send a tiny run (~10-14 events) from the laptop via localhost:9092 (SEED=42)
 	$(PY) -m simulator.main --config simulator/config.tiny.yaml --seed $(SEED)
 
-sim-local: ## Send a default run from the laptop via localhost:9092 (SEED=42)
+sim-local: dirs ## Send a default run from the laptop via localhost:9092 (SEED=42)
 	$(PY) -m simulator.main --config simulator/config.yaml --seed $(SEED)
 
-sim: ## Send a tiny run from the simulator container via kafka:29092 (SEED=42)
+sim: dirs ## Send a tiny run from the simulator container via kafka:29092 (SEED=42)
 	$(COMPOSE) --profile sim run --rm --build simulator --config simulator/config.tiny.yaml --seed $(SEED)
 
 test-unit: ## Run unit tests (no Docker needed)
@@ -68,3 +73,26 @@ test-unit: ## Run unit tests (no Docker needed)
 
 lint: ## Run ruff
 	$(VENV)/bin/ruff check .
+
+# --- Spark (container) --------------------------------------------------------
+
+spark-build: dirs ## Build the Spark image (pyspark 4.1.4 + Kafka connector)
+	$(COMPOSE) --profile spark build spark
+
+spark-up: dirs ## Start the streaming job Kafka -> raw Parquet (background)
+	$(COMPOSE) --profile spark up -d spark
+
+spark-stop: ## Stop the streaming job gracefully (checkpoint keeps its position)
+	$(COMPOSE) --profile spark stop spark
+
+spark-logs: ## Follow streaming job logs
+	$(COMPOSE) --profile spark logs -f spark
+
+verify: dirs ## Compare raw Parquet with a run manifest (MANIFEST=manifests/run_X.json)
+	@test -n "$(MANIFEST)" || (echo "usage: make verify MANIFEST=manifests/run_X.json" && exit 2)
+	$(COMPOSE) --profile spark run --rm --no-deps -T spark \
+		python -m streaming.verify_manifest --manifest /app/$(MANIFEST)
+
+test-spark: dirs ## Run Spark transformation tests inside the Spark image
+	$(COMPOSE) --profile spark run --rm --no-deps -T -v ./:/app:ro spark \
+		python -m pytest tests/spark -q -p no:cacheprovider

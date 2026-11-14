@@ -55,3 +55,24 @@ Template:
 - **Root cause:** `--timeout-ms 8000` means "exit if no message arrives for 8 s". The tool
   reports that normal exit as an error.
 - **Fix:** None needed. Check the final line, `Processed a total of N messages`.
+
+### Spark job crashed at start: `mkdir of file:/data/lake/raw/game_events/_spark_metadata failed` (Phase 1c)
+- **Symptom:** `make spark-up` started the container, which exited with code 1 a few seconds
+  later. The only clue was a Java stack trace (`java.io.IOException: mkdir ... failed`). My
+  "wait for the first batch" check also hung, because it only looked for JSON log lines.
+- **Root cause:** `./data` was owned by **root** (`drwxr-xr-x 0 0`), while the container runs as
+  uid 1000. An earlier `docker compose run spark ...` (the connector check) mounted `./data`
+  before it existed, and **Docker creates a missing bind-mount folder as root**. The later
+  `mkdir -p data` in the Makefile did nothing, because the folder already existed.
+- **Fix:**
+  1. Bind mounts use the long syntax with `bind.create_host_path: false`, so a missing folder
+     now fails loudly instead of silently becoming root-owned.
+  2. A `make dirs` target creates `data/` and `manifests/` as your user, and every Spark and
+     simulator target depends on it.
+  3. Repaired the existing empty folder with `chown 1000:1000` from a root container (no sudo,
+     nothing deleted).
+  4. The job now catches start-up failures and logs one structured `failed to start query`
+     line, so the cause is visible in `make spark-logs` without reading a stack trace.
+- **Lesson:** With bind mounts, file ownership is decided by the uid inside the container plus
+  whoever created the folder first. Create host folders yourself and run containers as a
+  non-root uid that matches yours. When waiting for a log line, also watch for failure.

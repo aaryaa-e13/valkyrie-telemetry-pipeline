@@ -1,0 +1,9 @@
+# Spark container dependencies (pinned). pyspark must match the Kafka connector version.
+pyspark==4.1.4
+py4j==0.10.9.9
+# Test runner for tests/spark (runs inside this image).
+pytest==9.2.0
+iniconfig==2.3.1
+packaging==26.3
+pluggy==1.7.0
+pygments==2.21.0
