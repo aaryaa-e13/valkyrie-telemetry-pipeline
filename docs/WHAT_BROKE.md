@@ -76,3 +76,22 @@ Template:
 - **Lesson:** With bind mounts, file ownership is decided by the uid inside the container plus
   whoever created the folder first. Create host folders yourself and run containers as a
   non-root uid that matches yours. When waiting for a log line, also watch for failure.
+
+### `date +%s%3N` printed nanoseconds, not milliseconds (Phase 1d)
+- **Symptom:** A seed meant to be epoch milliseconds (13 digits) came out as
+  `1794679946598044635` (19 digits).
+- **Root cause:** This Ubuntu ships **uutils coreutils 0.8.0** (the Rust rewrite) as `date`. It
+  ignores the `%3N` width modifier and always prints all 9 nanosecond digits. GNU `date`
+  would print 3.
+- **Fix:** The orchestrator (slice d2) generates seeds in Python
+  (`time.time_ns() // 1_000_000`) instead of shelling out to `date`.
+- **Lesson:** Don't assume GNU coreutils behaviour in scripts. Generate values in the language
+  you control, and check the output's shape.
+
+### Status offsets parser crashed on dict input (Phase 1d, caught by unit test)
+- **Symptom:** `TypeError: unhashable type: 'dict'` in `parse_offsets`.
+- **Root cause:** `raw in {"None", "null", ""}` checks membership in a set, which hashes `raw`.
+  A dict can't be hashed.
+- **Fix:** Only do that check when `raw` is a string.
+- **Lesson:** This is why the status logic is pure and unit-tested on the laptop. The bug would
+  otherwise have appeared only as a warning inside the running Spark job.

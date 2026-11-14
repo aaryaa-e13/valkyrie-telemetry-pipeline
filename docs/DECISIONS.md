@@ -189,6 +189,52 @@ Short decision records: context, decision, tradeoffs. Newest phase last.
 - **How to say it:** "Kafka plus Spark checkpoints give exactly-once *processing* of offsets.
   End-to-end *effectively-once* needs a stable event id and an idempotent sink."
 
+### D1.15 End-to-end checks: how we know Spark has processed a run (slice d)
+Built in steps: d1 = manifest offsets + status file (this entry); d2/d3 add the orchestrator.
+
+**Finding: the progress event fires only after the batch is committed (Spark 4.1.4).**
+- *Source* (tag `v4.1.4`, `MicroBatchExecution.executeOneBatch`): `runBatch`, then
+  `sink.addBatch`. For the Parquet sink, `FileStreamSink.addBatch` then `FileFormatWriter.write`
+  then `ManifestFileCommitProtocol.commitJob` then `fileLog.add(batchId)`, so
+  **`_spark_metadata/N`** is written before `addBatch` returns. Next, `markMicroBatchEnd` writes
+  `commitLog.add`, which is **`commits/N`**. Only then does `finishTrigger` call
+  `updateProgress`, which posts the `QueryProgressEvent`. The listener bus delivers events
+  asynchronously, which can only make it later still.
+- *Experiment* (2026-11-14, `rate` source to Parquet, 1 s trigger, listener checks files when
+  the event arrives): **29 batches, 0 violations.** Both files existed every time.
+- *Gotcha found by the experiment:* every 10th batch (default `compactInterval=10`) the sink log
+  entry is `_spark_metadata/9.compact`, not `9`. A tool that looks for plain `N` files would
+  wrongly conclude "not committed". That is one more reason not to parse Spark's internal
+  files, and to read Parquet only through Spark.
+- *Decision:* the progress event is a safe "batch durable" signal, so we use it. Fallback if a
+  future Spark version changes the order: poll the checkpoint's `commits/N`.
+
+**Status file** (`data/status/raw_to_parquet.json`, written by the job's progress listener).
+- Contents: `query_id`, `last_batch` (batch id, run id, row count, start and end offsets), and
+  the last 100 batches. It is written atomically (temp file + rename), so readers never see a
+  partial file. A write error only logs a warning and never stops the streaming query.
+- Why our own file instead of parsing `offsets/N` and `commits/N`: the checkpoint layout is
+  internal and undocumented (see the `.compact` gotcha). Our file is small, documented and
+  unit-tested. Cost: one more moving part in the job.
+- History survives restarts if `query_id` is unchanged (it is stored in the checkpoint). A new
+  `query_id` means the checkpoint was reset, so history starts fresh rather than mixing in
+  offsets from a different query.
+
+**Manifest v2** adds `kafka_offsets {partition: {min, max, count}}` from the delivery callbacks
+(acknowledged messages only).
+- **Catch-up rule:** a run is processed when, for every partition it wrote to,
+  `committed end_offset > max`. Spark end offsets are exclusive ("next offset to read"), hence
+  `>` and not `>=`.
+- Checked live: run offsets p2 5..10 and p4 7..13; status end offsets p2=11, p4=14, so caught up.
+  Verify: 13/13, 0 duplicates.
+- **Readers accept v1 and v2** (`common/manifest_reader.py`). v1 manifests (seeds 42 to 601) still
+  verify; they just cannot be used for offset-based waiting.
+
+**Duplicates stay a report, not a failure, unless `--fail-on-duplicates` is given.** Plain
+`make verify` on seed 501 reports "13 duplicate rows reported, not failing" and passes. That is
+the Phase 2 motivation (D1.14) and must stay visible. demo and smoke will pass
+`--fail-on-duplicates`, because they use a fresh seed and expect zero duplicates.
+
 ### D1.13 Plan: simulator pacing modes + deliberate lateness (not built yet; before Phase 2)
 Rule: **the event content stays deterministic; only *when* it is sent changes.** The generator
 stays a pure function that builds the timeline. A new *scheduler* layer decides send times.

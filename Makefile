@@ -15,7 +15,7 @@ SEED ?= 42
 
 .PHONY: dirs
 dirs: ## Create bind-mount folders owned by you (Docker would create them as root)
-	mkdir -p data manifests
+	mkdir -p data data/status manifests
 
 .PHONY: help env up down ps logs topics describe-topic venv sim-dry sim-local sim-tiny sim consume test-unit lint spark-build spark-up spark-stop spark-logs verify test-spark
 

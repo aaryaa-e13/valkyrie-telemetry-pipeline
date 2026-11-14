@@ -100,3 +100,44 @@ def test_write_manifest_is_valid_json_and_leaves_no_temp_files(tmp_path: Path) -
     assert path.name == "run_test.json"
     assert json.loads(path.read_text())["run_id"] == "test"
     assert [p.name for p in tmp_path.iterdir()] == ["run_test.json"]
+
+
+# --- Kafka offsets (manifest v2) ----------------------------------------------------
+
+def test_tracker_records_min_max_count_per_partition() -> None:
+    tracker = DeliveryTracker()
+    for i, (partition, offset) in enumerate([(3, 20), (3, 18), (0, 5), (3, 25)]):
+        tracker.on_delivery(f"e{i}", "m1", None, _FakeMsg(partition, offset))  # type: ignore[arg-type]
+    o3, o0 = tracker.offsets_by_partition[3], tracker.offsets_by_partition[0]
+    assert (o3.min, o3.max, o3.count) == (18, 25, 3)
+    assert (o0.min, o0.max, o0.count) == (5, 5, 1)
+
+
+def test_failed_deliveries_do_not_record_offsets() -> None:
+    tracker = DeliveryTracker()
+    tracker.on_delivery("e1", "m1", _FakeErr(), None)  # type: ignore[arg-type]
+    assert tracker.offsets_by_partition == {}
+
+
+def test_manifest_v2_writes_offsets_with_string_partition_keys() -> None:
+    cfg = SimulatorConfig(num_matches=2)
+    events = generate_events(cfg, START)
+    tracker = DeliveryTracker()
+    for i, e in enumerate(events):
+        tracker.on_delivery(e.event_id, e.match_id, None, _FakeMsg(i % 2, 100 + i))  # type: ignore[arg-type]
+    m = build_manifest(
+        run_id="t", config=cfg.public_dict(), start_time=START, events=events,
+        delivered_ids=tracker.delivered_ids, failed_ids=[],
+        partitions_by_match=tracker.partitions_by_match,
+        offsets_by_partition=tracker.offsets_by_partition,
+    )
+    assert m["manifest_version"] == 2
+    assert set(m["kafka_offsets"]) == {"0", "1"}
+    assert sum(o["count"] for o in m["kafka_offsets"].values()) == len(events)
+    assert m["kafka_offsets"]["0"]["min"] == 100
+    json.dumps(m)  # must stay JSON-serialisable
+
+
+def test_manifest_without_offsets_still_has_empty_section() -> None:
+    m, _ = _manifest()
+    assert m["kafka_offsets"] == {}

@@ -6,6 +6,13 @@ delivered; failed events are listed separately.
 
 The checksum is order-independent (sha256 over sorted ids), so it can be
 compared with ids read back from Parquet/Delta in any order.
+
+Versions:
+    1  event ids, counts, checksum.
+    2  adds `kafka_offsets`: per partition, the min/max offset and count of this
+       run's acknowledged messages. A consumer has fully read the run once its
+       committed (exclusive) end offset is > max for every listed partition.
+Readers must accept both versions (see common/manifest_reader.py).
 """
 
 from __future__ import annotations
@@ -22,7 +29,7 @@ from typing import Any
 
 from simulator.events import GameEvent
 
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 CHECKSUM_ALGORITHM = "sha256(sorted event_ids joined by newline)"
 
 
@@ -41,6 +48,7 @@ def build_manifest(
     delivered_ids: Iterable[str],
     failed_ids: Iterable[str],
     partitions_by_match: Mapping[str, set[int]],
+    offsets_by_partition: Mapping[int, Any] | None = None,
     include_event_ids: bool = True,
     interrupted: bool = False,
 ) -> dict[str, Any]:
@@ -54,6 +62,8 @@ def build_manifest(
         delivered_ids: Ids acknowledged by the broker.
         failed_ids: Ids whose delivery failed.
         partitions_by_match: Kafka partition(s) each match landed on.
+        offsets_by_partition: partition -> object with `min`, `max`, `count` of the
+            acknowledged offsets (see simulator.producer.PartitionOffsets).
         include_event_ids: If False, omit per-match id lists (smaller file for big runs).
         interrupted: True if the run was stopped early.
     """
@@ -95,6 +105,11 @@ def build_manifest(
         "delivered_checksum": {
             "algorithm": CHECKSUM_ALGORITHM,
             "value": event_ids_checksum(delivered),
+        },
+        # JSON object keys must be strings, so partitions are written as "0", "1", ...
+        "kafka_offsets": {
+            str(p): {"min": o.min, "max": o.max, "count": o.count}
+            for p, o in sorted((offsets_by_partition or {}).items())
         },
         "matches": matches,
         "failed_event_ids": failed,

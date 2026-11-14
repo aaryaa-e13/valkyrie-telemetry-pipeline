@@ -32,6 +32,7 @@ from pyspark.sql.streaming import StreamingQueryListener
 from common.logging_setup import setup_logging
 from streaming.config import RawJobConfig
 from streaming.schemas import EVENT_JSON_SCHEMA, EVENT_TIME_FORMAT, REQUIRED_FIELDS
+from streaming.status import batch_record, read_status, update_status, write_status
 
 log = logging.getLogger("streaming.raw_to_parquet")
 
@@ -104,7 +105,19 @@ def to_raw_rows(kafka_df: DataFrame) -> DataFrame:
 
 
 class ProgressLogger(StreamingQueryListener):
-    """Log one structured line per micro-batch (batch id, rows, offsets, timing)."""
+    """Per completed micro-batch: log one structured line and update the status file.
+
+    Spark posts the progress event only after the batch's sink commit
+    (_spark_metadata/N) and checkpoint commit (commits/N) are written, so the
+    status file never claims a batch that is not durable (see D1.15).
+    """
+
+    def __init__(self, query_name: str, status_path: str | None) -> None:
+        super().__init__()
+        self._query_name = query_name
+        self._status_path = status_path
+        # Keep history across restarts: start from what is on disk.
+        self._status = read_status(status_path) if status_path else None
 
     def onQueryStarted(self, event) -> None:  # noqa: N802 (Spark API name)
         log.info("query started", extra={"fields": {
@@ -123,6 +136,24 @@ class ProgressLogger(StreamingQueryListener):
         }
         level = logging.INFO if p.numInputRows > 0 else logging.DEBUG
         log.log(level, "batch progress", extra={"fields": fields})
+        if self._status_path and source is not None:
+            self._write_status(p, source)
+
+    def _write_status(self, p, source) -> None:
+        """Update the status file. Never raises: status is diagnostics, not data."""
+        try:
+            record = batch_record(
+                batch_id=p.batchId, run_id=str(p.runId), num_input_rows=p.numInputRows,
+                timestamp=p.timestamp, trigger_ms=p.durationMs.get("triggerExecution"),
+                start_offset=source.startOffset, end_offset=source.endOffset,
+            )
+            self._status = update_status(
+                self._status, record, query_name=self._query_name, query_id=str(p.id)
+            )
+            write_status(self._status, self._status_path)
+        except Exception as exc:  # noqa: BLE001 - must not kill the streaming query
+            log.warning("could not write status file", extra={"fields": {
+                "path": self._status_path, "error": str(exc)}})
 
     def onQueryIdle(self, event) -> None:  # noqa: N802
         pass
@@ -148,11 +179,12 @@ def run(cfg: RawJobConfig, master: str, driver_memory: str) -> int:
     """Start the streaming query and block until it stops. Returns an exit code."""
     spark = build_spark(cfg.query_name, master, driver_memory)
     spark.sparkContext.setLogLevel("WARN")
-    spark.streams.addListener(ProgressLogger())
+    spark.streams.addListener(ProgressLogger(cfg.query_name, cfg.status_path or None))
     log.info("starting", extra={"fields": {
         "spark_version": spark.version, "master": master, "driver_memory": driver_memory,
         "topic": cfg.topic, "output_path": cfg.output_path,
-        "checkpoint_path": cfg.checkpoint_path, "trigger": cfg.trigger_interval,
+        "checkpoint_path": cfg.checkpoint_path, "status_path": cfg.status_path,
+        "trigger": cfg.trigger_interval,
         "max_offsets_per_trigger": cfg.max_offsets_per_trigger}})
 
     try:

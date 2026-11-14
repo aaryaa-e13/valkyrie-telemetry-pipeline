@@ -22,6 +22,7 @@ class RawJobConfig:
     fail_on_data_loss: bool = True         # stop if Kafka deleted unread data
     output_path: str = "/data/lake/raw/game_events"
     checkpoint_path: str = "/data/checkpoints/raw_to_parquet"
+    status_path: str = "/data/status/raw_to_parquet.json"  # "" disables the status file
     trigger_interval: str = "10 seconds"
     query_name: str = "raw_to_parquet"
     log_level: str = "INFO"
@@ -55,6 +56,8 @@ class RawJobConfig:
             in {"1", "true", "yes"},
             output_path=get("RAW_OUTPUT_PATH", d.output_path),
             checkpoint_path=get("RAW_CHECKPOINT_PATH", d.checkpoint_path),
+            # Not via get(): an explicitly empty STATUS_PATH means "disabled".
+            status_path=env.get("STATUS_PATH", d.status_path),
             trigger_interval=get("TRIGGER_INTERVAL", d.trigger_interval),
             query_name=get("QUERY_NAME", d.query_name),
             log_level=get("LOG_LEVEL", d.log_level),

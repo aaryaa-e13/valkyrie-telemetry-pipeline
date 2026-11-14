@@ -11,11 +11,19 @@ truth) and check, for exactly those ids:
 Parquet is read with Spark, so only files committed in the sink's
 `_spark_metadata` log are seen (no half-written files from a killed batch).
 
+Accepts manifest v1 and v2 (see common/manifest_reader.py).
+
+Duplicates are always *reported*. They only cause FAIL with
+--fail-on-duplicates: Phase 1 deliberately shows duplicates (same seed sent
+twice) as the motivation for Phase 2, so plain verification must not hide
+them behind a failure.
+
 Usage (inside the Spark container):
     python -m streaming.verify_manifest --manifest manifests/run_X.json
     python -m streaming.verify_manifest --manifest ... --fail-on-duplicates
 
-Exit code: 0 = no missing ids (and no duplicates if --fail-on-duplicates), 1 otherwise.
+Exit code: 0 PASS, 1 FAIL (missing ids, or duplicates with --fail-on-duplicates),
+2 unusable manifest.
 """
 
 from __future__ import annotations
@@ -31,28 +39,37 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 from common.logging_setup import setup_logging
+from common.manifest_reader import ManifestError, load_manifest
 
 log = logging.getLogger("streaming.verify_manifest")
 
 
-def load_manifest_ids(path: Path) -> tuple[dict[str, Any], list[tuple[str, str]]]:
-    """Return the manifest and its (match_id, event_id) pairs.
+def evaluate(report: dict[str, Any], fail_on_duplicates: bool) -> tuple[str, list[str]]:
+    """Decide PASS/FAIL from a report. Returns (result, human-readable notes).
 
-    Raises:
-        ValueError: The manifest was written without event ids.
+    Missing ids always fail. Duplicates fail only if `fail_on_duplicates`.
     """
-    manifest = json.loads(path.read_text(encoding="utf-8"))
-    pairs: list[tuple[str, str]] = []
-    for match_id, entry in manifest["matches"].items():
-        if "event_ids" not in entry:
-            raise ValueError(f"{path} has no event_ids (run used --no-manifest-ids)")
-        pairs.extend((match_id, event_id) for event_id in entry["event_ids"])
-    return manifest, pairs
+    notes: list[str] = []
+    failed = False
+    if report["missing_ids"] > 0:
+        failed = True
+        notes.append(f"{report['missing_ids']} event ids are missing (data loss)")
+    if report["duplicate_rows"] > 0:
+        if fail_on_duplicates:
+            failed = True
+            notes.append(f"{report['duplicate_rows']} duplicate rows (--fail-on-duplicates)")
+        else:
+            notes.append(
+                f"{report['duplicate_rows']} duplicate rows reported, not failing "
+                "(expected in Phase 1 raw layer; use --fail-on-duplicates to enforce)"
+            )
+    return ("FAIL" if failed else "PASS"), notes
 
 
 def verify(spark: SparkSession, manifest_path: Path, parquet_path: str) -> dict[str, Any]:
-    """Compute the comparison report for one manifest."""
-    manifest, pairs = load_manifest_ids(manifest_path)
+    """Compute the comparison report for one manifest (v1 or v2)."""
+    manifest = load_manifest(manifest_path)
+    pairs = list(manifest.event_pairs)
     expected = spark.createDataFrame(pairs, "match_id string, event_id string")
     rows = spark.read.parquet(parquet_path)
 
@@ -74,8 +91,9 @@ def verify(spark: SparkSession, manifest_path: Path, parquet_path: str) -> dict[
     rows_matched = int(stats["rows_matched"])
     return {
         "manifest": str(manifest_path),
-        "run_id": manifest["run_id"],
-        "seed": manifest["seed"],
+        "manifest_version": manifest.version,
+        "run_id": manifest.run_id,
+        "seed": manifest.seed,
         "expected_unique_ids": expected_unique,
         "found_unique_ids": found_unique,
         "missing_ids": expected_unique - found_unique,
@@ -99,6 +117,11 @@ def main(argv: list[str] | None = None) -> int:
 
     setup_logging("INFO", component="verify_manifest")
     logging.getLogger("py4j").setLevel(logging.WARNING)
+    try:
+        load_manifest(args.manifest)  # fail fast, before starting a JVM
+    except (ManifestError, OSError) as exc:
+        log.error("unusable manifest", extra={"fields": {"error": str(exc)}})
+        return 2
     spark = (
         SparkSession.builder.appName("verify_manifest").master("local[2]")
         .config("spark.driver.memory", "1g")
@@ -113,12 +136,12 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         spark.stop()
 
-    ok = report["missing_ids"] == 0 and (
-        not args.fail_on_duplicates or report["duplicate_rows"] == 0
-    )
-    report["result"] = "PASS" if ok else "FAIL"
+    result, notes = evaluate(report, args.fail_on_duplicates)
+    report["fail_on_duplicates"] = args.fail_on_duplicates
+    report["notes"] = notes
+    report["result"] = result
     print(json.dumps(report, indent=2))
-    return 0 if ok else 1
+    return 0 if result == "PASS" else 1
 
 
 if __name__ == "__main__":

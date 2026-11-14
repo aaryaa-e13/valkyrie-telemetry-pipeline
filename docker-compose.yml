@@ -137,6 +137,7 @@ services:
       MAX_OFFSETS_PER_TRIGGER: ${MAX_OFFSETS_PER_TRIGGER:-50000}
       RAW_OUTPUT_PATH: /data/lake/raw/game_events
       RAW_CHECKPOINT_PATH: /data/checkpoints/raw_to_parquet
+      STATUS_PATH: /data/status/raw_to_parquet.json   # last committed batch (for tests)
       LOG_LEVEL: ${SPARK_JOB_LOG_LEVEL:-INFO}
     volumes:
       # Parquet output + checkpoints (git-ignored). See simulator for why long syntax.

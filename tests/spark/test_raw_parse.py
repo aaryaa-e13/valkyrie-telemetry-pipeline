@@ -6,7 +6,6 @@ Run with: make test-spark
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
 from datetime import UTC, datetime
 
 import pytest
@@ -23,20 +22,6 @@ KAFKA_SCHEMA = (
     "key binary, value binary, topic string, partition int, offset long, timestamp timestamp"
 )
 T = datetime(2026, 11, 14, 12, 0, 0, 123000, tzinfo=UTC)
-
-
-@pytest.fixture(scope="module")
-def spark() -> Iterator[SparkSession]:
-    session = (
-        SparkSession.builder.master("local[1]").appName("test_raw_parse")
-        .config("spark.sql.session.timeZone", "UTC")
-        .config("spark.sql.shuffle.partitions", "1")
-        .config("spark.ui.enabled", "false")
-        .getOrCreate()
-    )
-    session.sparkContext.setLogLevel("ERROR")
-    yield session
-    session.stop()
 
 
 def _event() -> GameEvent:

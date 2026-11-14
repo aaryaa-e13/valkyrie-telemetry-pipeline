@@ -32,12 +32,36 @@ log = logging.getLogger(__name__)
 
 
 @dataclass
+class PartitionOffsets:
+    """Offset range of this run's acknowledged messages in one partition."""
+
+    min: int
+    max: int
+    count: int = 1
+
+    def add(self, offset: int) -> None:
+        self.min = min(self.min, offset)
+        self.max = max(self.max, offset)
+        self.count += 1
+
+
+@dataclass
 class DeliveryTracker:
     """Records the broker's verdict for every message (fed by delivery callbacks)."""
 
     delivered_ids: list[str] = field(default_factory=list)
     failed_ids: list[str] = field(default_factory=list)
     partitions_by_match: dict[str, set[int]] = field(default_factory=lambda: defaultdict(set))
+    # partition -> offset range of acknowledged messages. Lets tests know exactly
+    # which offsets a consumer (Spark) must have processed to have seen this run.
+    offsets_by_partition: dict[int, PartitionOffsets] = field(default_factory=dict)
+
+    def _record_offset(self, partition: int, offset: int) -> None:
+        current = self.offsets_by_partition.get(partition)
+        if current is None:
+            self.offsets_by_partition[partition] = PartitionOffsets(offset, offset)
+        else:
+            current.add(offset)
 
     def on_delivery(
         self, event_id: str, match_id: str, err: KafkaError | None, msg: Message | None
@@ -56,6 +80,7 @@ class DeliveryTracker:
         assert msg is not None
         self.delivered_ids.append(event_id)
         self.partitions_by_match[match_id].add(msg.partition())
+        self._record_offset(msg.partition(), msg.offset())
         log.debug(
             "delivered",
             extra={"fields": {

@@ -102,6 +102,7 @@ def run(cfg: SimulatorConfig, dry_run: bool = False) -> int:
         delivered_ids=tracker.delivered_ids,
         failed_ids=tracker.failed_ids,
         partitions_by_match=tracker.partitions_by_match,
+        offsets_by_partition=tracker.offsets_by_partition,
         include_event_ids=cfg.manifest_include_event_ids,
         interrupted=interrupted,
     )
