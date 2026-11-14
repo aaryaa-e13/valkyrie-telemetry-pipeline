@@ -1,0 +1,86 @@
+# Project VALKYRIE - Docker Compose
+#
+# Services without a `profiles:` key are "core" and always start.
+# Heavier services get a profile so they only start when asked, e.g.
+#   docker compose --profile spark up -d
+# This keeps memory use low on a 10 GB WSL2 laptop.
+#
+# Every value has a default (${VAR:-default}), so this works without a .env file.
+
+name: valkyrie
+
+services:
+  # ---------------------------------------------------------------------------
+  # Kafka broker in KRaft mode (no ZooKeeper). One node acts as both the
+  # broker (stores messages) and the controller (manages cluster metadata).
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: ${KAFKA_IMAGE:-apache/kafka:4.3.2}
+    container_name: valkyrie-kafka
+    hostname: kafka
+    ports:
+      # Host port -> EXTERNAL listener, for tools running on your laptop.
+      - "${KAFKA_HOST_PORT:-9092}:9092"
+    environment:
+      # Fixed cluster id so the data volume is reused across restarts
+      # (a new id would not match the already-formatted storage).
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-MkU3OEVBNTcwNTJENDM2Qk}
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      # Three listeners:
+      #   INTERNAL  kafka:29092     -> other containers (Spark, simulator)
+      #   EXTERNAL  localhost:9092  -> your laptop
+      #   CONTROLLER kafka:9093     -> KRaft controller traffic only
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:${KAFKA_HOST_PORT:-9092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # Single broker => internal topics can only have 1 replica.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics must be created explicitly (see kafka-init) so partition count
+      # and retention are deliberate, not accidental defaults.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # JVM heap cap; container limit below leaves headroom for off-heap memory.
+      KAFKA_HEAP_OPTS: ${KAFKA_HEAP_OPTS:--Xms512m -Xmx512m}
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    mem_limit: ${KAFKA_MEM_LIMIT:-1g}
+    healthcheck:
+      # Healthy once the broker answers API requests on its internal listener.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:29092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # One-shot job: create topics, verify their config, then exit.
+  # Safe to re-run (idempotent).
+  # ---------------------------------------------------------------------------
+  kafka-init:
+    image: ${KAFKA_IMAGE:-apache/kafka:4.3.2}
+    container_name: valkyrie-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      TOPIC_NAME: ${TOPIC_NAME:-game-events}
+      TOPIC_PARTITIONS: ${TOPIC_PARTITIONS:-6}
+      TOPIC_REPLICATION_FACTOR: ${TOPIC_REPLICATION_FACTOR:-1}
+      TOPIC_RETENTION_MS: ${TOPIC_RETENTION_MS:-604800000}  # 7 days
+    volumes:
+      - ./docker/kafka/create-topics.sh:/scripts/create-topics.sh:ro
+    entrypoint: ["sh", "/scripts/create-topics.sh"]
+    mem_limit: 512m
+    restart: "no"
+
+volumes:
+  kafka-data:

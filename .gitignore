@@ -1,1 +1,14 @@
 CLAUDE.local.md
+
+# Local environment
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Pipeline output (data lake, checkpoints, simulator manifests)
+data/
+checkpoints/
+manifests/
