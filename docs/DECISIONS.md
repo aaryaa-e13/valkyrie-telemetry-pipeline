@@ -45,8 +45,14 @@ Short decision records: context, decision, tradeoffs. Newest phase last.
   size, so the risk is low.
 
 ### D1.6 Event envelope with `event_id` and `match_seq`
-- `event_id` (UUID v4) is created once, by the producer. It is the Phase 2 dedupe key: a retried
-  send keeps the same id, so duplicates are detectable.
+- `event_id` is a **UUID v5 derived from `match_id:match_seq`** (fixed namespace). This changed
+  from the planned random UUID v4 so that generation is deterministic: the same seed gives the same
+  ids, and a logical event always has the same id however often it is resent or regenerated. It
+  is the Phase 2 dedupe key. Consequence: re-running the simulator with the same seed sends
+  *duplicates* on purpose, so use a new seed for genuinely new data.
+- Determinism: one `random.Random(seed)` drives all choices in a fixed order. `event_time` starts
+  at `start_time` (default: now, so Phase 2 watermarks don't treat the data as ancient). Pass
+  `--start-time` for byte-identical runs. A golden unit test guards against accidental changes.
 - `match_seq` is a per-match sequence number starting at 1, with no gaps. It lets us (a) detect
   missing events (a gap), (b) detect duplicates (a repeated seq), and (c) restore the true order
   after shuffling, independent of clock timestamps. Two events in one match can share an
@@ -65,6 +71,22 @@ Short decision records: context, decision, tradeoffs. Newest phase last.
 - **Tradeoff:** Listing every id costs disk (about 37 bytes per event, so roughly 1.8 GB at 50M
   events). The checksum is tiny but only says *whether* sets differ, not *which* ids. We will
   store both, and the id list can be switched off for very large benchmark runs.
+- **Only broker-acknowledged events count as delivered.** The manifest is written after
+  `flush()`, from the delivery callbacks. Failed ids are listed separately, so ground truth never
+  includes an event Kafka didn't confirm. It is written atomically (temp file + rename).
+
+### D1.7b Producer settings
+- `acks=all` + `enable.idempotence=true`: the broker discards duplicates caused by the producer's
+  *internal* retries. This does not cover the simulator being re-run or crashing mid-run, which is
+  why downstream dedupe on `event_id` is still needed.
+- `partitioner=murmur2_random`: librdkafka (the Python client) defaults to a CRC32-based
+  partitioner, while Java clients use murmur2. Without this, the same `match_id` would land on
+  different partitions depending on which client produced it. Verified: the Java console
+  producer put both test keys on the same partitions (3 and 5) as the Python simulator.
+- `linger.ms=20` + lz4 compression: small batching delay for better throughput.
+  `delivery.timeout.ms=120000`: a message that can't be delivered in 2 min is reported as failed.
+- Preflight `list_topics` check: fail fast with exit code 2 if Kafka or the topic is missing,
+  instead of waiting for delivery timeouts.
 
 ### D1.8 Small-files tradeoff of the 10-second trigger
 - **Decision:** The Spark job uses `trigger(processingTime="10 seconds")` and

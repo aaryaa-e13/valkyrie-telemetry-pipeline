@@ -82,5 +82,29 @@ services:
     mem_limit: 512m
     restart: "no"
 
+  # ---------------------------------------------------------------------------
+  # Event simulator (profile: sim). One-shot: generates a run, sends it, writes
+  # the manifest to ./manifests, then exits. Usage:
+  #   docker compose --profile sim run --rm simulator --config simulator/config.tiny.yaml
+  # ---------------------------------------------------------------------------
+  simulator:
+    profiles: ["sim"]
+    build:
+      context: .
+      dockerfile: docker/simulator/Dockerfile
+    image: valkyrie-simulator:dev
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      # Inside the Docker network we use the INTERNAL listener, not localhost.
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TOPIC_NAME: ${TOPIC_NAME:-game-events}
+      LOG_LEVEL: ${SIM_LOG_LEVEL:-INFO}
+    volumes:
+      - ./manifests:/app/manifests
+    mem_limit: 256m
+    restart: "no"
+
 volumes:
   kafka-data:

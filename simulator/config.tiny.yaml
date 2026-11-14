@@ -1,0 +1,12 @@
+# Tiny run (~10-14 events) for eyeballing messages in the console consumer.
+# 2 matches x (1 start + 2 picks + 1-2 kills + 0-2 items + 1 end).
+seed: 42
+num_matches: 2
+players_per_team: 1
+kills_per_match_min: 1
+kills_per_match_max: 2
+items_per_player_min: 0
+items_per_player_max: 1
+match_duration_s_min: 60
+match_duration_s_max: 120
+match_interval_s: 5

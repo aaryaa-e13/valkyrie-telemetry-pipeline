@@ -1,0 +1,20 @@
+[project]
+name = "valkyrie"
+version = "0.1.0"
+description = "Fault-tolerant game telemetry pipeline (portfolio project)"
+requires-python = "==3.11.*"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: needs running Docker services (Kafka); run with `make test-integration`",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]

@@ -1,0 +1,3 @@
+# Runtime dependencies for the simulator (pinned; resolved for Python 3.11 on 2026-11-14).
+confluent-kafka==2.16.1
+PyYAML==6.0.3

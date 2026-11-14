@@ -1,0 +1,29 @@
+# Default simulator settings. Override with SIM_<FIELD> env vars or CLI flags.
+
+# --- Generation (same seed + same start_time => identical events and event_ids) ---
+seed: 42
+num_matches: 2
+players_per_team: 5          # 1..10 (each player in a match gets a unique champion)
+player_pool_size: 5000       # players are drawn from p_000000..p_004999 (repeats across matches)
+kills_per_match_min: 5
+kills_per_match_max: 15
+items_per_player_min: 2
+items_per_player_max: 6
+match_duration_s_min: 1200
+match_duration_s_max: 2400
+match_interval_s: 30         # seconds between consecutive match starts
+patch_version: "14.3"
+regions: [EUW, NA, KR, BR]
+# start_time: 2026-11-14T12:00:00Z   # omit = "now" (keeps events fresh for watermarks)
+
+# --- Kafka ---
+bootstrap_servers: localhost:9092    # from the laptop; containers use kafka:29092
+topic: game-events
+client_id: valkyrie-simulator
+flush_timeout_s: 30
+rate_per_s: 0                # 0 = as fast as possible
+
+# --- Output ---
+manifest_dir: manifests
+manifest_include_event_ids: true
+log_level: INFO
