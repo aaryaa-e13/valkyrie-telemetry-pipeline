@@ -88,6 +88,24 @@ Short decision records: context, decision, tradeoffs. Newest phase last.
 - Preflight `list_topics` check: fail fast with exit code 2 if Kafka or the topic is missing,
   instead of waiting for delivery timeouts.
 
+### D1.7c Known limitation: burst mode sends events from the future (found in slice b)
+- **Observation:** The generator builds the whole match timeline up front
+  (`event_time = start_time + game offset`), and the simulator then sends every event
+  immediately. So `event_time` is simulated game time running *ahead* of wall-clock time.
+  Measured on the topic on 2026-11-14 (tiny config): 36/36 events had `event_time` later than
+  their Kafka `CreateTime`, up to +124.5 s (a `match_end` sent two minutes before it
+  "happened"). With the default config (20-40 min matches, staggered starts) the gap would be
+  tens of minutes.
+- **Why it matters for Phase 2:**
+  - The watermark is `max(event_time seen) - allowed delay`. Future timestamps push it ahead of
+    real time, so normal events can be wrongly treated as too late and dropped.
+  - Lateness (`ingest_time - event_time`) becomes negative, which makes latency and freshness
+    metrics meaningless.
+  - Late and out-of-order data become impossible to test on purpose, because the "lateness" is
+    an accident of how events are sent.
+- **Acceptable for Phase 1:** The raw Parquet job just appends and doesn't use event time.
+- **Decision:** Add a pacing mode before Phase 2 watermarks (plan in D1.13).
+
 ### D1.8 Small-files tradeoff of the 10-second trigger
 - **Decision:** The Spark job uses `trigger(processingTime="10 seconds")` and
   `maxOffsetsPerTrigger=50000`.
@@ -127,3 +145,37 @@ Short decision records: context, decision, tradeoffs. Newest phase last.
 ### D1.11 Compose profiles
 - Kafka (and `kafka-init`) are *core* services with no profile. Spark (`spark`) and the simulator
   (`sim`) each get a profile, so only what is needed runs.
+
+### D1.13 Plan: simulator pacing modes + deliberate lateness (not built yet; before Phase 2)
+Rule: **the event content stays deterministic; only *when* it is sent changes.** The generator
+stays a pure function that builds the timeline. A new *scheduler* layer decides send times.
+
+- **`pace: realtime`** (new default for streaming demos):
+  - Each event is sent when the wall clock reaches its `event_time`. The simulator sleeps until
+    then, so `event_time ≈ send time` (within milliseconds).
+  - A `time_scale` factor (e.g. 30 = 30x faster) shrinks the in-game time gaps *before*
+    `event_time` is stamped, so `event_time` still matches the real send time. `duration_s`
+    keeps the game value, because it is "game clock" data, not a timestamp.
+  - Throughput comes from many matches overlapping (`match_interval_s`), not from bursts.
+- **`pace: backfill`** (replaces today's burst behaviour, for bulk loads and benchmarks):
+  - Sends as fast as possible, but the timeline is placed so its last event is at or before
+    *now* (`start_time = now - total span`). Every event is then in the past, like replaying
+    history. No more timestamps from the future.
+- **Deliberate lateness (`late_fraction`, `late_delay_s`):**
+  - A *separate* seeded RNG (`Random(seed, "lateness")`) picks which events are late and by how
+    much. Turning lateness on or off doesn't change any event or event_id, only the send order.
+  - A late event keeps its `event_time`, but its send time becomes `event_time + delay`. The
+    scheduler is a priority queue ordered by send time, so late events really do arrive after
+    newer ones (out of order within the partition). `match_seq` lets us detect and restore the
+    true order.
+  - The delay distribution is chosen to straddle the planned Phase 2 watermark (e.g. most events
+    5-60 s late, plus a small tail of about 10 min). That way the tests cover "late but accepted"
+    and "too late" cases.
+- **Manifest additions:** pacing mode, `time_scale`, and for each late event its planned delay.
+  Phase 2 tests can then assert exactly which events must appear (delay within the watermark)
+  and which are expected to be dropped or routed elsewhere.
+- **Guardrail:** In realtime mode, a check reports any event sent more than a small tolerance
+  *before* its `event_time`. In Phase 3, Spark will also flag `event_time > ingest_time + 5 min`
+  as a data-quality issue (clock skew or a bad client).
+- **Out of scope here:** Injecting duplicates and shuffling order belongs to Phase 4. Those will
+  reuse the same scheduler.
