@@ -34,20 +34,16 @@ Pin all dependency versions. If unsure of a version or API, say so.
 simulator/ streaming/ lakehouse/ warehouse/ airflow/ monitoring/
 dashboard/ tests/chaos/ docs/ docker/ Makefile README.md
 
-## How to work with me (IMPORTANT)
-- I am a complete beginner. Explain concepts and every command briefly.
-- Work in phases. Do ONLY the phase I ask for. Never jump ahead.
-- Before coding a phase: short plan, list of files, design decisions with
-  tradeoffs. Then WAIT for my approval before writing code.
+## Engineering standards
+- Build in phases. Each phase starts with a short plan, file list and design
+  decisions with tradeoffs, and ends with run/verify instructions and tests.
 - Production-quality code: type hints, docstrings, config via env/YAML,
   structured logging, error handling, no hardcoded secrets.
-- Every phase ends with: how to run it, how to verify it, tests, and 3-5
-  interview questions I should be able to answer.
 - Keep docs/DECISIONS.md (architecture decisions) and docs/WHAT_BROKE.md
   (bugs hit and fixes) updated each phase.
 - Do not claim "exactly-once" loosely: it is effectively-once via idempotent
   sinks, and tests must prove it.
-- Commit small and often; do not push or delete files without asking me.
+- Commit small and often.
 
 ## Phases
 1 Simulator + Kafka + Spark job writing Parquet
@@ -61,6 +57,3 @@ dashboard/ tests/chaos/ docs/ docker/ Makefile README.md
 8 Prometheus/Grafana, SLOs, alert demo
 9 Dashboard
 10 Benchmarks, README, diagrams, CI
-
-Planned scope (1 month): phases 1-4, then 8 and 6 (lite), then polish.
-Current phase: setup done, starting phase 1.
