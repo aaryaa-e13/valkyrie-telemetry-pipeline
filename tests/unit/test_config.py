@@ -41,6 +41,13 @@ def test_unknown_yaml_key_is_rejected(tmp_path: Path) -> None:
     {"players_per_team": 11},
     {"kills_per_match_min": 5, "kills_per_match_max": 1},
     {"start_time": "2026-11-14T12:00:00"},  # no timezone
+    {"pace": "burst"},
+    {"time_scale": 0},
+    {"time_scale": -2},
+    {"late_fraction": 1.5},
+    {"late_too_late_share": -0.1},
+    {"assumed_watermark_s": 0},
+    {"pace": "realtime", "rate_per_s": 100},  # the clock sets the rate in realtime
 ])
 def test_invalid_values_are_rejected(overrides: dict) -> None:
     with pytest.raises(ValueError):
@@ -50,3 +57,20 @@ def test_invalid_values_are_rejected(overrides: dict) -> None:
 def test_shipped_yaml_files_load() -> None:
     assert load_config("simulator/config.yaml", env={}).num_matches == 2
     assert load_config("simulator/config.tiny.yaml", env={}).players_per_team == 1
+
+
+def test_pacing_and_lateness_defaults_keep_the_features_off() -> None:
+    cfg = load_config(env={})
+    assert (cfg.pace, cfg.time_scale, cfg.late_fraction) == ("backfill", 1.0, 0.0)
+    assert (cfg.late_too_late_share, cfg.assumed_watermark_s) == (0.2, 30.0)
+
+
+def test_pacing_and_lateness_settings_load_from_env_and_reach_lateness_config() -> None:
+    env = {"SIM_PACE": "realtime", "SIM_TIME_SCALE": "10", "SIM_LATE_FRACTION": "0.3",
+           "SIM_LATE_TOO_LATE_SHARE": "0.5", "SIM_ASSUMED_WATERMARK_S": "20"}
+    cfg = load_config(env=env)
+    assert (cfg.pace, cfg.time_scale) == ("realtime", 10.0)
+    lateness = cfg.lateness()
+    assert (lateness.late_fraction, lateness.too_late_share,
+            lateness.assumed_watermark_s) == (0.3, 0.5, 20.0)
+    assert cfg.public_dict()["pace"] == "realtime"

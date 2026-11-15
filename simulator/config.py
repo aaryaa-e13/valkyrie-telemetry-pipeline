@@ -22,6 +22,11 @@ from typing import Any
 import yaml
 
 from simulator.catalog import CHAMPIONS
+from simulator.schedule import LatenessConfig
+
+PACE_BACKFILL = "backfill"
+PACE_REALTIME = "realtime"
+PACES = (PACE_BACKFILL, PACE_REALTIME)
 
 # Env vars with names shared with other components (not SIM_-prefixed).
 _ENV_ALIASES = {
@@ -56,7 +61,16 @@ class SimulatorConfig:
     topic: str = "game-events"
     client_id: str = "valkyrie-simulator"
     flush_timeout_s: float = 30.0
-    rate_per_s: float = 0.0  # 0 = send as fast as possible
+    rate_per_s: float = 0.0  # 0 = send as fast as possible (backfill pace only)
+
+    # Pacing (when events are sent; never changes what the events are)
+    pace: str = PACE_BACKFILL     # "backfill" or "realtime"
+    time_scale: float = 1.0       # 10 = game time runs ten times faster
+
+    # Deliberate lateness (see simulator/schedule.py for the exact formula)
+    late_fraction: float = 0.0          # share of events sent late; 0 = off
+    late_too_late_share: float = 0.2    # share of the late events in the "very" band
+    assumed_watermark_s: float = 30.0   # placeholder for the Phase 2 watermark
 
     # Output
     manifest_dir: str = "manifests"
@@ -88,12 +102,30 @@ class SimulatorConfig:
             errors.append("match_duration_s_min must be >= 1")
         if self.rate_per_s < 0:
             errors.append("rate_per_s must be >= 0")
+        if self.pace not in PACES:
+            errors.append(f"pace must be one of {list(PACES)}")
+        if not self.time_scale > 0:
+            errors.append("time_scale must be > 0")
+        if self.pace == PACE_REALTIME and self.rate_per_s > 0:
+            errors.append("rate_per_s cannot be used with pace=realtime (the clock sets the rate)")
+        try:
+            self.lateness()
+        except ValueError as exc:
+            errors.append(str(exc))
         if not self.regions:
             errors.append("regions must not be empty")
         if self.start_time is not None and self.start_time.tzinfo is None:
             errors.append("start_time must include a timezone, e.g. 2026-11-14T12:00:00Z")
         if errors:
             raise ValueError("invalid simulator config: " + "; ".join(errors))
+
+    def lateness(self) -> LatenessConfig:
+        """The lateness settings in the form simulator.schedule expects."""
+        return LatenessConfig(
+            late_fraction=self.late_fraction,
+            too_late_share=self.late_too_late_share,
+            assumed_watermark_s=self.assumed_watermark_s,
+        )
 
     def public_dict(self) -> dict[str, Any]:
         """Settings as a JSON-friendly dict (for the run manifest)."""

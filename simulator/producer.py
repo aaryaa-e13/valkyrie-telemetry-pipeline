@@ -149,6 +149,15 @@ class EventProducer:
                 self._producer.poll(0.5)
         self._producer.poll(0)  # serve delivery callbacks that are ready
 
+    def poll(self, timeout_s: float) -> None:
+        """Wait up to `timeout_s` while serving delivery callbacks.
+
+        Used by realtime pacing instead of `time.sleep`, so broker answers keep
+        being processed while the simulator waits for the next event's send time.
+        It may return early (when a callback was served); callers re-check the clock.
+        """
+        self._producer.poll(max(0.0, timeout_s))
+
     def flush(self, timeout_s: float) -> int:
         """Wait for outstanding messages. Returns how many are still undelivered."""
         return self._producer.flush(timeout_s)

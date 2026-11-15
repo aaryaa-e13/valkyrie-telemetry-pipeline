@@ -4,6 +4,14 @@ Examples:
     python -m simulator.main --config simulator/config.tiny.yaml
     python -m simulator.main --seed 7 --matches 100 --rate 500
     python -m simulator.main --config simulator/config.tiny.yaml --dry-run
+    python -m simulator.main --config simulator/config.tiny.yaml --pace realtime --time-scale 10
+    python -m simulator.main --config simulator/config.tiny.yaml --pace realtime \
+        --time-scale 10 --late-fraction 0.3
+
+Pace (see docs/DECISIONS.md D1.13):
+    backfill (default)  send as fast as possible; the timeline is placed so its
+                        last event_time is "now", so no event is from the future.
+    realtime            send each event when the wall clock reaches its event_time.
 
 Exit codes: 0 all delivered, 1 some events failed/undelivered, 2 setup error,
 130 interrupted (Ctrl+C).
@@ -14,16 +22,22 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-import time
-from datetime import UTC, datetime
+from collections import Counter
+from datetime import UTC, datetime, timedelta
 
 from common.logging_setup import setup_logging
-from simulator.config import SimulatorConfig, load_config
+from simulator.config import PACE_REALTIME, PACES, SimulatorConfig, load_config
 from simulator.generator import generate_events
 from simulator.manifest import build_manifest, write_manifest
 from simulator.producer import EventProducer
+from simulator.schedule import PlannedSend, backfill_start, build_schedule, retime
+from simulator.sender import SendStats, send_backfill, send_realtime
 
 log = logging.getLogger("simulator")
+
+# Realtime pace: the timeline starts this long after "now", so the first events
+# are not already overdue by the time the schedule has been built.
+REALTIME_LEAD = timedelta(seconds=1)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -34,10 +48,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--matches", dest="num_matches", type=int)
     p.add_argument("--players-per-team", dest="players_per_team", type=int)
     p.add_argument("--start-time", dest="start_time",
-                   help="ISO-8601 with timezone, e.g. 2026-11-14T12:00:00Z (default: now)")
+                   help="backfill only: ISO-8601 with timezone, e.g. 2026-11-14T12:00:00Z "
+                        "(default: place the timeline so that it ends now)")
+    p.add_argument("--pace", choices=PACES, help="backfill (default) or realtime")
+    p.add_argument("--time-scale", dest="time_scale", type=float,
+                   help="speed-up of game time, e.g. 10 = ten times faster")
+    p.add_argument("--late-fraction", dest="late_fraction", type=float,
+                   help="share of events sent deliberately late (0..1, default 0)")
+    p.add_argument("--late-too-late-share", dest="late_too_late_share", type=float,
+                   help="share of the late events that are VERY late (0..1, default 0.2)")
+    p.add_argument("--assumed-watermark-s", dest="assumed_watermark_s", type=float,
+                   help="assumed Phase 2 watermark in seconds; delays are multiples of it")
     p.add_argument("--bootstrap-servers", dest="bootstrap_servers")
     p.add_argument("--topic")
-    p.add_argument("--rate", dest="rate_per_s", type=float, help="events/second, 0 = unlimited")
+    p.add_argument("--rate", dest="rate_per_s", type=float,
+                   help="backfill only: events/second, 0 = unlimited")
     p.add_argument("--manifest-dir", dest="manifest_dir")
     p.add_argument("--no-manifest-ids", dest="manifest_include_event_ids",
                    action="store_const", const=False, help="omit per-event ids from manifest")
@@ -47,30 +72,92 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _send_all(producer: EventProducer, events: list, rate_per_s: float) -> int:
-    """Send events, optionally rate-limited. Returns how many were queued."""
-    started = time.monotonic()
-    for i, event in enumerate(events):
-        if rate_per_s > 0:
-            delay = started + i / rate_per_s - time.monotonic()
-            if delay > 0:
-                time.sleep(delay)
-        producer.send(event)
-    return len(events)
+def prepare_run(
+    cfg: SimulatorConfig, *, now: datetime, dry_run: bool = False
+) -> tuple[datetime, list[PlannedSend]]:
+    """Generate the events, place them in time and plan the send order.
+
+    Pure apart from the `now` you pass in: same cfg + same `now` = same result.
+
+    Where the timeline is placed:
+        backfill, no start_time   so that the last event_time is `now`
+        backfill, with start_time at start_time (must end at or before `now`)
+        realtime                  starting one second after `now`
+
+    Args:
+        cfg: Simulator configuration.
+        now: Current wall-clock time (timezone-aware).
+        dry_run: Nothing will be sent, so the two start_time checks are skipped.
+
+    Returns:
+        (start_time, plan): the timeline start and the planned sends in order.
+
+    Raises:
+        ValueError: A start_time that cannot work with the chosen pace.
+    """
+    explicit = cfg.start_time
+    ref_start = explicit or now.replace(microsecond=0)
+    events = generate_events(cfg, ref_start)
+
+    if cfg.pace == PACE_REALTIME:
+        if explicit is not None and not dry_run:
+            raise ValueError(
+                "start_time cannot be used with pace=realtime: realtime event_times "
+                "follow the wall clock (it is allowed together with --dry-run)")
+        # Round up to a whole millisecond (the wire format's precision).
+        now_ms = now.replace(microsecond=now.microsecond // 1000 * 1000)
+        start = explicit or now_ms + timedelta(milliseconds=1) + REALTIME_LEAD
+    elif explicit is not None:
+        start = explicit
+    else:
+        start = backfill_start(events, ref_start=ref_start, now=now, time_scale=cfg.time_scale)
+
+    events = retime(events, ref_start=ref_start, new_start=start, time_scale=cfg.time_scale)
+    if cfg.pace != PACE_REALTIME and explicit is not None and not dry_run and events:
+        last = events[-1].event_time
+        if last > now:
+            raise ValueError(
+                f"start_time {explicit.isoformat()} puts the last event at {last.isoformat()}, "
+                f"which is in the future (now is {now.isoformat()}). Use an earlier "
+                "start_time, or omit it so the timeline ends now")
+    return start, build_schedule(events, cfg.seed, cfg.lateness())
+
+
+def _timing_fields(
+    cfg: SimulatorConfig, start_time: datetime, plan: list[PlannedSend], now: datetime
+) -> dict[str, object]:
+    """Log fields describing where the timeline sits relative to the wall clock."""
+    fields: dict[str, object] = {
+        "pace": cfg.pace, "time_scale": cfg.time_scale, "start_time": start_time.isoformat(),
+    }
+    if plan:
+        first = min(p.event.event_time for p in plan)
+        last = max(p.event.event_time for p in plan)
+        bands = Counter(p.band for p in plan if p.band is not None)
+        fields.update({
+            "wall_clock": now.isoformat(timespec="milliseconds"),
+            "first_event_time": first.isoformat(timespec="milliseconds"),
+            "last_event_time": last.isoformat(timespec="milliseconds"),
+            # Positive = in the past, negative = still in the future.
+            "first_event_age_s": round((now - first).total_seconds(), 3),
+            "last_event_age_s": round((now - last).total_seconds(), 3),
+            "late_slight": bands.get("slight", 0),
+            "late_very": bands.get("very", 0),
+            "last_send_in_s": round((plan[-1].send_at - now).total_seconds(), 1) + 0.0,
+        })
+    return fields
 
 
 def run(cfg: SimulatorConfig, dry_run: bool = False) -> int:
     """Execute one simulator run. Returns the process exit code."""
-    start_time = cfg.start_time or datetime.now(UTC).replace(microsecond=0)
-    events = generate_events(cfg, start_time)
-    log.info("generated events", extra={"fields": {
-        "events": len(events), "matches": cfg.num_matches, "seed": cfg.seed,
-        "start_time": start_time.isoformat(),
-    }})
-
     if dry_run:
-        for e in events:
-            sys.stdout.write(e.to_json_bytes().decode("utf-8") + "\n")
+        try:
+            _, plan = prepare_run(cfg, now=datetime.now(UTC), dry_run=True)
+        except ValueError as exc:
+            log.error("invalid configuration", extra={"fields": {"error": str(exc)}})
+            return 2
+        for planned in plan:  # printed in planned send order
+            sys.stdout.write(planned.event.to_json_bytes().decode("utf-8") + "\n")
         return 0
 
     run_id = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}_seed{cfg.seed}"
@@ -85,13 +172,33 @@ def run(cfg: SimulatorConfig, dry_run: bool = False) -> int:
         "bootstrap_servers": cfg.bootstrap_servers, "topic": cfg.topic,
         "partitions": partitions}})
 
+    # "now" is taken after the Kafka check, which can take seconds: realtime
+    # pace needs the timeline to start at the real current time.
+    now = datetime.now(UTC)
+    try:
+        start_time, plan = prepare_run(cfg, now=now)
+    except ValueError as exc:
+        log.error("invalid configuration", extra={"fields": {"error": str(exc)}})
+        return 2
+    events = [p.event for p in plan]
+    timing = _timing_fields(cfg, start_time, plan, now)
+    log.info("generated events", extra={"fields": {
+        "events": len(events), "matches": cfg.num_matches, "seed": cfg.seed, **timing}})
+
+    stats = SendStats()
     interrupted = False
     try:
-        _send_all(producer, events, cfg.rate_per_s)
+        if cfg.pace == PACE_REALTIME:
+            send_realtime(plan, producer.send, wait=producer.poll, stats=stats)
+        else:
+            send_backfill(plan, producer.send, rate_per_s=cfg.rate_per_s, stats=stats)
     except KeyboardInterrupt:
         interrupted = True
         log.warning("interrupted; flushing what was already queued")
     remaining = producer.flush(cfg.flush_timeout_s)
+    if stats.future_events:
+        log.warning("events were sent before their event_time", extra={"fields": {
+            "future_events": stats.future_events, "max_ahead_ms": stats.max_ahead_ms}})
 
     tracker = producer.tracker
     manifest = build_manifest(
@@ -116,6 +223,11 @@ def run(cfg: SimulatorConfig, dry_run: bool = False) -> int:
         "undelivered_after_flush": remaining,
         "manifest": str(path),
         "partition_by_match": {m: sorted(p) for m, p in tracker.partitions_by_match.items()},
+        "pace": cfg.pace,
+        "sent": stats.sent,
+        "future_events": stats.future_events,
+        "max_ahead_ms": stats.max_ahead_ms,
+        "max_behind_ms": stats.max_behind_ms,
     }
     if interrupted:
         log.warning("run interrupted", extra={"fields": summary})

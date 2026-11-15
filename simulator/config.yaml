@@ -14,14 +14,26 @@ match_duration_s_max: 2400
 match_interval_s: 30         # seconds between consecutive match starts
 patch_version: "14.3"
 regions: [EUW, NA, KR, BR]
-# start_time: 2026-11-14T12:00:00Z   # omit = "now" (keeps events fresh for watermarks)
+# start_time: 2026-11-14T12:00:00Z   # backfill only. Omit = place the timeline so it ENDS now.
 
 # --- Kafka ---
 bootstrap_servers: localhost:9092    # from the laptop; containers use kafka:29092
 topic: game-events
 client_id: valkyrie-simulator
 flush_timeout_s: 30
-rate_per_s: 0                # 0 = as fast as possible
+rate_per_s: 0                # 0 = as fast as possible (backfill pace only)
+
+# --- Pacing: WHEN events are sent. Never changes event content or event_ids. ---
+# backfill: send as fast as possible; every event_time is in the past (last event = now).
+# realtime: send each event when the wall clock reaches its event_time.
+pace: backfill
+time_scale: 1.0              # 10 = game time runs ten times faster (gaps divided by 10)
+
+# --- Deliberate lateness: a late event keeps its event_time but is sent later. ---
+late_fraction: 0.0           # share of events sent late (0 = off)
+late_too_late_share: 0.2     # of the late events, the share that is VERY late
+assumed_watermark_s: 30      # placeholder for the Phase 2 watermark W.
+                             # slightly late = 0.1-0.5 x W, very late = 2-3 x W
 
 # --- Output ---
 manifest_dir: manifests
