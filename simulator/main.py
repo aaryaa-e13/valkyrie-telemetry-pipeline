@@ -23,6 +23,7 @@ import argparse
 import logging
 import sys
 from collections import Counter
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 from common.logging_setup import setup_logging
@@ -148,11 +149,23 @@ def _timing_fields(
     return fields
 
 
-def run(cfg: SimulatorConfig, dry_run: bool = False) -> int:
-    """Execute one simulator run. Returns the process exit code."""
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def run(
+    cfg: SimulatorConfig, dry_run: bool = False, *, clock: Callable[[], datetime] = _utc_now
+) -> int:
+    """Execute one simulator run. Returns the process exit code.
+
+    Args:
+        cfg: Simulator configuration.
+        dry_run: Print the events instead of sending them.
+        clock: Returns the current time; replaced by a fixed clock in tests.
+    """
     if dry_run:
         try:
-            _, plan = prepare_run(cfg, now=datetime.now(UTC), dry_run=True)
+            _, plan = prepare_run(cfg, now=clock(), dry_run=True)
         except ValueError as exc:
             log.error("invalid configuration", extra={"fields": {"error": str(exc)}})
             return 2
@@ -160,7 +173,7 @@ def run(cfg: SimulatorConfig, dry_run: bool = False) -> int:
             sys.stdout.write(planned.event.to_json_bytes().decode("utf-8") + "\n")
         return 0
 
-    run_id = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}_seed{cfg.seed}"
+    run_id = f"{clock():%Y%m%dT%H%M%SZ}_seed{cfg.seed}"
     producer = EventProducer(cfg.bootstrap_servers, cfg.topic, cfg.client_id)
     try:
         partitions = producer.check_topic()
@@ -174,7 +187,7 @@ def run(cfg: SimulatorConfig, dry_run: bool = False) -> int:
 
     # "now" is taken after the Kafka check, which can take seconds: realtime
     # pace needs the timeline to start at the real current time.
-    now = datetime.now(UTC)
+    now = clock()
     try:
         start_time, plan = prepare_run(cfg, now=now)
     except ValueError as exc:
@@ -212,6 +225,8 @@ def run(cfg: SimulatorConfig, dry_run: bool = False) -> int:
         offsets_by_partition=tracker.offsets_by_partition,
         include_event_ids=cfg.manifest_include_event_ids,
         interrupted=interrupted,
+        planned=plan,
+        stats=stats,
     )
     path = write_manifest(manifest, cfg.manifest_dir)
 

@@ -1,6 +1,6 @@
 """Tests for streaming.verify_manifest (run inside the Spark image: make test-spark).
 
-Covers: manifest v1 and v2 are both accepted, duplicates are reported but only
+Covers: manifest v1, v2 and v3 are all accepted, duplicates are reported but only
 fail with --fail-on-duplicates, missing ids always fail, unrelated rows
 (other runs, malformed messages) never affect the result.
 """
@@ -29,6 +29,25 @@ V1: dict[str, Any] = {
 }
 V2: dict[str, Any] = {**copy.deepcopy(V1), "manifest_version": 2,
                       "kafka_offsets": {"3": {"min": 0, "max": 2, "count": 3}}}
+V3: dict[str, Any] = {
+    **copy.deepcopy(V2), "manifest_version": 3,
+    "pacing": {
+        "mode": "realtime", "time_scale": 10.0, "assumed_watermark_s": 30.0,
+        "late_fraction": 0.3, "late_too_late_share": 0.2,
+        "bands": {
+            "slight": {"min_x_watermark": 0.1, "max_x_watermark": 0.5,
+                       "min_delay_ms": 3000, "max_delay_ms": 15000, "expected": "keep"},
+            "very": {"min_x_watermark": 2.0, "max_x_watermark": 3.0,
+                     "min_delay_ms": 60000, "max_delay_ms": 90000, "expected": "may_drop"},
+        },
+        "measured": {"sent": 3, "future_events": 0, "max_ahead_ms": 0, "max_behind_ms": 0},
+    },
+    "late_counts": {"slight": 0, "very": 1},
+    "late_events_omitted_reason": None,
+    # A very late event is still required in the raw layer.
+    "late_events": [{"event_id": "e3", "match_id": "m-a", "delay_ms": 70000, "band": "very",
+                     "expected": "may_drop", "stream_lag_ms": 5000}],
+}
 
 
 def _lake(spark: SparkSession, tmp_path: Path, event_ids: list[str | None]) -> str:
@@ -46,8 +65,8 @@ def _manifest(tmp_path: Path, data: dict[str, Any]) -> Path:
     return path
 
 
-@pytest.mark.parametrize("manifest", [V1, V2], ids=["v1", "v2"])
-def test_complete_run_passes_for_v1_and_v2(spark, tmp_path: Path, manifest) -> None:
+@pytest.mark.parametrize("manifest", [V1, V2, V3], ids=["v1", "v2", "v3"])
+def test_complete_run_passes_for_v1_v2_and_v3(spark, tmp_path: Path, manifest) -> None:
     lake = _lake(spark, tmp_path, ["e1", "e2", "e3"])
     report = verify(spark, _manifest(tmp_path, manifest), lake)
     assert report["manifest_version"] == manifest["manifest_version"]
