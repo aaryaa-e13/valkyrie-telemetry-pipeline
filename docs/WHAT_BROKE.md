@@ -95,3 +95,21 @@ Template:
 - **Fix:** Only do that check when `raw` is a string.
 - **Lesson:** This is why the status logic is pure and unit-tested on the laptop. The bug would
   otherwise have appeared only as a warning inside the running Spark job.
+
+### "Crashed" label for a clean stop (Phase 1d2, caught in a live failure test)
+- **Symptom:** After `make spark-stop`, the timeout report said `CRASHED` although the container
+  had exited with code 0.
+- **Root cause:** The first version of the hint treated "not running" as one case.
+- **Fix:** New label `stopped` for exit code 0 without OOM. `crashed` is now for non-zero exit,
+  OOMKilled, or a missing container. Unit-tested.
+- **Lesson:** Diagnostics must separate "someone stopped it" from "it died". They lead to
+  different actions.
+
+### My own wait loop never ended: `pgrep -f` matched itself (Phase 1d2, test tooling)
+- **Symptom:** A shell loop `while pgrep -f "seed 777001"; do sleep; done` ran forever.
+- **Root cause:** `pgrep -f` matches the full command line of every process, including the
+  shell running the loop, whose command line contains the same text.
+- **Fix:** Stopped the loop and checked the simulator's own log for `run complete` instead.
+  Nothing else was affected: the `chmod` after the loop had not run yet.
+- **Lesson:** Wait on a specific PID or an explicit completion signal (log line, file), not on
+  a text pattern that your own command contains.

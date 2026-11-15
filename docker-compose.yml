@@ -160,5 +160,39 @@ services:
     stop_grace_period: 60s                    # time to finish/abort the current batch
     restart: "no"
 
+  # ---------------------------------------------------------------------------
+  # One-shot Spark tools, e.g. verify_manifest (profile: tools). Same image as
+  # `spark`, but separate so it can run NEXT TO the streaming job:
+  #   - no container_name / ports  -> no clash with valkyrie-spark or :4040
+  #   - no depends_on kafka         -> reads Parquet only
+  #   - ./data is READ-ONLY         -> a verify bug cannot damage the lake or
+  #                                    the checkpoint (proved in D1.16)
+  #   - Spark scratch space lives in the container's own /tmp, not on the host
+  # Usage: docker compose --profile tools run --rm -T spark-tools python -m ...
+  # ---------------------------------------------------------------------------
+  spark-tools:
+    profiles: ["tools"]
+    image: valkyrie-spark:dev                 # built by `make spark-build`
+    pull_policy: never                        # never try Docker Hub for a local image
+    environment:
+      SPARK_LOCAL_DIRS: /tmp/spark-local
+      LOG_LEVEL: INFO
+    volumes:
+      - type: bind
+        source: ./data
+        target: /data
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./manifests
+        target: /app/manifests
+        read_only: true
+        bind:
+          create_host_path: false
+    mem_limit: ${SPARK_TOOLS_MEM_LIMIT:-1536m} # verify uses a 1g driver heap
+    init: true
+    restart: "no"
+
 volumes:
   kafka-data:

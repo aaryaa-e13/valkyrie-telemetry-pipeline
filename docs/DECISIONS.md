@@ -235,6 +235,83 @@ Built in steps: d1 = manifest offsets + status file (this entry); d2/d3 add the 
 the Phase 2 motivation (D1.14) and must stay visible. demo and smoke will pass
 `--fail-on-duplicates`, because they use a fresh seed and expect zero duplicates.
 
+### D1.16 Orchestrator, `spark-tools`, `make demo` / `make smoke` (slice d2)
+
+**Flow** (`e2e/orchestrator.py`, laptop side, stdlib + `common/` only): seed in Python (epoch ms)
+-> check Kafka, start Spark (idempotent `up -d`) -> **baseline** status snapshot -> simulator
+run -> find the one manifest for that seed (must be v2) -> **contiguity check** -> **pre-run
+guard** -> wait for catch-up -> verify in `spark-tools` with `--fail-on-duplicates`.
+The pure logic lives in `e2e/catchup.py` and is unit-tested (34 tests). Docker calls are thin
+wrappers in `e2e/docker_ops.py`, each with a timeout.
+
+**Exit codes:** 0 pass, 1 verify failed, 2 setup problem, 3 Spark did not catch up (timeout *or*
+container stopped; we don't wait out the timeout if the container is gone), 4 contiguity
+violation. `make` itself always exits 2 on failure, so the real code is in the final
+`SUMMARY {json}` line. Scripts and CI should read that line, or call the Python module directly.
+
+**Finding: Spark 4.1.4 posts no progress events while idle.** Experiment (2026-11-15, our job,
+10 s trigger, status file polled every 1-2 s):
+- After a restart with no new data: 150 s, **0** status updates, **0** `batch progress` lines.
+- After a batch with data (batch 9): 139 s idle, **0** further updates.
+- So the status file is event-driven, not a heartbeat. `updated_at` can be hours old on a
+  perfectly healthy idle job. (Older Spark versions sent "no-data" progress events every 10 s;
+  4.x does not, at least with our listener. We ignore `onQueryIdle`; using it as a heartbeat is
+  a possible later improvement.)
+- **Consequence for the hints:** an old `updated_at` is never evidence on its own. "Status file
+  not updating" is only diagnosed when the *logs* show a batch committed during the wait that
+  the file does not show, or a `could not write status file` warning.
+
+**Timeout diagnosis** (always prints container state, Kafka state, status file
+MISSING/UNREADABLE/age, the lag table and the last 40 log lines, then one hint):
+
+| Hint | Rule |
+|---|---|
+| stopped | container exited with code 0 (e.g. `make spark-stop`) |
+| crashed | container missing, non-zero exit, or OOMKilled |
+| status file not updating | logs show a batch_id newer than the file, or status write warnings |
+| slow | batches committed during the wait, or remaining offsets went down |
+| too early to tell | none of the above, and waited < 2 trigger intervals |
+| stuck | none of the above, after >= 2 trigger intervals |
+
+All six were exercised live, except "slow" and "stuck" (unit-tested only).
+
+**Contiguity check.** For every partition: `count == max - min + 1`. If it isn't, another
+producer wrote into the run's offset range, and we stop with exit 4 before waiting. Shown live
+with a real second simulator writing at the same time: "partition 0: run wrote 20 messages but
+its offsets span 493..563 (71 slots) -> 51 offsets in that range came from another producer".
+Caveat: if we ever use Kafka transactions, commit markers take up offsets, so this rule would
+need to change.
+
+**Stale-status guard (freshness).** Offsets alone are not enough. If the topic is recreated,
+offsets restart at 0, and an old status file with end offsets of, say, 900 would "prove" any new
+run is caught up. Two checks:
+1. *Pre-run guard (exit 2):* the baseline is taken **before** the run is sent. If the baseline
+   already has a committed end offset greater than the run's first offset, the status cannot
+   describe this topic's history ("topic probably recreated"). Shown live with a faked status
+   file (end offsets 99999).
+2. *Freshness:* "caught up" also requires (a) the manifest's topic name in the status offsets,
+   and (b) a batch committed **after** the baseline (higher `batch_id`, same `query_id`), or a
+   new `query_id` (checkpoint reset: the new query re-reads the topic, so its offsets are new
+   evidence).
+- **Limitation:** neither the status file nor the manifest records Kafka's topic **ID** (a UUID
+  that changes when a topic is recreated), only its name. So the guard can't catch a recreated
+  topic that has *already* grown past the old offsets before the run. Also, we haven't tested
+  what Spark itself does when the topic is recreated under an existing checkpoint (we expect
+  `failOnDataLoss=true` to stop it, but that is unverified). Recording the topic ID in both
+  files would close this gap. Deferred to Phase 4 (chaos).
+
+**`spark-tools` service** (profile `tools`): same image, `pull_policy: never`, 1.5 GB limit, no
+ports or `container_name` (runs next to the streaming job), no `depends_on` Kafka, and **`./data`
+and `./manifests` mounted read-only**. Spark's scratch space is `SPARK_LOCAL_DIRS=/tmp/spark-local`
+inside the container's own filesystem, not a host mount. Proven live: verify PASSes, `touch
+/data/x` fails with "Read-only file system", and `mount` shows `/data ... (ro,...)`. Reading
+the sink's `_spark_metadata` needs no writes. `make verify` now uses it too.
+
+**demo vs smoke:** same code. smoke = tiny config, 90 s timeout, short output. demo = 20 matches
+(~1250 events), 180 s timeout, verbose (lag table, full verify report, where to look). Both
+build images quietly first (`make e2e-images`). Live numbers on this laptop: smoke ~31 s total
+(catch-up 4-6 s, verify ~20 s, mostly JVM start-up), demo ~36 s.
+
 ### D1.13 Plan: simulator pacing modes + deliberate lateness (not built yet; before Phase 2)
 Rule: **the event content stays deterministic; only *when* it is sent changes.** The generator
 stays a pure function that builds the timeline. A new *scheduler* layer decides send times.

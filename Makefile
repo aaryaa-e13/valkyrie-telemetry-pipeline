@@ -17,7 +17,7 @@ SEED ?= 42
 dirs: ## Create bind-mount folders owned by you (Docker would create them as root)
 	mkdir -p data data/status manifests
 
-.PHONY: help env up down ps logs topics describe-topic venv sim-dry sim-local sim-tiny sim consume test-unit lint spark-build spark-up spark-stop spark-logs verify test-spark
+.PHONY: help env up down ps logs topics describe-topic venv sim-dry sim-local sim-tiny sim consume test-unit lint spark-build spark-up spark-stop spark-logs verify test-spark demo smoke e2e-images
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -90,9 +90,24 @@ spark-logs: ## Follow streaming job logs
 
 verify: dirs ## Compare raw Parquet with a run manifest (MANIFEST=manifests/run_X.json)
 	@test -n "$(MANIFEST)" || (echo "usage: make verify MANIFEST=manifests/run_X.json" && exit 2)
-	$(COMPOSE) --profile spark run --rm --no-deps -T spark \
+	$(COMPOSE) --profile tools run --rm -T spark-tools \
 		python -m streaming.verify_manifest --manifest /app/$(MANIFEST)
 
 test-spark: dirs ## Run Spark transformation tests inside the Spark image
 	$(COMPOSE) --profile spark run --rm --no-deps -T -v ./:/app:ro spark \
 		python -m pytest tests/spark -q -p no:cacheprovider
+
+# --- End-to-end (laptop orchestrator, see e2e/orchestrator.py) -----------------
+# Exit codes of the orchestrator: 0 pass, 1 verify failed, 2 setup problem,
+# 3 Spark did not catch up, 4 contiguity violation. make itself then reports
+# "Error N" and exits 2; the real code is in the SUMMARY line.
+# Extra flags: make smoke E2E_ARGS="--timeout 5"
+
+e2e-images: ## Build the simulator and Spark images quietly (used by demo/smoke)
+	$(COMPOSE) --profile sim --profile spark build --quiet simulator spark
+
+demo: dirs up e2e-images ## Full run with explanations: simulator -> Kafka -> Spark -> verify
+	$(PY) -m e2e.orchestrator --mode demo $(E2E_ARGS)
+
+smoke: dirs up e2e-images ## Quick end-to-end check (tiny run), one JSON SUMMARY line
+	$(PY) -m e2e.orchestrator --mode smoke $(E2E_ARGS)
