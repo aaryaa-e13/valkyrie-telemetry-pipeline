@@ -8,7 +8,8 @@ KAFKA_BIN := /opt/kafka/bin
 BOOTSTRAP_INTERNAL := kafka:29092
 VENV := .venv
 PY := $(VENV)/bin/python
-UV := $(shell command -v uv 2>/dev/null || echo $(HOME)/.local/bin/uv)
+# uv is found on PATH. Override with `make venv UV=/path/to/uv` if needed.
+UV ?= $(shell command -v uv 2>/dev/null)
 SEED ?= 42
 # For targets that must not reuse a seed (sim-realtime, sim-late): use SEED if you
 # passed one (make sim-late SEED=7), otherwise a fresh one (epoch milliseconds,
@@ -59,6 +60,10 @@ consume: ## Print all messages with partition, offset and key (exits after 8 s i
 # --- Python (laptop) ----------------------------------------------------------
 
 venv: ## Create .venv (Python 3.11 via uv) and install pinned dev dependencies
+	@if [ -z "$(UV)" ]; then \
+		echo "uv not found on PATH. Install it (https://docs.astral.sh/uv/) or pass UV=/path/to/uv." >&2; \
+		exit 1; \
+	fi
 	$(UV) venv --python 3.11 $(VENV)
 	$(UV) pip install --python $(PY) -r requirements/dev.txt
 

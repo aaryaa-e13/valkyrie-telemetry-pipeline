@@ -39,7 +39,7 @@ make venv     # once: create .venv with pinned dependencies
 make up       # start Kafka and create the topic
 ```
 
-| Command | What it does | Time |
+| Command | What it does | Time (16 GB WSL2 laptop) |
 |---|---|---|
 | `make demo` | Full run with explanations: about 1,250 events through Kafka and Spark, then verified against the manifest | about 40 s |
 | `make smoke` | The same check with a tiny run (10-16 events) and one `SUMMARY` JSON line | about 30-45 s |
@@ -48,7 +48,7 @@ make up       # start Kafka and create the topic
 | `make sim-late` | The same with 30% of events sent deliberately late | up to 2 min |
 | `make timing-check MANIFEST=manifests/run_X.json` | Reads a run back from Kafka and compares each message's Kafka timestamp with its `event_time` | a few seconds |
 | `make verify MANIFEST=manifests/run_X.json` | Compares raw Parquet with one run's manifest | about 20 s |
-| `make test-unit`, `make test-spark`, `make lint` | 284 unit tests, 18 Spark tests, ruff | seconds |
+| `make test-unit`, `make test-spark`, `make lint` | Unit tests, Spark tests and linter | seconds |
 
 `make help` lists every target. `make demo`, `make smoke` and `make smoke-restart` start the
 Spark job themselves and use a fresh seed each time.
