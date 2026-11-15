@@ -1,0 +1,85 @@
+{
+  "manifest_version": 1,
+  "run_id": "20261114T131326Z_seed42",
+  "created_at": "2026-11-14T13:13:26.821+00:00",
+  "interrupted": false,
+  "seed": 42,
+  "start_time": "2026-11-14T13:13:26+00:00",
+  "topic": "game-events",
+  "config": {
+    "seed": 42,
+    "num_matches": 2,
+    "players_per_team": 1,
+    "player_pool_size": 5000,
+    "kills_per_match_min": 1,
+    "kills_per_match_max": 2,
+    "items_per_player_min": 0,
+    "items_per_player_max": 1,
+    "match_duration_s_min": 60,
+    "match_duration_s_max": 120,
+    "match_interval_s": 5,
+    "patch_version": "14.3",
+    "regions": [
+      "EUW",
+      "NA",
+      "KR",
+      "BR"
+    ],
+    "start_time": null,
+    "bootstrap_servers": "localhost:9092",
+    "topic": "game-events",
+    "client_id": "valkyrie-simulator",
+    "flush_timeout_s": 30.0,
+    "rate_per_s": 0.0,
+    "manifest_dir": "manifests",
+    "manifest_include_event_ids": true,
+    "log_level": "DEBUG"
+  },
+  "totals": {
+    "matches": 2,
+    "events_generated": 14,
+    "events_delivered": 14,
+    "events_failed": 0
+  },
+  "delivered_checksum": {
+    "algorithm": "sha256(sorted event_ids joined by newline)",
+    "value": "38de42ac4bbcfd005bb9454f90146e6d912128798b4467bf0413886e1bcb23cc"
+  },
+  "matches": {
+    "3eb13b90-4668-4257-bdd6-40fb06671ad1": {
+      "events_generated": 6,
+      "events_delivered": 6,
+      "max_match_seq": 6,
+      "partitions": [
+        5
+      ],
+      "event_ids": [
+        "b94f52aa-6a40-5de2-a491-f9642c310b98",
+        "22694ab2-62cb-5cb0-a987-b733c67fcc7d",
+        "3948ef92-70e5-5029-be31-512c0cf257e4",
+        "d54a1f45-05d6-5006-9ca2-fa9d52b25fb4",
+        "6cc4c3a8-177d-5d4d-a19b-813c0604aedf",
+        "466b43ff-a0cc-5518-a1ed-225147bd391f"
+      ]
+    },
+    "b2b9437a-28df-4ec4-8e4a-2bbdc241330b": {
+      "events_generated": 8,
+      "events_delivered": 8,
+      "max_match_seq": 8,
+      "partitions": [
+        3
+      ],
+      "event_ids": [
+        "34d3ad01-74eb-52af-8015-102baa0bc89f",
+        "c096cf61-4624-5b58-93f1-40237f6f627f",
+        "b8285b04-5420-5afd-85c0-1ee0923b2f46",
+        "0d097ac4-3e83-5c34-807d-dbbb63d1c325",
+        "b0adfedc-2aa1-5eff-8154-f97dc94285bb",
+        "c08098de-066b-5504-8c61-9ca76fb154bd",
+        "eda1b57c-2ba2-5ce4-85b5-6265d68b69d9",
+        "305d4061-665e-5878-a0ae-8640f19dbd1b"
+      ]
+    }
+  },
+  "failed_event_ids": []
+}

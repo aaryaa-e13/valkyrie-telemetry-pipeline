@@ -52,7 +52,8 @@ Short decision records: context, decision, tradeoffs. Newest phase last.
   *duplicates* on purpose, so use a new seed for genuinely new data.
 - Determinism: one `random.Random(seed)` drives all choices in a fixed order. `event_time` starts
   at `start_time` (default: now, so Phase 2 watermarks don't treat the data as ancient). Pass
-  `--start-time` for byte-identical runs. A golden unit test guards against accidental changes.
+  `--start-time` for byte-identical runs. *(Updated in slice e: by default the timeline
+  now ENDS at "now" instead of starting there, see D1.17. Content and ids are unchanged.)* A golden unit test guards against accidental changes.
 - `match_seq` is a per-match sequence number starting at 1, with no gaps. It lets us (a) detect
   missing events (a gap), (b) detect duplicates (a repeated seq), and (c) restore the true order
   after shuffling, independent of clock timestamps. Two events in one match can share an
@@ -89,6 +90,12 @@ Short decision records: context, decision, tradeoffs. Newest phase last.
   instead of waiting for delivery timeouts.
 
 ### D1.7c Known limitation: burst mode sends events from the future (found in slice b)
+- **Status: RESOLVED in slice e (2026-11-15), see D1.17.** The default pace is now `backfill`,
+  which places the timeline so that it *ends* now; `realtime` sends each event at its
+  `event_time`. Measured with `make timing-check` (Kafka `CreateTime` vs `event_time`): 0 events
+  ahead in backfill, realtime and realtime-with-lateness runs; realtime events matched to 0 ms.
+  The same check run on a manifest from before the fix reports the old bug. The text below is
+  kept as the record of the problem.
 - **Observation:** The generator builds the whole match timeline up front
   (`event_time = start_time + game offset`), and the simulator then sends every event
   immediately. So `event_time` is simulated game time running *ahead* of wall-clock time.
@@ -353,7 +360,14 @@ build images quietly first (`make e2e-images`). Live numbers on this laptop: smo
 - *Out of scope until Phase 4:* `kill -9`, killing a batch midway, Kafka restarts, topic
   recreation.
 
-### D1.13 Plan: simulator pacing modes + deliberate lateness (not built yet; before Phase 2)
+### D1.13 Plan: simulator pacing modes + deliberate lateness (BUILT in slice e, see D1.17)
+> **Status: built on 2026-11-15.** This is the original plan, kept for the record. D1.17
+> describes what was actually built. Differences from this plan: (1) the default pace is
+> `backfill`, not `realtime`; (2) lateness comes from a per-event sha256 hash, not from a
+> second `Random` stream (`Random(seed, "lateness")` is not valid Python anyway); (3) delays
+> come from two bands with a gap between them, not "5-60 s plus a 10 min tail"; (4) the send
+> order is a plain sort, not a priority queue (all events exist up front).
+
 Rule: **the event content stays deterministic; only *when* it is sent changes.** The generator
 stays a pure function that builds the timeline. A new *scheduler* layer decides send times.
 
@@ -386,3 +400,135 @@ stays a pure function that builds the timeline. A new *scheduler* layer decides 
   as a data-quality issue (clock skew or a bad client).
 - **Out of scope here:** Injecting duplicates and shuffling order belongs to Phase 4. Those will
   reuse the same scheduler.
+
+### D1.17 Pacing modes, deliberate lateness, manifest v3 (slice e, as built)
+Rule: **what an event is never changes; only when it is sent.** The generator is untouched.
+`tests/unit/test_event_id_pins.py` pins the event_ids of seeds 42 and 7, captured from the code
+before this slice; no pacing or lateness setting may change them.
+
+Code: `simulator/schedule.py` (pure planning), `simulator/sender.py` (the only place that
+waits), `simulator/main.py::prepare_run`, `simulator/manifest.py`, `common/manifest_reader.py`,
+`e2e/timing_check.py`.
+
+**Pace modes (`pace`, `--pace`)**
+- `backfill` (default): send as fast as possible. With no `start_time` the timeline is placed
+  so that its last `event_time` is "now", so every event is in the past, like replaying
+  history. With an explicit `start_time` the run is refused (exit 2) if its last event would be
+  in the future.
+- `realtime`: each event is sent when the wall clock reaches its send time. The timeline starts
+  1 s after "now". `start_time` (except with `--dry-run`) and `rate_per_s` are refused.
+- `time_scale` (default 1): divides all gaps in the timeline before `event_time` is stamped, so
+  `event_time` still equals the real send time. `duration_s` is not scaled (it is game-clock
+  data, not a timestamp). Delays of late events are NOT scaled either: a watermark is measured
+  in real seconds.
+- *Why backfill is the default:* it finishes at once, so `make smoke`, `make demo` and
+  `make smoke-restart` keep their run times, and it already removes the future timestamps.
+  *Tradeoff:* with the default config, event times are up to ~50 minutes old on arrival.
+- *Realtime waiting:* due times are tracked on the monotonic clock (the wall clock can jump,
+  e.g. when WSL2 resumes), the wait is `producer.poll(timeout)` so delivery callbacks keep being
+  served, and just before each send the wall clock is checked so that no event leaves before
+  its own `event_time`. If the laptop falls behind, events go out late but in the same order.
+
+**Deliberate lateness (`late_fraction`, default 0 = off)**
+A late event keeps its `event_time` but is sent `delay` later, so it arrives after newer events
+of the same match (out of order within the partition). Exact formula:
+
+```
+digest = hashlib.sha256(f"{seed}:lateness:{event_id}".encode("utf-8")).digest()
+u1 = int.from_bytes(digest[0:8],   "big") / 2**64
+u2 = int.from_bytes(digest[8:16],  "big") / 2**64
+u3 = int.from_bytes(digest[16:24], "big") / 2**64
+late     = u1 < late_fraction
+band     = "very" if u2 < late_too_late_share else "slight"
+lo, hi   = (2.0, 3.0) if band == "very" else (0.1, 0.5)      # multiples of W
+delay_ms = round((lo + u3 * (hi - lo)) * assumed_watermark_s * 1000)
+```
+
+- `hashlib` on purpose, never Python's `hash()`: `hash()` is salted per process
+  (PYTHONHASHSEED), so the plan would change on every run. A test checks two processes with
+  different hash seeds give the same result.
+- It never touches the generator's RNG. An event's lateness depends only on
+  (seed, event_id, settings), so adding matches or changing pace or `time_scale` never changes
+  it, and raising `late_fraction` only adds late events.
+- `late_too_late_share` (default **0.2**) is the share of the *late* events that land in the
+  `very` band. It is a setting, not a side effect.
+- `assumed_watermark_s` = W (default **30**, a placeholder). Phase 2 chooses the real
+  watermark; the bands are multiples of W, so one number rescales every delay.
+
+| Band | Delay | `expected` |
+|---|---|---|
+| on time | 0 | `keep` |
+| `slight` | 0.1 W to 0.5 W (3-15 s at W = 30) | `keep` |
+| `very` | 2 W to 3 W (60-90 s at W = 30) | `may_drop` |
+
+**The band rule.** `expected` is decided by the band, i.e. by the planned delay, not by
+`stream_lag_ms`.
+- `stream_lag_ms` (recorded per late event) is how far the newest `event_time` sent before the
+  event is ahead of the event's own `event_time`. That is the quantity a watermark compares,
+  and it is never larger than the delay.
+- `keep` for `slight` events **relies on the dead zone between 0.5 W and W**. Sending is
+  asynchronous: a message handed to the client slightly later can reach the broker slightly
+  earlier (another partition, batching, a retry). So a neighbouring newer event may overtake a
+  late one and push the watermark a little further than planned. A slight event is at most
+  0.5 W behind the stream; the other 0.5 W absorbs that reordering. No delay is ever generated
+  between 0.5 W and 2 W, so no test outcome depends on millisecond timing.
+- `may_drop` means *allowed*, not *obliged*, to be rejected. A very late event with a small
+  lag (for example at the very end of a run, when nothing newer exists) will normally be kept.
+  It is still labelled `may_drop`, because "nothing newer overtakes it" cannot be promised.
+
+**What lateness can and cannot show**
+- Spark's watermark is `max(event_time seen in EARLIER micro-batches) - W`. It never looks at
+  the wall clock.
+- **Backfill lateness cannot demonstrate drops.** In backfill the events are sent in late
+  order but without waiting, so a whole run lands in one or two micro-batches and the watermark
+  hardly moves while they are processed. Backfill lateness only tests out-of-order handling.
+  **Phase 2 late-drop tests must use `pace: realtime`.**
+- **UNVERIFIED claim, to re-check against Spark 4.1.4 at the start of Phase 2:** "Structured
+  Streaming has no side output for too-late rows; stateful operators drop them silently." This
+  comes from general knowledge of Spark, not from a test in this repo. If it is true, Phase 2
+  must route too-late events to a table itself, because silent drops would break the oracle.
+- **Oracle (Phase 4) with lateness.** Late events are Kafka-confirmed, so they stay in the
+  manifest's delivered ids, totals and checksum; v3 only annotates them. The raw layer must
+  contain every one of them (`make verify`, unchanged). For a watermark-gated layer the rule
+  becomes: `accepted + late table == confirmed`, no overlap, and anything missing from
+  `accepted` must be a `may_drop` event.
+
+**Manifest v3** (v1 and v2 stay readable; unknown versions are rejected)
+- `pacing`: mode, `time_scale`, `assumed_watermark_s`, `late_fraction`, `late_too_late_share`,
+  both band definitions, and what the send loop measured (`sent`, `future_events`,
+  `max_ahead_ms`, `max_behind_ms`).
+- `late_counts`: delivered late events per band. Always written.
+- `late_events`: one entry per delivered late event, in send order: `event_id`, `match_id`,
+  `delay_ms`, `band`, `expected`, `stream_lag_ms`. Only delivered events are listed.
+- The list is left out (`null`) in two cases, and `late_events_omitted_reason` says which:
+  `no_manifest_ids` (`--no-manifest-ids`) or `too_many_late_events` (more than 100,000, about
+  20 MB of JSON).
+- *Why a new version for an additive change:* the reader rejects unknown versions on purpose,
+  and the version tells a reader what a missing entry means.
+
+What the reader (`common/manifest_reader.py`) returns, and what it means:
+
+| Manifest | `pacing` | `late_events` | Meaning |
+|---|---|---|---|
+| v1, v2 | `None` | `None` | lateness was **not recorded**; nothing can be concluded |
+| v3, list present | set | mapping, possibly empty `{}` | an event **not in it was on time**; `{}` = nobody was late |
+| v3, list omitted | set | `None`, reason set | counts known (`late_counts`), individual events not |
+
+Never treat `None` as "on time": the e2-era v2 fixture is a run that *did* send late events
+and has no record of them.
+
+**Guardrails**
+- The send loop counts events sent before their `event_time` (`future_events`, WARNING if > 0).
+- `make timing-check MANIFEST=...` is the independent check: it reads the run back from Kafka
+  and compares `CreateTime` with `event_time`. Tolerance 1 ms, because both timestamps are
+  whole milliseconds, so rounding alone can differ by 1 ms. Measured on this machine: 0 ms.
+- Seed reuse: if a manifest for the same seed already exists, the simulator logs a WARNING
+  (it does not fail, because sending duplicates on purpose is a valid test, D1.6).
+- `make verify` rebuilds the Spark image first (cached), so it never runs a stale reader.
+
+**Known limits**
+- All events are held in memory and sorted (unchanged). Fine for tests; large benchmarks will
+  need streaming generation.
+- A very large realtime run starts slightly behind, because the plan is built after "now" is
+  taken. `max_behind_ms` shows it.
+- Out of scope, Phase 4: injected duplicates and shuffled order (they will reuse the schedule).

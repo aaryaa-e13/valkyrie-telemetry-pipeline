@@ -1,0 +1,101 @@
+{
+  "manifest_version": 2,
+  "run_id": "20261115T101248Z_seed703",
+  "created_at": "2026-11-15T10:14:07.603+00:00",
+  "interrupted": false,
+  "seed": 703,
+  "start_time": "2026-11-15T10:12:49.787000+00:00",
+  "topic": "game-events",
+  "config": {
+    "seed": 703,
+    "num_matches": 2,
+    "players_per_team": 1,
+    "player_pool_size": 5000,
+    "kills_per_match_min": 1,
+    "kills_per_match_max": 2,
+    "items_per_player_min": 0,
+    "items_per_player_max": 1,
+    "match_duration_s_min": 60,
+    "match_duration_s_max": 120,
+    "match_interval_s": 5,
+    "patch_version": "14.3",
+    "regions": [
+      "EUW",
+      "NA",
+      "KR",
+      "BR"
+    ],
+    "start_time": null,
+    "bootstrap_servers": "localhost:9092",
+    "topic": "game-events",
+    "client_id": "valkyrie-simulator",
+    "flush_timeout_s": 30.0,
+    "rate_per_s": 0.0,
+    "pace": "realtime",
+    "time_scale": 10.0,
+    "late_fraction": 0.3,
+    "late_too_late_share": 0.2,
+    "assumed_watermark_s": 30.0,
+    "manifest_dir": "manifests",
+    "manifest_include_event_ids": true,
+    "log_level": "INFO"
+  },
+  "totals": {
+    "matches": 2,
+    "events_generated": 13,
+    "events_delivered": 13,
+    "events_failed": 0
+  },
+  "delivered_checksum": {
+    "algorithm": "sha256(sorted event_ids joined by newline)",
+    "value": "870fd5a3e0d0305c0960bc81a2c2d968bbb919ba7a1f0651b67b0aab6ed71e21"
+  },
+  "kafka_offsets": {
+    "0": {
+      "min": 945,
+      "max": 950,
+      "count": 6
+    },
+    "3": {
+      "min": 827,
+      "max": 833,
+      "count": 7
+    }
+  },
+  "matches": {
+    "4d780b2d-9f87-485d-b154-94021e81f476": {
+      "events_generated": 6,
+      "events_delivered": 6,
+      "max_match_seq": 6,
+      "partitions": [
+        0
+      ],
+      "event_ids": [
+        "e8f6d415-4bc6-5864-8268-86a88f565c8c",
+        "903c3249-398d-583c-b629-b9cf698f6686",
+        "7fd732c3-59bb-5888-b1c2-c7f7e2cb764d",
+        "aec3363e-175f-5bcc-a825-50358d79d306",
+        "5218ef69-0203-5261-abef-b7447c5cd3ab",
+        "817580dd-65b4-5e41-979c-bb7847c25417"
+      ]
+    },
+    "f8bace9a-7a77-4d58-a79c-72f7516f9d53": {
+      "events_generated": 7,
+      "events_delivered": 7,
+      "max_match_seq": 7,
+      "partitions": [
+        3
+      ],
+      "event_ids": [
+        "34213309-76a0-52d1-9d35-3d502c51e559",
+        "b4af9815-ed00-540b-823d-e9319ea63d56",
+        "ea3e5840-6a4b-539c-ad9f-39e566a1b15b",
+        "9d33e7aa-ca9f-5172-909a-36420b3f929b",
+        "76453e61-17de-5cad-94b6-86badc9c5e7a",
+        "a1019151-7d8e-56d0-98d6-abd84bfe049d",
+        "9aae0805-b0b1-51cd-bfe7-6f6b6ca40cef"
+      ]
+    }
+  },
+  "failed_event_ids": []
+}

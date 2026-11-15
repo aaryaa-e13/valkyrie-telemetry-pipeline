@@ -98,3 +98,23 @@ def test_unusable_manifest_exits_2_before_starting_spark(tmp_path: Path) -> None
     bad = copy.deepcopy(V1)
     bad["manifest_version"] = 99
     assert main(["--manifest", str(_manifest(tmp_path, bad))]) == 2
+
+
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "manifests"
+
+
+@pytest.mark.parametrize("name", [
+    "v1_run_20261114T131326Z_seed42.json",
+    "v2_pre_e2_run_20261115T095317Z_seed1794736395320.json",
+    "v2_e2_run_20261115T101248Z_seed703.json",
+    "v3_run_20261115T105409Z_seed723.json",
+], ids=["v1", "v2_pre_e2", "v2_e2", "v3"])
+def test_real_manifest_fixtures_of_every_version_verify(spark, tmp_path: Path, name: str) -> None:
+    """Real manifests (committed copies) against a lake that holds exactly their ids."""
+    raw = json.loads((FIXTURES / name).read_text())
+    ids = [i for match in raw["matches"].values() for i in match["event_ids"]]
+    report = verify(spark, FIXTURES / name, _lake(spark, tmp_path, ids))
+    assert report["manifest_version"] == raw["manifest_version"]
+    assert report["expected_unique_ids"] == len(ids) == raw["totals"]["events_delivered"]
+    assert (report["missing_ids"], report["duplicate_rows"]) == (0, 0)
+    assert evaluate(report, fail_on_duplicates=True)[0] == "PASS"

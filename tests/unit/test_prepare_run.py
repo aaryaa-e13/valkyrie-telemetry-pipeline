@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -10,7 +12,8 @@ import pytest
 from simulator.config import SimulatorConfig
 from simulator.generator import generate_events
 from simulator.main import REALTIME_LEAD, parse_args, prepare_run, run
-from simulator.manifest import event_ids_checksum
+from simulator.manifest import event_ids_checksum, find_manifests_for_seed
+from simulator.producer import DeliveryTracker
 
 NOW = datetime(2026, 11, 15, 9, 30, 0, 123456, tzinfo=UTC)
 PAST = datetime(2026, 11, 14, 12, 0, 0, tzinfo=UTC)
@@ -152,6 +155,7 @@ class _FakeProducer:
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         self.sent: list[object] = []
+        self.tracker = DeliveryTracker()
         _FakeProducer.instances.append(self)
 
     def check_topic(self) -> int:
@@ -159,6 +163,26 @@ class _FakeProducer:
 
     def send(self, event: object) -> None:
         self.sent.append(event)
+        # Pretend the broker acknowledged it: partition 0, next offset.
+        self.tracker.on_delivery(
+            event.event_id, event.match_id, None, _FakeMsg(len(self.sent)))  # type: ignore[attr-defined,arg-type]
+
+    def poll(self, timeout_s: float) -> None:
+        return None
+
+    def flush(self, timeout_s: float) -> int:
+        return 0
+
+
+class _FakeMsg:
+    def __init__(self, offset: int) -> None:
+        self._offset = offset
+
+    def partition(self) -> int:
+        return 0
+
+    def offset(self) -> int:
+        return self._offset
 
 
 def test_run_exits_2_and_sends_nothing_when_the_timeline_would_end_in_the_future(
@@ -174,3 +198,56 @@ def test_run_exits_2_and_sends_nothing_when_the_timeline_would_end_in_the_future
     assert len(_FakeProducer.instances) == 1
     assert _FakeProducer.instances[0].sent == []      # nothing reached "Kafka"
     assert list(tmp_path.iterdir()) == []             # and no manifest was written
+
+
+# --- seed reuse guard --------------------------------------------------------------
+
+SEED_REUSE_TEXT = "seed was used before"
+
+
+def _tiny(tmp_path: Path, seed: int) -> SimulatorConfig:
+    return SimulatorConfig(seed=seed, num_matches=1, players_per_team=1,
+                           manifest_dir=str(tmp_path))
+
+
+def test_reusing_a_seed_warns_but_still_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _FakeProducer.instances.clear()
+    monkeypatch.setattr("simulator.main.EventProducer", _FakeProducer)
+    caplog.set_level(logging.INFO, logger="simulator")
+
+    assert run(_tiny(tmp_path, 733), clock=lambda: NOW) == 0
+    assert SEED_REUSE_TEXT not in caplog.text                     # first use: silent
+    first = find_manifests_for_seed(tmp_path, 733)
+    assert len(first) == 1
+
+    caplog.clear()
+    later = NOW + timedelta(minutes=3)
+    assert run(_tiny(tmp_path, 733), clock=lambda: later) == 0    # a warning, not a failure
+    warnings = [r for r in caplog.records
+                if r.levelno == logging.WARNING and SEED_REUSE_TEXT in r.getMessage()]
+    assert len(warnings) == 1
+    assert warnings[0].fields["earlier_manifests"] == [str(first[0])]  # type: ignore[attr-defined]
+
+    # Both runs were "sent" in full and are the SAME events: that is the duplication.
+    both = find_manifests_for_seed(tmp_path, 733)
+    assert len(both) == 2
+    checksums = {json.loads(p.read_text())["delivered_checksum"]["value"] for p in both}
+    assert len(checksums) == 1
+    assert len(_FakeProducer.instances[1].sent) == len(_FakeProducer.instances[0].sent) > 0
+
+
+def test_a_different_seed_does_not_warn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr("simulator.main.EventProducer", _FakeProducer)
+    caplog.set_level(logging.INFO, logger="simulator")
+    assert run(_tiny(tmp_path, 733), clock=lambda: NOW) == 0
+    assert run(_tiny(tmp_path, 7330), clock=lambda: NOW) == 0     # 733 is a prefix of 7330
+    assert run(_tiny(tmp_path, 33), clock=lambda: NOW) == 0       # and 33 a suffix of 733
+    assert SEED_REUSE_TEXT not in caplog.text
+
+
+def test_find_manifests_for_seed_on_a_missing_folder_is_empty(tmp_path: Path) -> None:
+    assert find_manifests_for_seed(tmp_path / "nope", 1) == []

@@ -10,6 +10,10 @@ VENV := .venv
 PY := $(VENV)/bin/python
 UV := $(shell command -v uv 2>/dev/null || echo $(HOME)/.local/bin/uv)
 SEED ?= 42
+# For targets that must not reuse a seed (sim-realtime, sim-late): use SEED if you
+# passed one (make sim-late SEED=7), otherwise a fresh one (epoch milliseconds,
+# generated in Python like `make smoke` does).
+FRESH_SEED = $(if $(filter file,$(origin SEED)),$(shell $(PY) -c "import time; print(time.time_ns() // 1_000_000)"),$(SEED))
 
 .DEFAULT_GOAL := help
 
@@ -17,7 +21,9 @@ SEED ?= 42
 dirs: ## Create bind-mount folders owned by you (Docker would create them as root)
 	mkdir -p data data/status manifests
 
-.PHONY: help env up down ps logs topics describe-topic venv sim-dry sim-local sim-tiny sim consume test-unit lint spark-build spark-up spark-stop spark-logs verify test-spark demo smoke e2e-images smoke-restart
+.PHONY: help env up down ps logs topics describe-topic venv sim-dry sim-local sim-tiny sim \
+	sim-realtime sim-late timing-check consume test-unit lint spark-build spark-image spark-up \
+	spark-stop spark-logs verify test-spark demo smoke e2e-images smoke-restart
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -68,6 +74,18 @@ sim-local: dirs ## Send a default run from the laptop via localhost:9092 (SEED=4
 sim: dirs ## Send a tiny run from the simulator container via kafka:29092 (SEED=42)
 	$(COMPOSE) --profile sim run --rm --build simulator --config simulator/config.tiny.yaml --seed $(SEED)
 
+sim-realtime: dirs ## Realtime pace: tiny run, game time 10x faster, ~15 s (fresh seed unless SEED=)
+	$(PY) -m simulator.main --config simulator/config.tiny.yaml --seed $(FRESH_SEED) \
+		--pace realtime --time-scale 10
+
+sim-late: dirs ## Realtime pace with 30% deliberately late events, up to ~2 min (fresh seed unless SEED=)
+	$(PY) -m simulator.main --config simulator/config.tiny.yaml --seed $(FRESH_SEED) \
+		--pace realtime --time-scale 10 --late-fraction 0.3
+
+timing-check: ## Read a run back from Kafka: was any event sent before its event_time? (MANIFEST=...)
+	@test -n "$(MANIFEST)" || (echo "usage: make timing-check MANIFEST=manifests/run_X.json" && exit 2)
+	@$(PY) -m e2e.timing_check --manifest $(MANIFEST) $(TIMING_ARGS)
+
 test-unit: ## Run unit tests (no Docker needed)
 	$(PY) -m pytest tests/unit -q
 
@@ -88,7 +106,12 @@ spark-stop: ## Stop the streaming job gracefully (checkpoint keeps its position)
 spark-logs: ## Follow streaming job logs
 	$(COMPOSE) --profile spark logs -f spark
 
-verify: dirs ## Compare raw Parquet with a run manifest (MANIFEST=manifests/run_X.json)
+spark-image: ## Rebuild the Spark image quietly if code changed (cached: a few seconds)
+	@$(COMPOSE) --profile spark build --quiet spark
+
+# verify depends on spark-image: the manifest reader is baked into the image, so a
+# stale image would verify with old code (it once rejected v3 manifests; WHAT_BROKE).
+verify: dirs spark-image ## Compare raw Parquet with a run manifest (MANIFEST=manifests/run_X.json)
 	@test -n "$(MANIFEST)" || (echo "usage: make verify MANIFEST=manifests/run_X.json" && exit 2)
 	$(COMPOSE) --profile tools run --rm -T spark-tools \
 		python -m streaming.verify_manifest --manifest /app/$(MANIFEST)

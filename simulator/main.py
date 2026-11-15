@@ -8,7 +8,7 @@ Examples:
     python -m simulator.main --config simulator/config.tiny.yaml --pace realtime \
         --time-scale 10 --late-fraction 0.3
 
-Pace (see docs/DECISIONS.md D1.13):
+Pace (see docs/DECISIONS.md D1.17):
     backfill (default)  send as fast as possible; the timeline is placed so its
                         last event_time is "now", so no event is from the future.
     realtime            send each event when the wall clock reaches its event_time.
@@ -29,7 +29,7 @@ from datetime import UTC, datetime, timedelta
 from common.logging_setup import setup_logging
 from simulator.config import PACE_REALTIME, PACES, SimulatorConfig, load_config
 from simulator.generator import generate_events
-from simulator.manifest import build_manifest, write_manifest
+from simulator.manifest import build_manifest, find_manifests_for_seed, write_manifest
 from simulator.producer import EventProducer
 from simulator.schedule import PlannedSend, backfill_start, build_schedule, retime
 from simulator.sender import SendStats, send_backfill, send_realtime
@@ -172,6 +172,16 @@ def run(
         for planned in plan:  # printed in planned send order
             sys.stdout.write(planned.event.to_json_bytes().decode("utf-8") + "\n")
         return 0
+
+    earlier = find_manifests_for_seed(cfg.manifest_dir, cfg.seed)
+    if earlier:
+        # Not an error: sending duplicates on purpose is a valid test (D1.6).
+        log.warning(
+            "seed was used before: this run sends the SAME event_ids again, so every event "
+            "will exist more than once in Kafka and in raw Parquet. Use a new --seed for "
+            "new data",
+            extra={"fields": {"seed": cfg.seed, "earlier_runs": len(earlier),
+                              "earlier_manifests": [str(f) for f in earlier[-3:]]}})
 
     run_id = f"{clock():%Y%m%dT%H%M%SZ}_seed{cfg.seed}"
     producer = EventProducer(cfg.bootstrap_servers, cfg.topic, cfg.client_id)

@@ -124,3 +124,69 @@ Template:
   container"). Unit-tested with all three spellings.
 - **Lesson:** Don't match exact error text from another tool. And every branch, even the "missing"
   one, needs to be run live once: the unit tests passed because they never called docker.
+
+### A unit test hung forever: my fake clock could not reach the due time (Phase 1e2, test tooling)
+- **Symptom:** `pytest tests/unit` printed dots, then stopped. No failure, no error; the command
+  hit its 120 s timeout. Before the new sender tests the whole suite took under 3 s.
+- **Root cause:** The realtime sender waits in a loop: "while time remains, wait". Kafka's
+  `poll(timeout)` may return early, so the test used a fake clock whose `wait(s)` advanced time
+  by only `0.3 * s`. The remaining time then shrank 1 s, 0.7 s, 0.49 s, ... and never reached
+  zero. Once the step was smaller than what a float near 1000.0 can represent, adding it changed
+  nothing at all and the loop spun forever. The bug was in the test helper, not in the sender:
+  a real early return still lets real time pass.
+- **How it was found:** The hang started exactly when `tests/unit/test_sender.py` was added, and
+  only one test used `early_return=0.3`. Re-running with `timeout 100 pytest -x` kept the run
+  bounded while narrowing it down.
+- **Fix:** The fake clock now advances by at least 0.5 ms per wait:
+  `min(seconds, max(seconds * early_return, 0.0005))`.
+- **Lesson:** A fake clock must not be able to stand still, or any "wait until" loop becomes an
+  infinite loop. And run new tests under a timeout, so a hang shows up as a failure.
+- **Also learned:** I tried to stop the hung run with `pkill -f "pytest tests/unit"`. The pattern
+  matched the shell that was running `pkill` itself and killed that too. Same trap as the
+  `pgrep -f` entry above.
+
+### `make verify` rejected a correct v3 manifest: stale Spark image (Phase 1e3)
+- **Symptom:** Right after the reader learned manifest v3 (and its unit tests passed),
+  `make verify MANIFEST=manifests/run_20261115T105353Z_seed721.json` failed with
+  `manifest_version 3 not supported (supported: [1, 2])` and `make: *** [verify] Error 2`.
+- **Root cause:** `common/manifest_reader.py` is copied into the Spark image at build time
+  (`COPY common/ common/`). `make verify` runs inside that image but did not rebuild it. So the
+  laptop had the new reader and the container still had the old one. `make smoke` hid this,
+  because it rebuilds both images first.
+- **How it was found:** The message listed `[1, 2]` although the file on disk said `{1, 2, 3}`:
+  two different copies of the code. `docker-compose.yml` showed that `spark-tools` uses the
+  image and mounts only `data/` and `manifests/`, not the source code.
+- **Fix:** `make verify` now depends on a new `spark-image` target (a quiet, cached build that
+  takes a few seconds when nothing changed).
+- **Lesson:** Code baked into an image is a snapshot. Every target that runs code from an image
+  must build it first, or it will sooner or later test old code. The useful part: the stale
+  reader failed loudly instead of misreading a format it did not know. That is why unknown
+  manifest versions are rejected.
+
+### Seed 733 sent twice: every event twice in raw Parquet (Phase 1e3, operator error the tool allowed)
+- **Symptom:** `make verify` for the seed 733 run reported `"found_unique_ids": 14`,
+  `"rows_for_these_ids": 28`, `"duplicate_rows": 14`: every event was in Parquet exactly twice.
+  (The result was still PASS, because the raw layer only reports duplicates unless
+  `--fail-on-duplicates` is given.)
+- **Root cause:** The same simulator command was run twice with `--seed 733`. `event_id` is
+  derived from the seed (D1.6), so the second run produced the same 14 ids and Kafka stored
+  them as 14 new messages. Nothing was wrong in Kafka or Spark; the raw layer keeps everything
+  (D1.14). The simulator gave no hint that the seed had been used.
+- **How it was found:** `manifests/` held two files for the seed,
+  `run_20261115T111409Z_seed733.json` and `run_20261115T111755Z_seed733.json`. They have the
+  same `delivered_checksum` (the same events) but different `kafka_offsets` (partition 0:
+  1043-1049 and 1050-1056; partition 4: 1230-1236 and 1237-1243). Same ids at two different
+  offset ranges means two sends, not a pipeline that wrote rows twice.
+- **Fix:** (1) The simulator now logs a WARNING when a manifest for the same seed already
+  exists. It does not fail, because resending a seed on purpose is a legitimate duplicate test.
+  (2) `make sim-realtime` and `make sim-late` generate a fresh seed unless `SEED=` is given.
+- **Second trap, the `$(ls ...)` gotcha:** `make verify MANIFEST=$(ls manifests/run_*_seed733.json)`
+  expands to *two* paths once two files match. `MANIFEST` gets the first one, and make treats
+  the second as a target to build and only prints `make: Nothing to be done for
+  'manifests/run_20261115T111755Z_seed733.json'`. So one run is verified and the other is
+  silently skipped. Paste the exact file name from the simulator's `run complete` line, or pick
+  the newest explicitly: `ls -t manifests/run_*_seed733.json | head -1`.
+- **Lesson:** Deterministic ids make re-sending a seed look like duplicates, which is exactly
+  what Phase 2 dedupe needs for testing, but the tool must say so. To tell "sent twice" from
+  "written twice", compare the Kafka offsets of the runs. And a shell glob in a command is only
+  safe while exactly one file matches.

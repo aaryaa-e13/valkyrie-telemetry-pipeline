@@ -11,5 +11,5 @@ __pycache__/
 # Pipeline output (data lake, checkpoints, simulator manifests)
 data/
 checkpoints/
-manifests/
+/manifests/
 docs/plans/

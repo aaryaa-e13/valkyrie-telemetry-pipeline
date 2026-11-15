@@ -222,6 +222,16 @@ def build_manifest(
     }
 
 
+def find_manifests_for_seed(directory: str | Path, seed: int) -> list[Path]:
+    """Manifests of earlier runs with this seed (file name `run_<time>_seed<seed>.json`).
+
+    The same seed always produces the same event_ids, so an earlier manifest
+    means the events were probably sent before and a new run duplicates them.
+    Only as good as the folder: deleted manifests cannot warn anyone.
+    """
+    return sorted(Path(directory).glob(f"run_*_seed{seed}.json"))
+
+
 def write_manifest(manifest: Mapping[str, Any], directory: str | Path) -> Path:
     """Write the manifest atomically (temp file + rename) and return its path.
 

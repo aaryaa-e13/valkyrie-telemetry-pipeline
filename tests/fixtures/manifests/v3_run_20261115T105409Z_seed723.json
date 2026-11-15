@@ -1,0 +1,196 @@
+{
+  "manifest_version": 3,
+  "run_id": "20261115T105409Z_seed723",
+  "created_at": "2026-11-15T10:55:32.576+00:00",
+  "interrupted": false,
+  "seed": 723,
+  "start_time": "2026-11-15T10:54:10.548000+00:00",
+  "topic": "game-events",
+  "config": {
+    "seed": 723,
+    "num_matches": 2,
+    "players_per_team": 1,
+    "player_pool_size": 5000,
+    "kills_per_match_min": 1,
+    "kills_per_match_max": 2,
+    "items_per_player_min": 0,
+    "items_per_player_max": 1,
+    "match_duration_s_min": 60,
+    "match_duration_s_max": 120,
+    "match_interval_s": 5,
+    "patch_version": "14.3",
+    "regions": [
+      "EUW",
+      "NA",
+      "KR",
+      "BR"
+    ],
+    "start_time": null,
+    "bootstrap_servers": "localhost:9092",
+    "topic": "game-events",
+    "client_id": "valkyrie-simulator",
+    "flush_timeout_s": 30.0,
+    "rate_per_s": 0.0,
+    "pace": "realtime",
+    "time_scale": 10.0,
+    "late_fraction": 0.5,
+    "late_too_late_share": 0.2,
+    "assumed_watermark_s": 30.0,
+    "manifest_dir": "manifests",
+    "manifest_include_event_ids": true,
+    "log_level": "INFO"
+  },
+  "totals": {
+    "matches": 2,
+    "events_generated": 13,
+    "events_delivered": 13,
+    "events_failed": 0
+  },
+  "delivered_checksum": {
+    "algorithm": "sha256(sorted event_ids joined by newline)",
+    "value": "b092a14b7cd27a1e2c517df351db7c0a55d7799d46a85430b372c3176b12104b"
+  },
+  "kafka_offsets": {
+    "3": {
+      "min": 1307,
+      "max": 1319,
+      "count": 13
+    }
+  },
+  "pacing": {
+    "mode": "realtime",
+    "time_scale": 10.0,
+    "assumed_watermark_s": 30.0,
+    "late_fraction": 0.5,
+    "late_too_late_share": 0.2,
+    "bands": {
+      "slight": {
+        "min_x_watermark": 0.1,
+        "max_x_watermark": 0.5,
+        "min_delay_ms": 3000,
+        "max_delay_ms": 15000,
+        "expected": "keep"
+      },
+      "very": {
+        "min_x_watermark": 2.0,
+        "max_x_watermark": 3.0,
+        "min_delay_ms": 60000,
+        "max_delay_ms": 90000,
+        "expected": "may_drop"
+      }
+    },
+    "measured": {
+      "sent": 13,
+      "future_events": 0,
+      "max_ahead_ms": 0,
+      "max_behind_ms": 0
+    }
+  },
+  "late_counts": {
+    "slight": 5,
+    "very": 3
+  },
+  "late_events_omitted_reason": null,
+  "late_events": [
+    {
+      "event_id": "ae23cc08-3b73-5379-9a99-72895a6c6a59",
+      "match_id": "318c948a-4494-4a3d-b453-72142cec6930",
+      "delay_ms": 6445,
+      "band": "slight",
+      "expected": "keep",
+      "stream_lag_ms": 3783
+    },
+    {
+      "event_id": "91539a19-4ef8-53fa-a508-30faca2e684b",
+      "match_id": "4bdd1b5a-f18d-4818-b939-580d1fe2ef35",
+      "delay_ms": 6567,
+      "band": "slight",
+      "expected": "keep",
+      "stream_lag_ms": 6355
+    },
+    {
+      "event_id": "5205d932-b3e0-5994-8210-6df7bc1e710b",
+      "match_id": "318c948a-4494-4a3d-b453-72142cec6930",
+      "delay_ms": 3632,
+      "band": "slight",
+      "expected": "keep",
+      "stream_lag_ms": 2787
+    },
+    {
+      "event_id": "b9a3d76e-27df-5125-8b2f-150d34b47d59",
+      "match_id": "318c948a-4494-4a3d-b453-72142cec6930",
+      "delay_ms": 14898,
+      "band": "slight",
+      "expected": "keep",
+      "stream_lag_ms": 10879
+    },
+    {
+      "event_id": "d9bca243-9bee-55a6-9ae3-d3fe5c753b4f",
+      "match_id": "318c948a-4494-4a3d-b453-72142cec6930",
+      "delay_ms": 11183,
+      "band": "slight",
+      "expected": "keep",
+      "stream_lag_ms": 1197
+    },
+    {
+      "event_id": "53317c71-f2a4-569c-9f1f-8a988652564d",
+      "match_id": "4bdd1b5a-f18d-4818-b939-580d1fe2ef35",
+      "delay_ms": 73961,
+      "band": "very",
+      "expected": "may_drop",
+      "stream_lag_ms": 6986
+    },
+    {
+      "event_id": "9dc7618a-09f3-5a75-8c69-9883e1988529",
+      "match_id": "4bdd1b5a-f18d-4818-b939-580d1fe2ef35",
+      "delay_ms": 78938,
+      "band": "very",
+      "expected": "may_drop",
+      "stream_lag_ms": 10407
+    },
+    {
+      "event_id": "642c3026-9586-52e8-ac72-2d44479511bc",
+      "match_id": "4bdd1b5a-f18d-4818-b939-580d1fe2ef35",
+      "delay_ms": 81425,
+      "band": "very",
+      "expected": "may_drop",
+      "stream_lag_ms": 10847
+    }
+  ],
+  "matches": {
+    "318c948a-4494-4a3d-b453-72142cec6930": {
+      "events_generated": 7,
+      "events_delivered": 7,
+      "max_match_seq": 7,
+      "partitions": [
+        3
+      ],
+      "event_ids": [
+        "ae23cc08-3b73-5379-9a99-72895a6c6a59",
+        "b9a3d76e-27df-5125-8b2f-150d34b47d59",
+        "944e3138-3b41-5b41-9f87-69f37423306d",
+        "47d18abe-ce97-5e53-85d6-07a26e0ccf16",
+        "5205d932-b3e0-5994-8210-6df7bc1e710b",
+        "d9bca243-9bee-55a6-9ae3-d3fe5c753b4f",
+        "160fb9f0-ce7e-580d-a79b-de3d4f375647"
+      ]
+    },
+    "4bdd1b5a-f18d-4818-b939-580d1fe2ef35": {
+      "events_generated": 6,
+      "events_delivered": 6,
+      "max_match_seq": 6,
+      "partitions": [
+        3
+      ],
+      "event_ids": [
+        "642c3026-9586-52e8-ac72-2d44479511bc",
+        "91539a19-4ef8-53fa-a508-30faca2e684b",
+        "9dc7618a-09f3-5a75-8c69-9883e1988529",
+        "9609b7ed-b9c1-5936-a274-11e37327599d",
+        "53317c71-f2a4-569c-9f1f-8a988652564d",
+        "3185967b-9fbe-5cf0-9729-b9b1cbc7892e"
+      ]
+    }
+  },
+  "failed_event_ids": []
+}
