@@ -1,0 +1,284 @@
+"""Pure checks for the graceful-restart scenario (no Docker, no I/O).
+
+Scenario (e2e/smoke_restart.py): baseline -> graceful stop -> run sent while
+Spark is down -> restart -> catch-up -> these checks. All inputs come from
+one "evidence" dict, so a saved evidence file can be re-checked offline
+(`python -m e2e.smoke_restart --check-evidence FILE`). That is also how the
+failure paths are demonstrated: edit a copy, re-check.
+
+Names:
+    E0  committed end offsets per partition after the stop (exclusive)
+    B0  last committed batch_id after the stop
+    Q0  query_id after the stop (stored in the checkpoint)
+    R0  run_id of the process that committed B0 (changes on every restart)
+
+First post-restart batch: in the status history (same Q0), the batch with
+batch_id B0 + 1. Batch ids increase by exactly 1 per executed batch, so
+anything else means the history does not contain it and we cannot prove
+anything. Its run_id must differ from R0 and match the new process's
+"query started" log line. If Spark had planned but not committed a batch
+before the stop, it re-runs it as B0 + 1, and the same rule applies: it must
+start exactly at E0.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from typing import Any
+
+from common.manifest_reader import OffsetRange
+
+EVIDENCE_VERSION = 1
+
+
+def _int_keys(d: Mapping[Any, Any] | None) -> dict[int, int] | None:
+    return None if d is None else {int(k): int(v) for k, v in d.items()}
+
+
+# --- inputs ---------------------------------------------------------------------
+
+
+def parse_kafka_end_offsets(text: str, topic: str) -> dict[int, int]:
+    """Parse kafka-get-offsets.sh output lines "topic:partition:offset".
+
+    Raises:
+        ValueError: No line for `topic`, or a malformed line for it.
+    """
+    out: dict[int, int] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith(f"{topic}:"):
+            continue
+        name, partition, offset = line.rsplit(":", 2)
+        if name != topic:
+            continue
+        out[int(partition)] = int(offset)
+    if not out:
+        raise ValueError(f"no offsets for topic {topic!r} in: {text.strip()[:200]!r}")
+    return out
+
+
+@dataclass(frozen=True)
+class Batch:
+    """One committed batch from the status history, for one topic."""
+
+    batch_id: int
+    run_id: str | None
+    num_input_rows: int
+    start: dict[int, int] | None    # None: Spark reported no start offset
+    end: dict[int, int] | None
+
+
+def history_batches(status: Mapping[str, Any], topic: str) -> list[Batch]:
+    """Status history as Batch records (sorted by batch_id)."""
+    batches = []
+    for h in status.get("history") or []:
+        start = (h.get("start_offset") or {}).get(topic) if h.get("start_offset") else None
+        end = (h.get("end_offset") or {}).get(topic) if h.get("end_offset") else None
+        batches.append(Batch(int(h["batch_id"]), h.get("run_id"), int(h["num_input_rows"]),
+                             _int_keys(start), _int_keys(end)))
+    return sorted(batches, key=lambda b: b.batch_id)
+
+
+def baseline_pending(kafka_end: Mapping[int, int], committed: Mapping[int, int]) -> list[str]:
+    """Partitions where Spark has not committed everything Kafka holds (empty = done)."""
+    pending = []
+    for p in sorted(kafka_end):
+        c = committed.get(p)
+        if c is None:
+            if kafka_end[p] > 0:
+                pending.append(f"p{p}: kafka end {kafka_end[p]}, nothing committed")
+        elif c < kafka_end[p]:
+            pending.append(f"p{p}: kafka end {kafka_end[p]}, committed {c}")
+    return pending
+
+
+def run_start_problems(
+    run: Mapping[int, OffsetRange], e0: Mapping[int, int]
+) -> tuple[list[str], list[str]]:
+    """(other-writer problems, cannot-prove problems) for run.min == E0.
+
+    A run sent while Spark is down must start exactly at E0 in every partition
+    it wrote to. A higher min means someone else wrote in between.
+    """
+    writers, unprovable = [], []
+    for p in sorted(run):
+        if p not in e0:
+            unprovable.append(f"p{p}: run wrote here but E0 has no offset for it (cannot prove)")
+        elif run[p].min != e0[p]:
+            writers.append(f"p{p}: run starts at {run[p].min} but E0 is {e0[p]}: "
+                           f"{run[p].min - e0[p]} offsets in between came from another writer")
+    return writers, unprovable
+
+
+# --- checks ---------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Check:
+    """One named assertion with its outcome."""
+
+    name: str
+    ok: bool
+    detail: str
+
+
+def find_post_restart(
+    status: Mapping[str, Any] | None, *, q0: str, b0: int, r0: str | None,
+    new_run_ids: Iterable[str], topic: str,
+) -> tuple[list[Batch], list[str]]:
+    """(batches after B0, problems). Problems mean the first batch is not proven."""
+    if not status:
+        return [], ["status file missing after catch-up"]
+    if status.get("query_id") != q0:
+        return [], [f"query_id changed {q0} -> {status.get('query_id')}: checkpoint was reset, "
+                    "offsets cannot be compared with E0"]
+    post = [b for b in history_batches(status, topic) if b.batch_id > b0]
+    if not post:
+        return [], [f"no batch after B0={b0} in the status history"]
+    first = post[0]
+    problems = []
+    if first.batch_id != b0 + 1:
+        problems.append(f"history has no batch {b0 + 1} (first after B0 is {first.batch_id}; "
+                        "evicted from the 100-entry history?)")
+    if r0 is not None and first.run_id == r0:
+        problems.append(f"batch {first.batch_id} has the pre-stop run_id {r0}: "
+                        "it was not run by the restarted process")
+    new_ids = list(new_run_ids)
+    if not new_ids:
+        problems.append("no 'query started' log line after the restart")
+    elif first.run_id not in new_ids:
+        problems.append(f"batch {first.batch_id} run_id {first.run_id} does not match the "
+                        f"restarted query's run_id {new_ids}")
+    return post, problems
+
+
+def check_no_rewind(post: list[Batch], e0: Mapping[int, int]) -> list[str]:
+    """First post-restart batch starts exactly at E0; later batches chain end -> start."""
+    if not post:
+        return ["no post-restart batch to check"]
+    first = post[0]
+    if first.start is None:
+        return [f"batch {first.batch_id} has no start_offset (cannot prove)"]
+    problems = []
+    for p in sorted(e0):
+        s = first.start.get(p)
+        if s is None:
+            problems.append(f"p{p}: batch {first.batch_id} has no start offset (cannot prove)")
+        elif s < e0[p]:
+            problems.append(f"p{p}: REWIND, batch {first.batch_id} starts at {s}, E0 is {e0[p]} "
+                            f"({e0[p] - s} offsets re-read)")
+        elif s > e0[p]:
+            problems.append(f"p{p}: GAP, batch {first.batch_id} starts at {s}, E0 is {e0[p]} "
+                            f"({s - e0[p]} offsets never read)")
+    for prev, cur in zip(post, post[1:], strict=False):
+        if prev.end != cur.start:
+            problems.append(f"batch {cur.batch_id} start {cur.start} != batch {prev.batch_id} "
+                            f"end {prev.end}")
+    return problems
+
+
+def check_no_skip(
+    post: list[Batch], e0: Mapping[int, int], final_end: Mapping[int, int] | None,
+    run: Mapping[int, OffsetRange], run_count: int,
+) -> list[str]:
+    """Rows read after restart == run count, and offsets line up with E0."""
+    problems = []
+    rows = sum(b.num_input_rows for b in post)
+    if rows != run_count:
+        problems.append(f"rows read after restart {rows} != run messages {run_count} "
+                        f"({rows - run_count:+d})")
+    writers, unprovable = run_start_problems(run, e0)
+    problems += writers + unprovable
+    if final_end is None:
+        return [*problems, "no committed end offset after catch-up"]
+    for p in sorted(run):
+        if p in e0 and final_end.get(p) != e0[p] + run[p].count:
+            problems.append(f"p{p}: end {final_end.get(p)} != E0 {e0[p]} + run count "
+                            f"{run[p].count}")
+    for p in sorted(set(e0) - set(run)):
+        if final_end.get(p, e0[p]) != e0[p]:
+            problems.append(f"p{p}: run did not write here, but end moved {e0[p]} -> "
+                            f"{final_end.get(p)} (another writer?)")
+    return problems
+
+
+def check_parquet_delta(before_rows: int, after_rows: int, run_count: int) -> list[str]:
+    """Rows on disk grew by exactly the run's message count."""
+    delta = after_rows - before_rows
+    if delta == run_count:
+        return []
+    kind = "EXTRA rows (re-read or duplicate writes)" if delta > run_count else "MISSING rows"
+    return [f"Parquet rows {before_rows} -> {after_rows}: delta {delta} != run messages "
+            f"{run_count} ({delta - run_count:+d}, {kind})"]
+
+
+def check_footer_consistency(footer_rows: int, committed_rows: int | None) -> list[str]:
+    """Footer total == Spark's committed total, i.e. no uncommitted files on disk."""
+    if committed_rows is None:
+        return ["no committed row count from verify (cannot prove footer count is exact)"]
+    if footer_rows != committed_rows:
+        return [f"footer count {footer_rows} != Spark committed count {committed_rows}: "
+                f"{footer_rows - committed_rows:+d} rows in files Spark has not committed, "
+                "so the footer delta is not trustworthy"]
+    return []
+
+
+def evaluate(ev: Mapping[str, Any]) -> list[Check]:
+    """Run every check on an evidence dict (see smoke_restart.collect_evidence)."""
+    topic = ev["topic"]
+    e0 = _int_keys(ev["e0"]) or {}
+    run = {int(p): OffsetRange(*r) for p, r in ev["run_offsets"].items()}
+    run_count = int(ev["run_count"])
+    status = ev.get("status_after")
+    final_end = None
+    if status and (status.get("last_batch") or {}).get("end_offset"):
+        final_end = _int_keys(status["last_batch"]["end_offset"].get(topic))
+
+    def check(name: str, problems: list[str], ok_detail: str) -> Check:
+        return Check(name, not problems, "; ".join(problems) if problems else ok_detail)
+
+    checks = [check("graceful stop", [] if ev["stop_exit_code"] == 0 else
+                    [f"exit code {ev['stop_exit_code']} (expected 0)"],
+                    "exit code 0")]
+    checks.append(check("baseline complete",
+                        baseline_pending(_int_keys(ev["kafka_end_at_baseline"]) or {}, e0),
+                        "E0 >= Kafka end offsets in every partition"))
+    post, problems = find_post_restart(status, q0=ev["q0"], b0=int(ev["b0"]), r0=ev.get("r0"),
+                                       new_run_ids=ev.get("new_run_ids") or [], topic=topic)
+    checks.append(check("first batch after restart", problems,
+                        f"batch {post[0].batch_id} run_id {post[0].run_id}" if post else ""))
+    rewind = check_no_rewind(post, e0) if not problems else ["not evaluated: first batch unproven"]
+    checks.append(check("no re-read (start == E0)", rewind,
+                        f"batch {post[0].batch_id if post else '?'} starts at E0 "
+                        "in all partitions"))
+    checks.append(check("no skip (rows + offsets)",
+                        check_no_skip(post, e0, final_end, run, run_count),
+                        f"{run_count} rows read after restart, offsets contiguous with E0"))
+    before, after = ev["parquet_before"]["rows"], ev["parquet_after"]["rows"]
+    checks.append(check("parquet delta (footers)", check_parquet_delta(before, after, run_count),
+                        f"{before} -> {after} = +{after - before}"))
+    checks.append(check("footers == committed", check_footer_consistency(
+        after, ev.get("committed_rows_after")), f"{after} rows, no uncommitted files"))
+    v = ev.get("verify") or {}
+    checks.append(check("verify --fail-on-duplicates",
+                        [] if v.get("result") == "PASS" else [f"verify {v.get('result')}: "
+                                                              f"{v.get('notes')}"],
+                        f"{v.get('found_unique_ids')}/{v.get('expected_unique_ids')} ids, "
+                        f"{v.get('duplicate_rows')} duplicates"))
+    return checks
+
+
+def exit_code_for(checks: list[Check]) -> int:
+    """0 all pass, 5 a restart rule failed, 1 only verify failed."""
+    if any(not c.ok for c in checks if c.name != "verify --fail-on-duplicates"):
+        return 5
+    return 0 if all(c.ok for c in checks) else 1
+
+
+def format_checks(checks: list[Check]) -> str:
+    """Aligned PASS/FAIL table."""
+    width = max(len(c.name) for c in checks)
+    return "\n".join(f"  {'PASS' if c.ok else 'FAIL'}  {c.name:<{width}}  {c.detail}"
+                     for c in checks)

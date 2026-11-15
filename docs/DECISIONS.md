@@ -312,6 +312,47 @@ the sink's `_spark_metadata` needs no writes. `make verify` now uses it too.
 build images quietly first (`make e2e-images`). Live numbers on this laptop: smoke ~31 s total
 (catch-up 4-6 s, verify ~20 s, mostly JVM start-up), demo ~36 s.
 
+**Restart check: `make smoke-restart` (slice d3, `e2e/smoke_restart.py` + pure `e2e/restart.py`).**
+- *Scenario:* baseline -> graceful stop (assert exit 0) -> new-seed run sent while Spark is
+  down -> restart -> catch-up -> checks. About 48 s if Spark is already running, ~64 s if it
+  has to be started first. The job is down for ~20-30 s and **always left running**: a
+  `finally` block restarts it, and if that fails, the last line says `Start it with: make spark-up`
+  and the SUMMARY has `"spark_left_running": false`.
+- *Baseline (E0):* Kafka's real end offsets (`kafka-get-offsets.sh --time -1`) vs the status
+  file's committed end, not "status stopped changing". Because idle Spark is silent, that's the
+  only way to know the baseline is complete. E0, B0 (batch id), Q0 (query_id) and R0 (run_id)
+  are read from the status file *after* the stop, when nothing can change them.
+- *First post-restart batch:* the history entry with batch_id **B0 + 1** under the same Q0.
+  Batch ids go up by exactly 1, so if B0 + 1 isn't there we can't prove anything (e.g. evicted
+  from the 100-entry history). Its run_id must differ from R0 and equal the run_id in the new
+  process's `query started` log line. A batch that was planned but not committed before the stop
+  is re-run as B0 + 1 and must also start at E0.
+- *Checks:* no re-read (start == E0 in every partition; later batches chain end -> start), no
+  skip (rows read after restart == run count; run.min == E0 and final end == E0 + count per
+  written partition; untouched partitions don't move), and verify `--fail-on-duplicates`.
+  "Cannot prove" (E0 missing for a written partition, `start_offset` null, wrong run_id) fails.
+  It never passes.
+- *Independent data check (not our listener):* Parquet rows counted from **file footers** with
+  pyarrow (no JVM, ~0.03 s for 76 files) after the stop and after catch-up; the delta must equal
+  the run count. Footers also count files Spark never committed (aborted batches), so we
+  cross-check the "after" total against Spark's committed total, which verify already reports
+  (`parquet_total_rows`), at no extra JVM cost. If they're equal, there are no uncommitted files
+  after. The file sink only adds files, so there were none before either, and the footer delta
+  is exactly the committed delta. Checked once by hand: footers 4677 == Spark 4677. Cost: pyarrow
+  26.0.1 added to dev requirements (no transitive deps).
+- *Why the rewind test matters:* verify only looks at **this** run's ids. A restart that re-read
+  the previous run's last message would still pass verify. Only start == E0, the row count and
+  the Parquet delta catch it (shown with a faked evidence file).
+- *Evidence file:* every run writes `data/e2e/smoke_restart_<run_id>.json` with all inputs to
+  the checks. `--check-evidence FILE` re-runs the checks offline. The faked failure paths are
+  edited copies, so there are no fault-injection hooks in the live code.
+- *Exit codes:* d2's 0-4, plus **5 = restart rule failed** (stop exit code, re-read, skip,
+  Parquet delta, cannot prove). Verify failing on its own gives 1.
+- *Assumption:* nobody else writes to the topic. If someone does, run.min != E0 stops the test
+  with exit 4 (shown live with a second simulator: "p5: run starts at 966 but E0 is 888").
+- *Out of scope until Phase 4:* `kill -9`, killing a batch midway, Kafka restarts, topic
+  recreation.
+
 ### D1.13 Plan: simulator pacing modes + deliberate lateness (not built yet; before Phase 2)
 Rule: **the event content stays deterministic; only *when* it is sent changes.** The generator
 stays a pure function that builds the timeline. A new *scheduler* layer decides send times.

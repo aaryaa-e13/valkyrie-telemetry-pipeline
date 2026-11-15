@@ -52,6 +52,8 @@ LOG_TAIL = 40
 MODES: dict[str, dict[str, Any]] = {
     "smoke": {"config": "simulator/config.tiny.yaml", "timeout": 90.0, "matches": None},
     "demo": {"config": "simulator/config.yaml", "timeout": 180.0, "matches": 20},
+    # Used by e2e.smoke_restart; the timeout includes JVM start-up after the restart.
+    "restart": {"config": "simulator/config.tiny.yaml", "timeout": 120.0, "matches": None},
 }
 
 
@@ -78,9 +80,8 @@ def say(msg: str = "") -> None:
     print(msg, flush=True)
 
 
-def parse_args(argv: list[str] | None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="VALKYRIE end-to-end run")
-    p.add_argument("--mode", choices=sorted(MODES), default="smoke")
+def add_common_args(p: argparse.ArgumentParser) -> None:
+    """Flags shared by e2e.orchestrator and e2e.smoke_restart."""
     p.add_argument("--config", help="simulator config (default depends on mode)")
     p.add_argument("--matches", type=int, help="override number of matches")
     p.add_argument("--sim-rate", type=float, default=0.0, help="simulator events/s (0 = max)")
@@ -96,6 +97,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         os.environ.get("E2E_STATUS_PATH", "data/status/raw_to_parquet.json")))
     p.add_argument("--manifest-dir", type=Path, default=Path("manifests"))
     p.add_argument("--json-summary", type=Path, help="also write the summary JSON to this file")
+
+
+def parse_args(argv: list[str] | None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="VALKYRIE end-to-end run")
+    p.add_argument("--mode", choices=["demo", "smoke"], default="smoke")
+    add_common_args(p)
     return p.parse_args(argv)
 
 
@@ -225,20 +232,28 @@ def timeout_report(
     return "\n".join(parts)
 
 
-def verify(manifest: Manifest, verbose: bool) -> dict[str, Any]:
-    """Run verify_manifest in spark-tools; returns its JSON report."""
-    rel = manifest.path.as_posix()
-    res = run_verify(rel)
+def verify_report(manifest: Manifest) -> tuple[int, dict[str, Any]]:
+    """Run verify_manifest in spark-tools; (exit code, JSON report), even if it FAILs.
+
+    Raises:
+        Abort: verify produced no JSON report (crash or unusable manifest).
+    """
+    res = run_verify(manifest.path.as_posix())
     try:
-        report = json.loads(res.stdout)
+        return res.returncode, json.loads(res.stdout)
     except ValueError:
         tail = "\n".join((res.stdout + res.stderr).splitlines()[-20:])
         raise Abort(EXIT_SETUP if res.returncode == 2 else EXIT_VERIFY,
                     f"verify exited {res.returncode} without a JSON report:\n{tail}") from None
-    if verbose or res.returncode != 0:
+
+
+def verify(manifest: Manifest, verbose: bool) -> dict[str, Any]:
+    """Run verify_manifest in spark-tools; returns its JSON report, Abort on FAIL."""
+    res_code, report = verify_report(manifest)
+    if verbose or res_code != 0:
         say(json.dumps(report, indent=2))
-    if res.returncode != 0:
-        raise Abort(EXIT_VERIFY if res.returncode == 1 else EXIT_SETUP,
+    if res_code != 0:
+        raise Abort(EXIT_VERIFY if res_code == 1 else EXIT_SETUP,
                     f"verify {report.get('result')}: {report.get('notes')}")
     return report
 

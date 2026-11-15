@@ -225,6 +225,7 @@ class LogFacts:
     status_write_warnings: int          # "could not write status file"
     query_started: bool
     errors: tuple[str, ...]             # msg of ERROR lines
+    started_run_ids: tuple[str, ...] = ()   # run_id of each "query started" line
 
     @property
     def max_batch_id(self) -> int | None:
@@ -237,6 +238,7 @@ def parse_log_lines(lines: Iterable[str]) -> LogFacts:
     warnings = 0
     started = False
     errors: list[str] = []
+    run_ids: list[str] = []
     for line in lines:
         line = line.strip()
         if not line.startswith("{"):
@@ -252,9 +254,11 @@ def parse_log_lines(lines: Iterable[str]) -> LogFacts:
             warnings += 1
         elif msg == "query started":
             started = True
+            if rec.get("run_id"):
+                run_ids.append(str(rec["run_id"]))
         if rec.get("level") == "ERROR":
             errors.append(str(msg))
-    return LogFacts(tuple(batch_ids), warnings, started, tuple(errors))
+    return LogFacts(tuple(batch_ids), warnings, started, tuple(errors), tuple(run_ids))
 
 
 # --- diagnosis --------------------------------------------------------------------

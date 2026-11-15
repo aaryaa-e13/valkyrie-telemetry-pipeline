@@ -113,3 +113,14 @@ Template:
   Nothing else was affected: the `chmod` after the loop had not run yet.
 - **Lesson:** Wait on a specific PID or an explicit completion signal (log line, file), not on
   a text pattern that your own command contains.
+
+### "Container missing" crashed the orchestrator: Docker's error text changed case (Phase 1d3)
+- **Symptom:** The first `make smoke-restart` after a WSL restart (Spark container gone) ended
+  with `FAIL (exit 2): docker inspect valkyrie-spark failed: error: no such object` instead of
+  starting Spark.
+- **Root cause:** `container_state` looked for `"No such"`, but this Docker version prints
+  `error: no such object:` in lowercase. d2 never hit it live, because the container always existed.
+- **Fix:** `is_missing_container_error()` matches case-insensitively ("no such object" / "no such
+  container"). Unit-tested with all three spellings.
+- **Lesson:** Don't match exact error text from another tool. And every branch, even the "missing"
+  one, needs to be run live once: the unit tests passed because they never called docker.

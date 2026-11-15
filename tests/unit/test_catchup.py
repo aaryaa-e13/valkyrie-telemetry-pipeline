@@ -243,3 +243,12 @@ def test_docker_nanosecond_timestamps_are_trimmed() -> None:
     assert trimmed == "2026-11-15T08:06:01.123456Z"
     assert catchup.parse_timestamp(trimmed) == datetime(2026, 11, 15, 8, 6, 1, 123456, tzinfo=UTC)
     assert _trim_nanos("0001-01-01T00:00:00Z") == "0001-01-01T00:00:00Z"
+
+
+@pytest.mark.parametrize("stderr", ["error: no such object: valkyrie-spark",
+                                    "Error: No such object: valkyrie-spark",
+                                    "Error response from daemon: No such container: x"])
+def test_missing_container_error_any_case(stderr: str) -> None:
+    from e2e.docker_ops import is_missing_container_error
+    assert is_missing_container_error(stderr)
+    assert not is_missing_container_error("permission denied while trying to connect")

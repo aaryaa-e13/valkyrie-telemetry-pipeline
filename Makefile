@@ -17,7 +17,7 @@ SEED ?= 42
 dirs: ## Create bind-mount folders owned by you (Docker would create them as root)
 	mkdir -p data data/status manifests
 
-.PHONY: help env up down ps logs topics describe-topic venv sim-dry sim-local sim-tiny sim consume test-unit lint spark-build spark-up spark-stop spark-logs verify test-spark demo smoke e2e-images
+.PHONY: help env up down ps logs topics describe-topic venv sim-dry sim-local sim-tiny sim consume test-unit lint spark-build spark-up spark-stop spark-logs verify test-spark demo smoke e2e-images smoke-restart
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -111,3 +111,6 @@ demo: dirs up e2e-images ## Full run with explanations: simulator -> Kafka -> Sp
 
 smoke: dirs up e2e-images ## Quick end-to-end check (tiny run), one JSON SUMMARY line
 	$(PY) -m e2e.orchestrator --mode smoke $(E2E_ARGS)
+
+smoke-restart: dirs up e2e-images ## Graceful stop/restart: no re-read, no skip (~1-2 min)
+	$(PY) -m e2e.smoke_restart $(E2E_ARGS)

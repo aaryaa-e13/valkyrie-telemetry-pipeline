@@ -47,11 +47,19 @@ def run(cmd: Sequence[str], *, timeout: float, stream: bool = False) -> Result:
     return Result(proc.returncode, proc.stdout or "", proc.stderr or "")
 
 
+def is_missing_container_error(stderr: str) -> bool:
+    """True if `docker inspect` failed because the container does not exist.
+
+    Docker versions differ: "Error: No such object: x" vs "error: no such object: x".
+    """
+    return "no such object" in stderr.lower() or "no such container" in stderr.lower()
+
+
 def container_state(name: str) -> ContainerState:
     """Return the container's state; exists=False if there is no such container."""
     res = run(["docker", "inspect", "--format", "{{json .State}}", name], timeout=20)
     if res.returncode != 0:
-        if "No such" in res.stderr:
+        if is_missing_container_error(res.stderr):
             return ContainerState(exists=False)
         raise CommandError(f"docker inspect {name} failed: {res.stderr.strip()}")
     state = json.loads(res.stdout)
@@ -90,6 +98,24 @@ def container_logs(name: str, *, tail: int | None = None, since: float | None = 
 def compose_up_spark() -> Result:
     """Start the streaming job (no-op if it is already running)."""
     return run([*COMPOSE, "--profile", "spark", "up", "-d", "spark"], timeout=300)
+
+
+def compose_stop_spark() -> Result:
+    """Graceful stop: SIGTERM, then up to stop_grace_period (60 s) before SIGKILL."""
+    return run([*COMPOSE, "--profile", "spark", "stop", "spark"], timeout=180)
+
+
+def topic_end_offsets_raw(container: str, topic: str, bootstrap: str = "kafka:29092") -> str:
+    """Latest offsets per partition as printed by kafka-get-offsets.sh ("topic:p:offset").
+
+    Raises:
+        CommandError: The tool failed (e.g. Kafka down, unknown topic).
+    """
+    res = run(["docker", "exec", container, "/opt/kafka/bin/kafka-get-offsets.sh",
+               "--bootstrap-server", bootstrap, "--topic", topic, "--time", "-1"], timeout=60)
+    if res.returncode != 0:
+        raise CommandError(f"kafka-get-offsets failed: {(res.stderr or res.stdout).strip()}")
+    return res.stdout
 
 
 def run_simulator(config: str, seed: int, extra: Sequence[str], *, stream: bool) -> Result:
