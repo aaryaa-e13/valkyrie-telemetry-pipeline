@@ -24,7 +24,8 @@ dirs: ## Create bind-mount folders owned by you (Docker would create them as roo
 
 .PHONY: help env up down ps logs topics describe-topic venv sim-dry sim-local sim-tiny sim \
 	sim-realtime sim-late timing-check consume test-unit lint spark-build spark-image spark-up \
-	spark-stop spark-logs verify test-spark demo smoke e2e-images smoke-restart
+	spark-stop spark-logs verify test-spark demo smoke e2e-images smoke-restart \
+	delta-compat jars-lock
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -124,6 +125,28 @@ verify: dirs spark-image ## Compare raw Parquet with a run manifest (MANIFEST=ma
 test-spark: dirs ## Run Spark transformation tests inside the Spark image
 	$(COMPOSE) --profile spark run --rm --no-deps -T -v ./:/app:ro spark \
 		python -m pytest tests/spark -q -p no:cacheprovider
+
+# Delta compatibility gate (Phase 2 slice 1, DECISIONS D2.1): checks C1-C14 in the
+# container's /tmp, prints one JSON report, exits 0 (PASS) or 1. Runs in spark-tools
+# (./data read-only), so it can run next to the streaming job.
+delta-compat: dirs spark-image ## Delta compatibility checks C1-C14 (JSON report, PASS/FAIL)
+	$(COMPOSE) --profile tools run --rm -T spark-tools \
+		python -m streaming.delta_compat_check $(DELTA_COMPAT_ARGS)
+
+# Regenerate the jar SHA-256 lock ON PURPOSE (after changing a fetched package).
+# Builds a separate image tag without lock verification, hashes every added jar,
+# cross-checks it against Maven Central's .sha1 over HTTPS, and only then replaces
+# docker/spark/jars.sha256. Review the result with `git diff docker/spark/jars.sha256`.
+JARS_LOCK := docker/spark/jars.sha256
+jars-lock: ## Regenerate docker/spark/jars.sha256 (cross-checked with Maven Central); review git diff
+	docker build -q -f docker/spark/Dockerfile --build-arg JARS_LOCK_VERIFY=0 \
+		-t valkyrie-spark:jars-lock . > /dev/null
+	docker run --rm --entrypoint bash valkyrie-spark:jars-lock -c \
+		'python /opt/valkyrie/jars_lock.py generate /opt/valkyrie/jars-*.txt --jars-dir \
+		"$$(python -c "import os, pyspark; print(os.path.dirname(pyspark.__file__))")/jars"' \
+		> $(JARS_LOCK).new || { rm -f $(JARS_LOCK).new; exit 1; }
+	mv $(JARS_LOCK).new $(JARS_LOCK)
+	@git diff --stat -- $(JARS_LOCK) || true
 
 # --- End-to-end (laptop orchestrator, see e2e/orchestrator.py) -----------------
 # Exit codes of the orchestrator: 0 pass, 1 verify failed, 2 setup problem,
