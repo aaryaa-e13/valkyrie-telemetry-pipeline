@@ -154,7 +154,8 @@ Short decision records: context, decision, tradeoffs. Newest phase last.
   (`sim`) each get a profile, so only what is needed runs.
 
 ### D1.12 Raw job details (slice c)
-- **Connector JARs are baked into the image at build time** (`docker/spark/fetch_kafka_jars.sh`).
+- **Connector JARs are baked into the image at build time** (`docker/spark/fetch_kafka_jars.sh`,
+  renamed `fetch_jars.sh` in Phase 2; jar set, exclusions and SHA-256 lock: D2.1).
   It resolves `spark-sql-kafka-0-10_2.13:4.1.4`, adds `kafka-clients-3.9.1`, `commons-pool2-2.12.1`
   and the token provider, and skips JARs Spark already ships (lz4, snappy, slf4j, hadoop), so a
   library is never on the classpath in two versions. The container needs no internet at runtime.
@@ -532,3 +533,142 @@ and has no record of them.
 - A very large realtime run starts slightly behind, because the plan is built after "now" is
   taken. `max_behind_ms` shows it.
 - Out of scope, Phase 4: injected duplicates and shuffled order (they will reuse the schedule).
+
+---
+
+## Phase 2: Delta, dedupe, watermark, idempotent MERGE
+
+### D2.1 Delta Lake pin: `io.delta:delta-spark_4.1_2.13:4.4.1` (slice 1, compatibility gate)
+
+**Decision.** Pin Delta 4.4.1, Spark-4.1 build. The jars are baked into the image at build time
+(like the Kafka connector, D1.12). pip `delta-spark==4.4.1` provides only the Python API
+(`delta.tables`); `configure_spark_with_delta_pip` is not used, so nothing downloads at runtime.
+- **Not** the unsuffixed `delta-spark_2.13`: in Delta 4.4.x that artifact is built for Spark 4.2.
+  C1 fails if any `delta-spark_2.13-*` jar is on the classpath.
+- Session settings: `spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension`,
+  `spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog`. Both are
+  static (set before the session starts), so `tests/spark/conftest.py` sets them for all tests.
+
+**Gate result (2026-11-18): `make delta-compat` PASS, all 14 checks, about 218 s**
+(`streaming/delta_compat_check.py`; temp folders in the container's `/tmp`, `./data` read-only).
+
+| Check | Result |
+|---|---|
+| C1 versions | Spark 4.1.4, Scala 2.13.17, Java 17.0.21, pip delta-spark 4.4.1; `DeltaLog` loaded from `delta-spark_4.1_2.13-4.4.1.jar` |
+| C2 classpath | 299 jars, 13 added. Added jars: 0 same-name, 0 duplicate classes. Jackson aligned. Lock verified. Details below |
+| C3 create | 3 rows; `engineInfo` = `Apache-Spark/4.1.4 Delta-Lake/4.4.1` |
+| C4 MERGE twice | 5 rows, then 5; the replay wrote **no new version** |
+| C5 pruning (R) | insert-only MERGE reports no file-skipping metrics (see facts) |
+| C6 checkpoint | `00000000000000000010.checkpoint.parquet` after 12 commits; fresh read 12 rows |
+| C7 numRecords | live `add.stats.numRecords` sum == `count()` on 4 tables, incl. a DELETE |
+| C8 sink | 3 + 2 batches, 50 rows, 50 distinct; `txn` versions 0..4, one stable `appId` |
+| C9 sink replay | deleted `commits/4`: batch 4 re-ran, Delta version stayed 4, still 50 rows |
+| C10 foreachBatch | Delta source 31 rows (23 distinct, dups inside and across commits) -> target 23 |
+| C11 fB replay | deleted `commits/3`: batch 3 re-ran, MERGE wrote no version, target still 23 |
+| C12 event order | 11 progress events (6 sink, 5 foreachBatch), 0 violations |
+| C13 log scan | 0 linkage/class-loading errors (LinkageError family + ClassNotFoundException) |
+| C14 Jackson | jdk8 module 2.21.2 on databind 2.21.2: `Optional` written and read back correctly |
+
+**pip.** pip's own resolution (dry run in the old image) added exactly `delta_spark 4.4.1`,
+`importlib_metadata 8.7.1`, `zipp 4.1.2`; all three are pinned. Two gates:
+- *Every build:* `docker/spark/pip_gate.py` fails the build unless `pip freeze` equals
+  `requirements/spark.txt` exactly (nothing moved, nothing unpinned) and pyspark is 4.1.4.
+- *Slice 1, one-off:* `pip freeze` of the old and new image differ only by those three added
+  lines; all 7 old lines, including `pyspark==4.1.4`, are unchanged.
+
+**Jar set** (three `fetch_jars.sh` runs: Kafka, Delta, Jackson; list in `/opt/valkyrie/jars-*.txt`)
+- Added by Delta: `delta-spark_4.1_2.13`, `delta-storage`, `delta-kernel-api/defaults/unitycatalog`
+  (4.4.1), `unitycatalog-client/hadoop` (0.6.0), `javax.annotation-api` 1.3.2. Plus
+  `jackson-datatype-jdk8` 2.21.2. The Kafka set is unchanged from D1.12. 13 added jars in total.
+- **Excluded from the Delta resolution** (`--exclude-packages`), because the name-based skip
+  skips a jar but still adds that jar's own dependencies (WHAT_BROKE):
+  - `commons-logging` 1.3.0 (via `hadoop-client-runtime`): 5 of its classes are also in Spark's
+    `jcl-over-slf4j`, so which copy wins would depend on the order of `jars/*` on the classpath,
+    and Java does not specify that order. Its other 22 classes are JCL's own backends (e.g.
+    `impl.LogFactoryImpl`, `impl.Log4jApiLogFactory`). Stock Spark 4.1.4 has never shipped
+    them. A scan of all jars found one reference: the *string* `...impl.Jdk14Logger` in
+    `hadoop-client-runtime`'s shaded Jetty `JettyLogHandler`, already there before Delta.
+  - `shims` 0.9.25 (via RoaringBitmap 0.9.25): its only class, `ArraysShim`, is in Spark's
+    `RoaringBitmap-1.3.0`. RoaringBitmap 0.9.25 itself was skipped.
+  - `jackson-datatype-jdk8` 2.13.5 (via Delta Kernel): replaced by 2.21.2, see below.
+- **Jackson alignment.** All 7 jars with real `com/fasterxml/jackson` classes are 2.21.2, except
+  `jackson-annotations` 2.21. Since 2.20 Jackson versions annotations as major.minor only
+  (Maven Central lists 2.20, 2.21, 2.22 and no 2.21.x). C2 enforces exactly this rule.
+  Embedded Jackson metadata in `hadoop-client-runtime` (2.12.7) and `parquet-jackson`
+  (2.19.2) belongs to relocated classes; it is printed, not checked.
+  - *Why aligned:* Jackson modules should match databind's version. The probe passed with both
+    2.13.5 and 2.21.2, so this is consistency, not a fix for an observed failure.
+  - *Who uses it:* only Delta Kernel (`JsonMetadataDomain`, `MetricsReportSerializer`). C14 found
+    that none of these classes were loaded during C3-C12 (path tables, MERGE, streaming).
+  - *Accepted risk:* Delta Kernel was compiled against Jackson 2.13.x. A Jackson API change
+    that Kernel relies on would surface only on a Kernel code path we do not exercise yet.
+- **Skips where Spark's version wins** (Delta declared a newer one): commons-pool 1.6 -> 1.5.4,
+  log4j 2.25.3 -> 2.24.3, jsr305 3.0.2 -> 3.0.0. C13 found no linkage errors.
+- Image size: 1,501.6 MB -> 1,529.2 MB (+27.5 MB).
+
+**Classpath baselines (stock pip pyspark 4.1.4, measured in slice 1).** C2 fails only on
+problems involving jars we add. Stock findings are printed, compared with these baselines, and
+only WARN on drift, so a Spark upgrade gets noticed without breaking the build.
+- 1,364 duplicate classes in 7 jar groups of Spark's own jars (735 ORC shaded protobuf, 382
+  shaded fastutil in parquet-column/hadoop, 180 jdo, 42 java-diff-utils/scala-compiler, 18
+  jta/transaction-api, 4 jline/leveldbjni, 3 hive-common/storage-api). Ignore list for added
+  jars: only Spark's empty `org/apache/spark/unused/UnusedStubClass`.
+- 2 same-name pairs: `hive-shims-0.23-2.3.10` / `hive-shims-2.3.10` (a misread name, see the
+  next point), `jline-2.14.6` / `jline-3.29.0-jdk8` (groupIds `jline` vs `org.jline`).
+
+**File-name rule limitation (fetch_jars.sh skip logic and C2).** The artifact name is the file
+name before the first `-<digit>`. That misreads names with a digit after a dash:
+`spark-sql-kafka-0-10_2.13-4.1.4.jar` -> `spark-sql-kafka-0`, `hive-shims-0.23-...` ->
+`hive-shims`. C2 now audits every add/skip decision against the real coordinate recorded from
+Ivy's cache. In this build 2 of 45 names were misparsed (both Kafka connector jars), and **0
+decisions changed**: with the real name they would still be added. 10 skips could be
+confirmed only by name (Spark's jar has no `pom.properties`); all 9 distinct pairs share 100%
+of the fetched jar's classes with Spark's jar (one-off check).
+
+**Integrity: Ivy does not verify checksums; a SHA-256 lock does.**
+- Tested in the image: Ivy (via `spark-submit --packages`) accepted a jar whose `.sha1` was all
+  zeros, from a `file://` repo and over HTTP. Over HTTP it never even requested the `.sha1`.
+  Ivy's default `ivy.checksums=sha1,md5` has no effect on this path.
+- Resolvers (from Ivy's "tried" list for a missing artifact): `local-m2-cache`
+  (`file:~/.m2`), `local-ivy-cache`, `central` (`https://repo1.maven.org/maven2/`),
+  `spark-packages` (`https://repos.spark-packages.org/`). Network resolvers are HTTPS only; all
+  44 jar downloads in the build log were `https://`. The two local caches are empty in a fresh
+  build container.
+- **Lock:** `docker/spark/jars.sha256` lists every jar `fetch_jars.sh` adds (sha256, file,
+  group:artifact:version). After the three fetches, `jars_lock.py verify` fails the build on a
+  hash or coordinate mismatch, an unlisted jar, or a listed jar that was not added. A passing
+  build writes `/opt/valkyrie/lock-verified.txt`, and C2 fails without it.
+- **Regenerating on purpose:** `make jars-lock` builds a separate tag with verification off,
+  hashes the added jars, downloads Maven Central's published `.sha1` for each over HTTPS
+  (Python, certificate checked, `http://` refused), prints the comparison and writes the lock
+  only if all match. First run: 13 of 13 equal. An upgrade is then a reviewable diff.
+- *Trust model:* trust on first use, cross-checked with Central's `.sha1` (same origin as the
+  jar). This protects against anything that changes later (a replaced artifact, a resolver
+  drifting to another version or dependency). It does not protect against a compromise that
+  was already present when the lock was generated. Signature (`.asc`) checks would; not done.
+
+**Recorded facts for later slices**
+- Delta sink idempotency (D1 bronze): every sink commit carries `txn(appId = query id, version =
+  batch id)`. On replay the sink logs `DeltaSink: Skipping already complete epoch N` and writes
+  nothing (C9).
+- Delta source offset (D8 catch-up): `{"sourceVersion":1,"reservoirId":"<table id>",
+  "reservoirVersion":V,"index":I,"isStartingVersion":true|false}`.
+- MERGE `operationMetrics` keys (22): `numSourceRows`, `numTargetRowsInserted`,
+  `numTargetFilesAdded/Removed`, `numTargetRowsMatchedUpdated`, `numTargetBytesAdded`,
+  `executionTimeMs`, `scanTimeMs`, `rewriteTimeMs` and others (full list in the report).
+- **An insert-only MERGE that inserts nothing writes no commit** (C4, C11). Code that reads
+  "the version this batch produced" must handle "no new version".
+- **Insert-only MERGE has no file-skipping metrics** (`numTargetFilesBeforeSkipping/
+  AfterSkipping` absent in C5). Pruning evidence for D2 must come from somewhere else in slice
+  3, e.g. the query plan or scan metrics. UNVERIFIED which.
+- Checkpoints are classic `<v>.checkpoint.parquet` every 10 commits, plus `_last_checkpoint`.
+- `DELETE` rewrote files (2 removes) and made no deletion vectors: they are off by default
+  here. The Delta-log count in slice 2 still subtracts `deletionVector.cardinality`, in case
+  they are turned on later.
+- D1.15 holds for Delta: at every progress event, `commits/N` and the batch's Delta version
+  already existed (Delta sink and `foreachBatch`).
+
+**Not verified (limits of this gate)**
+- `availableNow` runs few, small batches: C12 shows the order, it is not a stress test.
+- Deletion vectors (and RoaringBitmap 1.3.0 under Delta's 0.9.25 API), Unity Catalog and Delta
+  Kernel code paths were not exercised.

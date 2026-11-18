@@ -190,3 +190,68 @@ Template:
   what Phase 2 dedupe needs for testing, but the tool must say so. To tell "sent twice" from
   "written twice", compare the Kafka offsets of the runs. And a shell glob in a command is only
   safe while exactly one file matches.
+
+### Delta brought two jars that duplicate Spark's classes (Phase 2 slice 1)
+- **Symptom:** The first Delta build passed, and the planned C2 check (no artifact in two
+  versions, by file name) would have passed too. But the build log added
+  `commons-logging-1.3.0.jar` and `shims-0.9.25.jar`. A class-level scan of all jars showed
+  that `commons-logging` shares 5 classes (`org/apache/commons/logging/Log`, `LogFactory`, ...)
+  with Spark's `jcl-over-slf4j-2.0.17.jar`, and `shims` shares `org/roaringbitmap/ArraysShim`
+  with Spark's `RoaringBitmap-1.3.0.jar`.
+- **Root cause:** `fetch_jars.sh` skips a jar whose artifact Spark already ships, but it still
+  adds that jar's own dependencies. Spark leaves those out on purpose: it replaces JCL with
+  `jcl-over-slf4j`, and RoaringBitmap 1.x no longer needs `shims`. Skipping
+  `hadoop-client-runtime` and `RoaringBitmap-0.9.25` was right; adding their dependencies was
+  not.
+- **Why it matters:** With the same class in two jars, the JVM loads whichever jar comes first
+  on the classpath, and the order of `jars/*` is not specified. Today Spark's copies won. A
+  different build or filesystem could flip that silently.
+- **Fix:** `--exclude-packages commons-logging:commons-logging,org.roaringbitmap:shims` for the
+  Delta fetch (after proving that nothing references the 22 JCL-only classes). C2 now fails if
+  any class in a jar we add also exists in another jar. The only ignored class is Spark's
+  `UnusedStubClass`.
+- **Lesson:** "Skip what is already there" is a rule about jar names, but conflicts happen
+  between classes. Check classes, and check what a skipped jar drags in.
+
+### My first strict C2 would have failed on stock Spark (Phase 2 slice 1, my own mistake)
+- **Symptom:** I proposed "fail on any class that is in two jars" and later ran the planned
+  rule "no artifact in two versions". Both fail on Spark 4.1.4 itself, before Delta: 1,364
+  duplicate classes in 7 groups of Spark's own jars, and two same-name pairs
+  (`hive-shims-0.23` / `hive-shims`, `jline` 2.x / 3.x).
+- **Root cause:** I wrote the rule before measuring the stock baseline.
+- **Fix:** C2 fails only on problems involving jars we add. Stock findings are printed and
+  compared with a recorded baseline, and only WARN on drift (D2.1).
+- **Lesson:** Before writing a "must be zero" check, measure what the unchanged system gives.
+  Otherwise the check is either wrong on day one or gets weakened in a hurry.
+
+### Jackson fetch failed: "expected 1 cache entry ... found 0" (Phase 2 slice 1)
+- **Symptom:** The third `fetch_jars.sh` run (`jackson-datatype-jdk8:2.21.2`) stopped the build:
+  `ERROR: expected 1 cache entry for com.fasterxml.jackson.datatype_jackson-datatype-jdk8-2.21.2.jar,
+  found 0`.
+- **Root cause:** To record the exact coordinate, the script looks the jar up in Ivy's cache
+  under `<group>/<module>/jars/`. Jackson publishes with Maven packaging `bundle` (OSGi), and
+  Ivy stores those under `<module>/bundles/`.
+- **Fix:** Look in both `jars/` and `bundles/`. The guard that failed (exactly one cache entry,
+  else stop) stays. It turned a wrong assumption into a clear build error instead of a
+  missing coordinate.
+
+### The jar-name rule misreads names like `spark-sql-kafka-0-10_2.13` (Phase 2 slice 1, latent since Phase 1)
+- **Symptom:** A new C2 audit compares the artifact name parsed from each file name with the
+  real coordinate. It found 2 of 45 mismatches: `spark-sql-kafka-0-10_2.13-4.1.4.jar` parses as
+  `spark-sql-kafka-0` (and the token provider the same way).
+- **Root cause:** The rule "artifact = file name before the first `-<digit>`" treats `-0-10`
+  as a version. `hive-shims-0.23-2.3.10.jar` has the same problem.
+- **Impact:** None in this build. With the real name, both jars would still be added, because
+  Spark ships no connector. But a wrongly parsed name can wrongly skip a jar in a future fetch.
+- **Fix:** No parser change. C2 checks every add/skip decision against the real coordinate and
+  fails if a misparse would change one. The limitation is recorded in D2.1.
+
+### My check script reported the wrong MERGE metrics for a no-op MERGE (Phase 2 slice 1, test tooling)
+- **Symptom:** C4 printed `numTargetRowsInserted: 2` for the *second* (replayed) MERGE, which
+  inserts nothing.
+- **Root cause:** An insert-only MERGE that inserts nothing writes no Delta commit. So
+  `history(1)` still showed the first MERGE.
+- **Fix:** C4 and C11 compare versions before and after, and report "no commit" when nothing
+  was written.
+- **Lesson:** "The latest history entry" means "the latest commit", not "my operation". This
+  matters for slice 3, which will read per-batch MERGE metrics.
