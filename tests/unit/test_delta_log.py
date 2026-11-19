@@ -12,7 +12,14 @@ from typing import Any
 
 import pytest
 
-from common.delta_log import DeltaLogError, appended_between, current_version, read_commit
+from common.delta_log import (
+    DeltaLogError,
+    appended_between,
+    current_version,
+    latest_txn_in_commits,
+    newest_checkpoint_files,
+    read_commit,
+)
 
 
 def _commit(table: Path, version: int, actions: list[dict[str, Any]]) -> None:
@@ -94,3 +101,34 @@ def test_gap_and_backwards_range_fail(tmp_path: Path) -> None:
         appended_between(t, 2, 1)
     with pytest.raises(DeltaLogError):
         read_commit(t, 99)
+
+
+def test_latest_txn_in_commits(tmp_path: Path) -> None:
+    t = _table(tmp_path)
+    _commit(t, 3, [{"commitInfo": {}}, _txn("other", 9), _add("d", 1)])
+    _commit(t, 4, [{"commitInfo": {"operation": "OPTIMIZE"}}])
+    assert latest_txn_in_commits(t, "q") == (1, True)      # newest txn for q is in v2
+    assert latest_txn_in_commits(t, "other") == (9, True)
+    assert latest_txn_in_commits(t, "nobody") == (None, True)  # scanned back to v0
+    assert latest_txn_in_commits(tmp_path / "missing", "q") == (None, True)
+
+
+def test_latest_txn_incomplete_after_log_cleanup(tmp_path: Path) -> None:
+    t = _table(tmp_path)
+    _commit(t, 3, [{"commitInfo": {"operation": "OPTIMIZE"}}])
+    (t / "_delta_log" / f"{2:020d}.checkpoint.parquet").write_text("x")
+    for v in (0, 1, 2):
+        (t / "_delta_log" / f"{v:020d}.json").unlink()      # what log cleanup does
+    assert latest_txn_in_commits(t, "q") == (None, False)  # must look in the checkpoint
+    assert [f.name for f in newest_checkpoint_files(t)] == [f"{2:020d}.checkpoint.parquet"]
+
+
+def test_newest_checkpoint_files_multi_part(tmp_path: Path) -> None:
+    log = tmp_path / "_delta_log"
+    log.mkdir()
+    for name in (f"{10:020d}.checkpoint.parquet", f"{20:020d}.checkpoint.0000000001.0000000002"
+                 ".parquet", f"{20:020d}.checkpoint.0000000002.0000000002.parquet"):
+        (log / name).write_text("x")
+    assert [f.name[21:] for f in newest_checkpoint_files(tmp_path)] == [
+        "checkpoint.0000000001.0000000002.parquet", "checkpoint.0000000002.0000000002.parquet"]
+    assert newest_checkpoint_files(tmp_path / "none") == []

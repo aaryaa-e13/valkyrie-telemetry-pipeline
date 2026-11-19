@@ -163,3 +163,38 @@ def appended_between(table: Path | str, v_before: int, v_after: int) -> AppendSu
                 txns.append({"delta_version": v, "appId": action["txn"]["appId"],
                              "version": action["txn"]["version"]})
     return AppendSummary(v_before, v_after, rows, files, v_after - v_before, txns)
+
+
+def latest_txn_in_commits(table: Path | str, app_id: str) -> tuple[int | None, bool]:
+    """Newest txn version for `app_id`, scanning commit JSONs from newest to oldest.
+
+    A streaming query's txn version only grows, so the newest commit that has
+    one holds the maximum. Returns (version or None, complete): complete is True
+    when the scan reached version 0 (or found the txn), so None really means
+    "no txn". complete is False when older commit files were removed by log
+    cleanup; then the answer is in the Delta checkpoint (`*.checkpoint*.parquet`),
+    which needs a Parquet reader (streaming.bronze uses Spark for that).
+    """
+    log = _log_dir(table)
+    if not log.is_dir():
+        return None, True
+    versions = sorted((int(f.name[:20]) for f in log.iterdir() if COMMIT_RE.match(f.name)),
+                      reverse=True)
+    for v in versions:
+        for action in read_commit(table, v):
+            if "txn" in action and action["txn"].get("appId") == app_id:
+                return int(action["txn"]["version"]), True
+    return None, not versions or versions[-1] == 0
+
+
+def newest_checkpoint_files(table: Path | str) -> list[Path]:
+    """Files of the newest Delta checkpoint (classic, multi-part or V2 top file)."""
+    log = _log_dir(table)
+    if not log.is_dir():
+        return []
+    cps = [f for f in log.iterdir()
+           if re.match(r"^\d{20}\.checkpoint.*\.parquet$", f.name)]
+    if not cps:
+        return []
+    newest = max(f.name[:20] for f in cps)
+    return sorted(f for f in cps if f.name.startswith(newest))

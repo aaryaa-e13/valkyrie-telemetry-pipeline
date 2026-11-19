@@ -10,10 +10,10 @@ What it guarantees (Phase 2 slice 2, DECISIONS D2.2):
     * Unparseable messages are kept (parse_ok = false, raw_value preserved).
     * The table is append-only (delta.appendOnly = true): Delta refuses any
       UPDATE/DELETE/MERGE that would remove rows.
-    * Checkpoint-reset guard: if the table has data but the checkpoint has no
-      batches, the job refuses to start (exit 2) unless BRONZE_ALLOW_REBUILD=1.
-      A new checkpoint means a new query id, so Delta's txn cannot recognise
-      the old batches and every message would be appended again.
+    * Start-up guard, both directions: the table's newest txn version for the
+      checkpoint's query id must match the checkpoint's last committed batch
+      (or be one ahead after a crash). Otherwise exit 2 unless
+      BRONZE_ALLOW_REBUILD=1 (streaming/start_guard.py, DECISIONS D2.2).
 
 What it does NOT do (slice 3+): deduplicate events, handle late data with
 watermarks, or MERGE. Duplicate events in Kafka produce duplicate rows here
@@ -31,7 +31,6 @@ import os
 import signal
 import sys
 from functools import reduce
-from pathlib import Path
 from types import FrameType
 from typing import Any
 
@@ -40,10 +39,12 @@ from pyspark.sql import functions as F
 from pyspark.sql.streaming import StreamingQuery, StreamingQueryListener
 from pyspark.sql.types import StructField, StructType
 
+from common.delta_log import latest_txn_in_commits, newest_checkpoint_files
 from common.logging_setup import setup_logging
 from streaming.config import BronzeJobConfig
 from streaming.schemas import EVENT_JSON_SCHEMA, EVENT_TIME_FORMAT, REQUIRED_FIELDS
 from streaming.spark_session import build_spark
+from streaming.start_guard import BronzeStartupError, decide, read_checkpoint_state
 from streaming.status import batch_record, read_status, update_status, write_status
 
 log = logging.getLogger("streaming.bronze")
@@ -51,10 +52,6 @@ log = logging.getLogger("streaming.bronze")
 PARTITION_COLUMN = "ingest_date"
 APPEND_ONLY_PROPERTY = "delta.appendOnly"
 EXIT_REFUSED = 2  # start-up refused (guard or table check); 1 = runtime failure
-
-
-class BronzeStartupError(Exception):
-    """The job must not start (checkpoint-reset guard or unexpected table layout)."""
 
 
 def to_raw_rows(kafka_df: DataFrame) -> DataFrame:
@@ -117,17 +114,6 @@ def bronze_schema(source_df: DataFrame) -> StructType:
                        for f in to_raw_rows(source_df).schema.fields])
 
 
-def checkpoint_has_batches(checkpoint_path: str) -> bool:
-    """True if the checkpoint recorded at least one batch (a file in `offsets/`).
-
-    Spark writes `offsets/N` before it runs batch N. A checkpoint folder with
-    only `metadata` (or nothing) has never planned a batch, so it does not know
-    which Kafka offsets the table already holds. Local paths only (/data/...).
-    """
-    offsets = Path(checkpoint_path) / "offsets"
-    return offsets.is_dir() and any(f.name.isdigit() for f in offsets.iterdir())
-
-
 def table_has_data(spark: SparkSession, table_path: str) -> bool:
     """True if a Delta table exists at the path and has at least one row."""
     from delta.tables import DeltaTable
@@ -137,35 +123,66 @@ def table_has_data(spark: SparkSession, table_path: str) -> bool:
     return spark.read.format("delta").load(table_path).limit(1).count() > 0
 
 
+def table_txn_version(spark: SparkSession, table_path: str, app_id: str) -> int | None:
+    """Newest txn version the table holds for `app_id` (a query id), or None.
+
+    Reads commit JSONs first (stdlib, newest first). Only if log cleanup has
+    removed older commits and none of the remaining ones has the txn, it reads
+    the newest Delta checkpoint Parquet with Spark (txn actions live there).
+    """
+    v, complete = latest_txn_in_commits(table_path, app_id)
+    if v is not None or complete:
+        return v
+    files = newest_checkpoint_files(table_path)
+    if not files:
+        raise BronzeStartupError(f"bronze table {table_path}: commit files before the oldest "
+                                 "remaining one are gone and there is no Delta checkpoint")
+    rows = (spark.read.parquet(*[str(f) for f in files])
+            .where(F.col("txn").isNotNull() & (F.col("txn.appId") == app_id))
+            .agg(F.max("txn.version").alias("v")).first())
+    return None if rows is None or rows["v"] is None else int(rows["v"])
+
+
 def check_checkpoint_guard(spark: SparkSession, table_path: str, checkpoint_path: str,
                            allow_rebuild: bool) -> str:
-    """Refuse to start on a populated table with a missing/empty checkpoint.
+    """Refuse to start when checkpoint and table disagree (both directions).
 
-    Why Delta's own idempotency does not help here: the sink skips a batch only
-    if the table already has txn(appId = query id, version = batch id). A new
-    checkpoint gets a NEW query id, so none of the old txn entries match, and
-    re-reading the topic from `earliest` appends every message a second time.
+    One rule (streaming/start_guard.py): the table's newest txn version T for
+    the checkpoint's query id must equal the checkpoint's newest committed batch
+    C, or be C + 1 after a crash between the Delta commit and commits/C+1.
+    Covers:
+      * table has data, checkpoint missing/empty: a new checkpoint means a NEW
+        query id, so Delta's txn cannot recognise the old batches and every
+        message would be appended again;
+      * checkpoint has batches, table missing or without a txn for this query
+        id: resuming would skip every row before the checkpoint's offsets;
+      * table behind (restored from an older copy) or ahead of the checkpoint.
 
     Returns:
-        "fresh" (no data, no batches), "resume" (checkpoint has batches) or
-        "rebuild" (data + no batches, allowed by BRONZE_ALLOW_REBUILD=1).
+        "fresh", "resume", or "rebuild" (refusal overridden by
+        BRONZE_ALLOW_REBUILD=1, logged as a WARNING).
 
     Raises:
-        BronzeStartupError: data + no batches, and allow_rebuild is False.
+        BronzeStartupError: refused, and allow_rebuild is False.
     """
-    if checkpoint_has_batches(checkpoint_path):
-        return "resume"
-    if not table_has_data(spark, table_path):
-        return "fresh"
+    state = read_checkpoint_state(checkpoint_path)
+    txn = (table_txn_version(spark, table_path, state.query_id)
+           if state.query_id and state.last_planned is not None else None)
+    decision = decide(state, txn, lambda: table_has_data(spark, table_path))
+    fields = {"table_path": table_path, "checkpoint_path": checkpoint_path,
+              "query_id": state.query_id, "checkpoint_planned": state.last_planned,
+              "checkpoint_committed": state.last_committed, "table_txn": txn}
+    if decision.mode != "refuse":
+        log.info("start-up state", extra={"fields": {**fields, "mode": decision.mode,
+                                                     "note": decision.note}})
+        return decision.mode
+    message = (f"bronze table {table_path} and checkpoint {checkpoint_path} disagree: "
+               f"{decision.problem}. Restore the matching checkpoint/table, or set "
+               "BRONZE_ALLOW_REBUILD=1 if that is really intended (DECISIONS D2.2).")
     if not allow_rebuild:
-        raise BronzeStartupError(
-            f"bronze table {table_path} has data but checkpoint {checkpoint_path} has no "
-            "batches (missing or reset). Starting would re-read the topic and append every "
-            "message again under a new query id. Restore the checkpoint, or set "
-            "BRONZE_ALLOW_REBUILD=1 if re-appending is really intended (DECISIONS D2.2).")
-    log.warning("REBUILD: starting with an empty checkpoint on a populated bronze table; "
-                "messages still in Kafka will be appended again", extra={"fields": {
-                    "table_path": table_path, "checkpoint_path": checkpoint_path}})
+        raise BronzeStartupError(message)
+    log.warning("REBUILD: starting although checkpoint and table disagree",
+                extra={"fields": {**fields, "problem": decision.problem}})
     return "rebuild"
 
 

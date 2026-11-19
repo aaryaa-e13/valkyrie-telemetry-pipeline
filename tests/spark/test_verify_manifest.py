@@ -88,6 +88,7 @@ def test_complete_run_passes_for_v1_v2_and_v3(spark, tmp_path: Path, manifest) -
     assert report["total_rows"] == 6        # noise is counted ...
     assert report["unparsed_rows"] == 1
     assert report["duplicate_kafka_offsets"] == 0
+    assert report["null_kafka_offset_rows"] == 0
     assert report["table_version"] == 0
     assert evaluate(report, fail_on_duplicates=True)[0] == "PASS"  # ... but never judged
 
@@ -111,6 +112,20 @@ def test_duplicate_kafka_offset_always_fails_r0(spark, tmp_path: Path) -> None:
     result, notes = evaluate(report, fail_on_duplicates=False)
     assert result == "FAIL"
     assert any(n.startswith("R0:") for n in notes)
+
+
+@pytest.mark.parametrize("null_col", ["kafka_topic", "kafka_partition", "kafka_offset"])
+def test_null_kafka_offset_column_fails_r0(spark, tmp_path: Path, null_col: str) -> None:
+    lake = _lake(spark, tmp_path, ["e1", "e2", "e3"])
+    row = {"event_id": "x", "parse_ok": True, "kafka_topic": "game-events",
+           "kafka_partition": 4, "kafka_offset": 7, null_col: None}
+    spark.createDataFrame([tuple(row.values())], LAKE_SCHEMA) \
+        .write.format("delta").mode("append").save(lake)
+    report = verify(spark, _manifest(tmp_path, V1), lake)
+    assert (report["null_kafka_offset_rows"], report["duplicate_kafka_offsets"]) == (1, 0)
+    result, notes = evaluate(report, fail_on_duplicates=False)
+    assert result == "FAIL"
+    assert any("NULL Kafka topic, partition or offset" in n for n in notes)
 
 
 def test_versions_report_time_travel_counts(spark, tmp_path: Path) -> None:

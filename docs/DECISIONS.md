@@ -712,32 +712,66 @@ append-only. Otherwise it exits 2.
 - Cost: a deliberate delete (e.g. GDPR) first needs `ALTER TABLE ... SET TBLPROPERTIES
   (delta.appendOnly = false)`, a visible, logged step.
 
-**Checkpoint-reset guard.** At start-up, if the table has at least one row but the checkpoint
-has no batch (folder missing, or no file in `offsets/`), the job refuses to start: ERROR log
-`start-up refused` and exit 2. `BRONZE_ALLOW_REBUILD=1` overrides it with a WARNING
-(`REBUILD: ...`). The guard runs before the table is created or touched.
-- **Why Delta's `txn` cannot protect this case.** The sink's idempotency (D2.1, C9) is a lookup:
-  "does the table already have `txn(appId = this query's id, version = this batch id)`?" The
-  query id is stored in the checkpoint. A new or emptied checkpoint makes Spark generate a
-  **new query id**, so every old `txn` entry has a different `appId` and nothing matches.
-  Batch 0 of the new query re-reads the topic from `earliest` and Delta appends all of it
-  again. `txn` protects replays *within* one query, not a reset that creates a new one.
+**Start-up guard, both directions** (`streaming/start_guard.py`; first built as a one-way
+checkpoint-reset guard in slice 2, extended in the slice 2 follow-up). Before the table is
+created or touched, the job compares the checkpoint with the table. On a mismatch it logs
+`start-up refused` (ERROR) and exits 2. `BRONZE_ALLOW_REBUILD=1` overrides it with a WARNING
+(`REBUILD: ...`).
+- **One rule.** Let C = the checkpoint's newest `commits/N`, P = its newest `offsets/N`,
+  Q = its query id (`metadata`), and T = the table's newest `txn` version with `appId == Q`.
+  Start only if **T == C**, or **T == C + 1 with P >= C + 1**. With no batch in the
+  checkpoint (P missing), start only if the table has no rows.
+- **Why one *ahead* is legal and one *behind* is not.** For each batch N the order is
+  `offsets/N` -> Delta commit with `txn(Q, N)` -> `commits/N` (D1.15, C12). A crash between
+  the last two leaves T = C + 1. Spark then re-runs N, and the sink skips it ("Skipping
+  already complete epoch"); tested by deleting `commits/1`. T < C cannot happen, because
+  `commits/N` is written only after the Delta commit, and the sink commits a `txn` even for
+  a batch with zero output rows (tested). So "behind" always means the table lost commits
+  (e.g. restored from an older copy).
+- **What it catches:**
+
+  | Case | T vs C | Why starting is wrong |
+  |---|---|---|
+  | checkpoint missing/reset, table has data | no batches | new query id: Delta's `txn` cannot match the old batches, so every message would be appended again (below) |
+  | table deleted, checkpoint kept | T missing | Spark resumes at the checkpoint's offsets: every row before them is silently gone |
+  | table replaced by another (no txn for Q) | T missing | same |
+  | table restored from an older copy | T < C | batches T+1..C would be lost |
+  | another writer used Q as `txnAppId` | T > P | the table claims batches the checkpoint never planned |
+  | batch 0 planned, not committed; table has another query's data | T missing, C missing | same as a reset |
+
+- **Why Delta's `txn` cannot protect a checkpoint reset.** The sink's idempotency (D2.1, C9) is
+  a lookup: "does the table already have `txn(appId = this query's id, version = this batch
+  id)`?" The query id is stored in the checkpoint. A new or emptied checkpoint makes Spark
+  generate a **new query id**, so every old `txn` entry has a different `appId` and nothing
+  matches. Batch 0 of the new query re-reads the topic from `earliest` and Delta appends all
+  of it again. `txn` protects replays *within* one query, not a reset that creates a new one.
   Afterwards R0 would show it, but by then every message is in bronze twice, and append-only
   makes the clean-up a deliberate operation.
-- Tested: Spark tests for "fresh" (no table, or an empty table), "resume" (checkpoint has
-  batches), refusal for a missing checkpoint, a checkpoint with only `metadata`, and an empty
-  `offsets/` (table version unchanged each time), `run()` returning 2 without starting a query,
-  and the override. Live (2026-11-19): a one-off container with
+- **Reading T.** `common/delta_log.latest_txn_in_commits` scans commit JSONs from newest to
+  oldest (a query's txn version only grows, so the first hit is the maximum). If log cleanup
+  (30 days by default) has removed older commits and none of the remaining ones has it, the
+  job reads the newest Delta checkpoint Parquet with Spark, where `txn` actions are kept.
+  Tested by deleting commits 0..10 after a checkpoint at version 10.
+- Tested in Spark (`tests/spark/test_bronze_table.py`), each state created for real: fresh
+  (no table / empty table); refused with no batches (missing checkpoint, `metadata` only,
+  empty `offsets/`); normal resume; T = C + 1 after deleting `commits/1`, then a re-run that
+  writes nothing; table deleted; table replaced; table restored from an older copy; T ahead
+  (a write with `txnAppId = Q, txnVersion = 5`); a zero-row batch still commits its `txn`;
+  T found in the checkpoint after log cleanup; `run()` returns 2 without starting a query;
+  the override. The pure decision table has one unit test per branch
+  (`tests/unit/test_start_guard.py`).
+- Live (2026-11-19, first version of the guard): a one-off container with
   `BRONZE_CHECKPOINT_PATH=/data/checkpoints/bronze_guard_demo` against the populated table
-  exited 2 with the message above, created no checkpoint folder, and wrote no commit.
-- Not guarded (open): the reverse case, a deleted table with a kept checkpoint. The job would
-  create an empty table and resume at the checkpoint's offsets, so the old rows would simply be
-  gone from bronze. Noted for Phase 4.
+  exited 2, created no checkpoint folder, and wrote no commit.
 
 **R0: `(kafka_topic, kafka_partition, kafka_offset)` is unique in bronze** (parent plan D6).
 `verify_manifest` reports `duplicate_kafka_offsets` over the whole table, and any value > 0 is
 FAIL (duplicate event ids are only reported, as before). It proves "one row per Kafka message"
 at table level, including across restarts.
+- A row with a NULL `kafka_topic`, `kafka_partition` or `kafka_offset` also fails R0
+  (`null_kafka_offset_rows`). Every Kafka message has all three, so such a row cannot be tied
+  to one message. It is counted separately because SQL `DISTINCT` treats NULLs as equal and
+  would hide two such rows as one.
 - **Known limit: false positives after a topic is deleted and recreated.** Offsets restart at
   0, so new messages reuse `(topic, partition, offset)` keys already in bronze and R0 fails
   although nothing was written twice. Bronze does not store Kafka's topic id. Until it does,
@@ -772,7 +806,9 @@ batch, no re-read, no skip) are unchanged. Replaced and new:
   `phase-1`.
 - `common/delta_log.py` is stdlib only (laptop side, D1.16). `read_commits`, `reconcile` and
   `txn_actions` moved there from the slice 1 gate (one copy); `make delta-compat` still PASSes
-  with them (2026-11-19, 245.5 s, all 14 checks). `e2e/parquet_count.py` was removed.
+  with them (2026-11-19, 245.5 s, all 14 checks). `e2e/parquet_count.py` was removed, and in
+  the follow-up `pyarrow` was dropped from `requirements/dev.txt` (nothing imports it; unit
+  tests pass in a fresh venv without it).
 
 **Measured (2026-11-19, laptop, WSL2; single runs, not benchmarks)**
 

@@ -7,6 +7,7 @@ in pytest's tmp_path, never in ./data.
 from __future__ import annotations
 
 import logging
+import shutil
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,7 +19,11 @@ pytest.importorskip("pyspark")
 
 from pyspark.sql import DataFrame, SparkSession  # noqa: E402
 
-from common.delta_log import appended_between, current_version  # noqa: E402
+from common.delta_log import (  # noqa: E402
+    appended_between,
+    current_version,
+    latest_txn_in_commits,
+)
 from simulator.events import EventType, GameEvent  # noqa: E402
 from streaming import bronze  # noqa: E402
 from streaming.bronze import (  # noqa: E402
@@ -31,6 +36,7 @@ from streaming.bronze import (  # noqa: E402
     to_raw_rows,
 )
 from streaming.config import BronzeJobConfig  # noqa: E402
+from streaming.start_guard import read_checkpoint_state  # noqa: E402
 
 KAFKA_SCHEMA = (
     "key binary, value binary, topic string, partition int, offset long, timestamp timestamp"
@@ -234,31 +240,144 @@ def test_run_exits_2_when_guard_refuses(spark: SparkSession, tmp_path: Path,
 
 # --- the streaming sink ---------------------------------------------------------------------
 
+def _run_stream(spark: SparkSession, src: Path, cfg: BronzeJobConfig,
+                max_files: int | None = None, where: str | None = None) -> str:
+    """One availableNow run of the real bronze writer over Kafka-shaped Parquet files."""
+    reader = spark.readStream.schema(KAFKA_SCHEMA)
+    if max_files:
+        reader = reader.option("maxFilesPerTrigger", max_files)
+    stream = reader.parquet(str(src))
+    if where:
+        stream = stream.where(where)
+    assert prepare_bronze(spark, cfg, stream) in {"fresh", "resume"}
+    q = start_bronze_query(stream, cfg, trigger={"availableNow": True})
+    q.awaitTermination(180)
+    assert q.exception() is None
+    return str(q.id)
+
+
+def _add_src(spark: SparkSession, src: Path, offsets: range, partition: int = 0) -> None:
+    _kafka_rows(spark, offsets, partition).coalesce(1).write.mode("append").parquet(str(src))
+
+
+def _two_runs(spark: SparkSession, tmp_path: Path) -> tuple[BronzeJobConfig, str]:
+    """Batches 0 (5 rows) and 1 (3 rows) from one checkpoint. Returns (cfg, query id)."""
+    src, cfg = tmp_path / "src", _cfg(tmp_path)
+    _add_src(spark, src, range(0, 5))
+    q1 = _run_stream(spark, src, cfg)
+    _add_src(spark, src, range(5, 8), partition=1)
+    q2 = _run_stream(spark, src, cfg)  # restart from the same checkpoint
+    assert q1 == q2  # query id is stored in the checkpoint
+    return cfg, q1
+
+
+def _guard(spark: SparkSession, cfg: BronzeJobConfig, allow_rebuild: bool = False) -> str:
+    return check_checkpoint_guard(spark, cfg.table_path, cfg.checkpoint_path, allow_rebuild)
+
+
 def test_sink_appends_once_per_message_with_stable_txn_app_id(spark: SparkSession,
                                                                tmp_path: Path) -> None:
-    src = tmp_path / "src"
-    cfg = _cfg(tmp_path)
-
-    def run_once() -> str:
-        stream = spark.readStream.schema(KAFKA_SCHEMA).parquet(str(src))
-        assert prepare_bronze(spark, cfg, stream) in {"fresh", "resume"}
-        q = start_bronze_query(stream, cfg, trigger={"availableNow": True})
-        q.awaitTermination(120)
-        assert q.exception() is None
-        return str(q.id)
-
-    _kafka_rows(spark, range(0, 5)).write.mode("append").parquet(str(src))
-    q1 = run_once()
-    _kafka_rows(spark, range(5, 8), partition=1).write.mode("append").parquet(str(src))
-    q2 = run_once()  # restart from the same checkpoint
-
-    assert q1 == q2  # query id is stored in the checkpoint
+    cfg, q = _two_runs(spark, tmp_path)
     df = spark.read.format("delta").load(cfg.table_path)
     assert df.count() == 8
     assert df.select("kafka_topic", "kafka_partition", "kafka_offset").distinct().count() == 8
     log = appended_between(cfg.table_path, -1, current_version(cfg.table_path))
     assert log.rows == 8
-    assert [t["appId"] for t in log.txns] == [q1, q1]
+    assert [t["appId"] for t in log.txns] == [q, q]
     assert [t["version"] for t in log.txns] == [0, 1]
-    assert check_checkpoint_guard(spark, cfg.table_path, cfg.checkpoint_path,
-                                  False) == "resume"
+    assert _guard(spark, cfg) == "resume"  # txn 1 == checkpoint's last commit 1
+
+
+# --- start-up guard, checkpoint has batches (the other direction) -------------------------
+
+def test_txn_one_ahead_after_crash_before_commit_file_is_legal(spark: SparkSession,
+                                                               tmp_path: Path) -> None:
+    """Delta committed batch 1, commits/1 is missing: the one legal mismatch (T = C + 1)."""
+    cfg, _ = _two_runs(spark, tmp_path)
+    commits = Path(cfg.checkpoint_path) / "commits"
+    (commits / "1").unlink()
+    (commits / ".1.crc").unlink(missing_ok=True)
+    v = current_version(cfg.table_path)
+    assert _guard(spark, cfg) == "resume"
+    _run_stream(spark, tmp_path / "src", cfg)  # Spark re-runs batch 1, the sink skips it
+    assert (commits / "1").exists()
+    assert current_version(cfg.table_path) == v
+    assert spark.read.format("delta").load(cfg.table_path).count() == 8
+
+
+def test_table_missing_with_checkpoint_is_refused(spark: SparkSession, tmp_path: Path) -> None:
+    cfg, _ = _two_runs(spark, tmp_path)
+    shutil.rmtree(cfg.table_path)
+    with pytest.raises(BronzeStartupError, match="missing or has no txn for this query id"):
+        _guard(spark, cfg)
+    assert not Path(cfg.table_path).exists()  # refused before creating anything
+    assert _guard(spark, cfg, allow_rebuild=True) == "rebuild"
+
+
+def test_table_without_txn_for_this_query_is_refused(spark: SparkSession,
+                                                     tmp_path: Path) -> None:
+    """The table was replaced by one written by something else (here: plain appends)."""
+    cfg, _ = _two_runs(spark, tmp_path)
+    other = _populated(spark, tmp_path / "other")
+    with pytest.raises(BronzeStartupError, match="no txn for this query id"):
+        check_checkpoint_guard(spark, other.table_path, cfg.checkpoint_path, False)
+
+
+def test_table_behind_checkpoint_is_refused(spark: SparkSession, tmp_path: Path) -> None:
+    """Table restored from a copy taken after batch 0; the checkpoint has batch 1."""
+    src, cfg = tmp_path / "src", _cfg(tmp_path)
+    _add_src(spark, src, range(0, 5))
+    _run_stream(spark, src, cfg)
+    backup = tmp_path / "backup"
+    shutil.copytree(cfg.table_path, backup)
+    _add_src(spark, src, range(5, 8))
+    _run_stream(spark, src, cfg)
+    shutil.rmtree(cfg.table_path)
+    shutil.copytree(backup, cfg.table_path)
+    with pytest.raises(BronzeStartupError, match="behind the checkpoint.*lose batches 1..1"):
+        _guard(spark, cfg)
+
+
+def test_table_ahead_of_checkpoint_is_refused(spark: SparkSession, tmp_path: Path) -> None:
+    """Another writer used this query id as its txnAppId, with a higher version."""
+    cfg, q = _two_runs(spark, tmp_path)
+    to_raw_rows(_kafka_rows(spark, range(100, 101))).write.format("delta").mode("append") \
+        .option("txnAppId", q).option("txnVersion", 5).save(cfg.table_path)
+    with pytest.raises(BronzeStartupError, match="ahead of the checkpoint"):
+        _guard(spark, cfg)
+
+
+def test_batch_with_zero_output_rows_still_commits_txn(spark: SparkSession,
+                                                       tmp_path: Path) -> None:
+    """Why T can never lag C: the sink commits a txn even when a batch writes no rows."""
+    src, cfg = tmp_path / "src", _cfg(tmp_path)
+    _add_src(spark, src, range(0, 5))
+    q = _run_stream(spark, src, cfg, where="offset < 3")
+    _add_src(spark, src, range(10, 13))  # new input, but every row is filtered out
+    _run_stream(spark, src, cfg, where="offset < 3")
+    log = appended_between(cfg.table_path, -1, current_version(cfg.table_path))
+    assert log.rows == 3
+    assert [(t["appId"], t["version"]) for t in log.txns] == [(q, 0), (q, 1)]
+    assert sorted(p.name for p in (Path(cfg.checkpoint_path) / "commits").iterdir()
+                  if p.name.isdigit()) == ["0", "1"]
+    assert _guard(spark, cfg) == "resume"
+
+
+def test_txn_is_found_in_delta_checkpoint_after_log_cleanup(spark: SparkSession,
+                                                            tmp_path: Path) -> None:
+    """Old commit JSONs gone (log cleanup): the txn is read from the checkpoint Parquet."""
+    src, cfg = tmp_path / "src", _cfg(tmp_path)
+    for i in range(10):
+        _add_src(spark, src, range(i * 2, i * 2 + 2))
+    _run_stream(spark, src, cfg, max_files=1)  # batches 0..9 -> versions 1..10
+    log_dir = Path(cfg.table_path) / "_delta_log"
+    assert (log_dir / f"{10:020d}.checkpoint.parquet").exists()
+    spark.sql(f"OPTIMIZE delta.`{cfg.table_path}`")  # version 11, no txn
+    assert current_version(cfg.table_path) == 11
+    for v in range(11):  # what cleanup does: drop commits up to the checkpoint
+        (log_dir / f"{v:020d}.json").unlink()
+        (log_dir / f"{v:020d}.crc").unlink(missing_ok=True)
+    assert latest_txn_in_commits(cfg.table_path, read_checkpoint_state(
+        cfg.checkpoint_path).query_id) == (None, False)
+    assert _guard(spark, cfg) == "resume"  # txn 9 from the checkpoint == commits/9
+    assert spark.read.format("delta").load(cfg.table_path).count() == 20

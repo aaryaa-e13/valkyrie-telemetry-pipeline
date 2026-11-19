@@ -15,6 +15,10 @@ and, for the whole table, rule R0 (DECISIONS D2.2):
                              message, so this must be 0. Duplicate *event ids*
                              are expected in bronze; a duplicate *offset* means
                              the sink wrote one message twice.
+    null_kafka_offset_rows   rows where any of the three is NULL. Every Kafka
+                             message has all three, so this must be 0 too: such
+                             a row cannot be tied to one message, and SQL
+                             DISTINCT would silently treat NULLs as equal.
 
 The table is read through Delta at one pinned version (`table_version` in the
 report), so every number comes from the same snapshot. Only committed data is
@@ -41,6 +45,7 @@ import argparse
 import json
 import logging
 import sys
+from functools import reduce
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +76,10 @@ def evaluate(report: dict[str, Any], fail_on_duplicates: bool) -> tuple[str, lis
         failed = True
         notes.append(f"R0: {report['duplicate_kafka_offsets']} extra rows share a Kafka "
                      "(topic, partition, offset): one message was written twice")
+    if report["null_kafka_offset_rows"] > 0:
+        failed = True
+        notes.append(f"R0: {report['null_kafka_offset_rows']} rows have a NULL Kafka topic, "
+                     "partition or offset: they cannot be tied to one message")
     if report["duplicate_rows"] > 0:
         if fail_on_duplicates:
             failed = True
@@ -116,12 +125,15 @@ def verify(spark: SparkSession, manifest_path: Path, table_path: str,
         .alias("ids_duplicated"),
         F.coalesce(F.max("count"), F.lit(0)).alias("max_copies"),
     ).first()
+    any_null = reduce(lambda a, b: a | b, [F.col(c).isNull() for c in OFFSET_KEY])
     table = rows.agg(
         F.count("*").alias("total"),
         F.coalesce(F.sum(F.when(~F.col("parse_ok"), 1).otherwise(0)), F.lit(0))
         .alias("unparsed"),
+        F.coalesce(F.sum(F.when(any_null, 1).otherwise(0)), F.lit(0)).alias("null_offsets"),
     ).first()
-    distinct_offsets = rows.select(*OFFSET_KEY).distinct().count()
+    keyed = rows.where(~any_null)
+    distinct_offsets = keyed.select(*OFFSET_KEY).distinct().count()
 
     expected_unique = len({event_id for _, event_id in pairs})
     found_unique = int(stats["found_unique"])
@@ -144,7 +156,8 @@ def verify(spark: SparkSession, manifest_path: Path, table_path: str,
         "max_copies_of_one_id": int(stats["max_copies"]),
         "total_rows": total,
         "unparsed_rows": int(table["unparsed"]),
-        "duplicate_kafka_offsets": total - distinct_offsets,
+        "duplicate_kafka_offsets": total - int(table["null_offsets"]) - distinct_offsets,
+        "null_kafka_offset_rows": int(table["null_offsets"]),
     }
     if versions:
         report["version_counts"] = {str(v): count_at(spark, table_path, v) for v in versions}
