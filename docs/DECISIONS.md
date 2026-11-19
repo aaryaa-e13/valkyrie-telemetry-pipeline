@@ -969,3 +969,66 @@ per batch, the aggregation, the control write). Silver keeps up at this rate, bu
 no headroom at a 10 s trigger. Not tuned in this slice. The likely lever is
 `spark.databricks.delta.snapshotPartitions` (50 by default; 2 in the test session cut the Spark
 suite from 14 to under 7 minutes). Changing it in the job is a decision for the next slice.
+
+**Slice 3 follow-up (2026-11-19): where a small silver batch spends its time, and
+`DELTA_SNAPSHOT_PARTITIONS=4`.**
+
+*Method.* A throwaway harness (not in the repo) called the real `process_batch` with the
+job's settings (`local[4]`, 2g, 8 shuffle partitions) on copies of the live tables (silver v4,
+control v5, bronze v8) in a one-off container. The pipeline was stopped, and no Kafka write was
+made. The source was 12-row batches read as Parquet, like the Delta streaming source. There
+were 5 "insert" batches (new ids) and 5 "no-op" batches (ids already in silver) after a
+warm-up. Spark jobs came from the REST API (`/jobs`), bucketed by the step they were
+submitted in. Each configuration ran in its own JVM, in the order default, 8, 4, default.
+
+*Breakdown with Delta's default (median of 5, insert / no-op):*
+
+| Step | Wall ms | Spark jobs | Tasks | Job ms | Of which snapshot rebuild | Driver time outside jobs |
+|---|---|---|---|---|---|---|
+| persist + counts/min/max | 443 / 394 | 4 / 4 | 7 / 7 | 121 / 88 | 0 | ~320 |
+| MERGE | 1,768 / 4,658 | 5 / 8 | 64 / 176 | 924 / 3,618 | (inside MERGE jobs) | ~850-970 |
+| control write | 4,121 / 4,042 | 4 / 4 | 114 / 117 | 3,379 / 3,374 | 3,011 / 3,005 | ~620 |
+| whole `process_batch` | 6,823 / 9,108 | | | | | |
+
+- **Counts and min/max are already one aggregation pass** (one `agg`, one action). Spark runs
+  it as 4 short jobs from the same call site (1, 1, 2, 3 stages; 7 tasks), about 0.1 s of job
+  time. Folding anything further would save at most a few hundred ms, so no change.
+- The time goes to **Delta snapshot rebuilds with ~51 tasks** (one job of 2.7 s in the control
+  write alone) and to the MERGE's own jobs. A no-op MERGE runs more jobs than an inserting one
+  (8 vs 5).
+
+*`spark.databricks.delta.snapshotPartitions` (median `process_batch` ms, insert / no-op):*
+
+| Setting | Insert | No-op | Control step | MERGE tasks | Harness container peak |
+|---|---|---|---|---|---|
+| default (50), run 1 | 6,823 | 9,108 | 4,121 | 64 / 176 | 2.82 GiB |
+| 8 | 4,022 | 4,491 | 1,795 | | 2.17 GiB |
+| **4** | **3,253** | **3,910** | **1,553** | 18 / 38 | 1.75 GiB |
+| default (50), run 2 | 6,505 | 8,441 | 3,954 | | 2.23 GiB |
+
+The two default runs agree within 4.7 % / 7.3 % (the noise). Against their average, 4 cuts the
+median by 51 % / 55 % and 8 by 40 % / 49 %. Rule agreed beforehand: apply the faster value if
+it cuts at least 20 % and the default runs agree within 10 %. So **4**. (The harness container
+also copied tables and built batch tables, so its peaks are not the job's.)
+
+*Applied as one change:* env `DELTA_SNAPSHOT_PARTITIONS` (compose default 4; empty = Delta's
+default; must be an int >= 1), passed to `build_spark` by `streaming/pipeline.py` and
+`streaming/bronze.py`, logged at start-up. Nothing else changed. It applies to the whole
+session, so bronze and silver both use it. `spark-tools` (verify) keeps Delta's default.
+
+*Live, before (slice 3, snapshotPartitions 50) and after (4), 11-16 row batches, 3 x `make smoke`:*
+
+| | Before | After |
+|---|---|---|
+| silver MERGE | 3.5-5.0 s (median 4.1) | 1.9-2.6 s (median 2.4) |
+| silver whole batch (`addBatch`) | 7.5-9.6 s (median 8.7) | 4.3-7.6 s (median 5.3, -39 %) |
+| silver trigger (10 s interval) | 7.6-9.9 s | 4.4-7.8 s |
+| bronze `addBatch` | 4.0-4.2 s | 2.9-5.1 s (3 batches; no clear change) |
+| silver caught up after bronze | 7.3 s (smoke) | 8.6, 1.1, -0.1 s (smoke 1-3) |
+| Spark container peak (`docker stats`) | 2.05 GiB (slice 3 max) | 1.53 GiB |
+| JVM heap peak / GC share | 0.83 GiB / 0.3 % | 0.55 GiB / 0.3 % |
+| correctness | PASS | PASS x3, both layers; silver rows == distinct keyed bronze ids each time |
+
+The slowest "after" batch (7.6 s) was the first one after the restart. Silver now has headroom
+at a 10 s trigger. **Caveat for Phase 10:** a lower value means fewer, larger tasks when a big
+table with a long log is rebuilt. Today's logs are under 15 commits. Re-measure at 1-50M rows.

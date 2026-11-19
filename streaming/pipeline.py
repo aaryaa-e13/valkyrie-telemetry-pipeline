@@ -37,7 +37,11 @@ from streaming.bronze import (
     prepare_bronze,
     start_bronze_query,
 )
-from streaming.config import BronzeJobConfig, SilverJobConfig
+from streaming.config import (
+    BronzeJobConfig,
+    SilverJobConfig,
+    delta_snapshot_partitions_from_env,
+)
 from streaming.progress import ProgressLogger
 from streaming.silver import prepare_silver, start_silver_query
 from streaming.spark_session import build_spark
@@ -54,7 +58,9 @@ def _stop_all(queries: list[StreamingQuery]) -> None:
 
 def run(bcfg: BronzeJobConfig, scfg: SilverJobConfig, master: str, driver_memory: str) -> int:
     """Start both queries and block until a stop signal or a failure."""
-    spark = build_spark("valkyrie-pipeline", master, driver_memory)
+    snapshot_partitions = delta_snapshot_partitions_from_env()
+    spark = build_spark("valkyrie-pipeline", master, driver_memory,
+                        delta_snapshot_partitions=snapshot_partitions)
     spark.sparkContext.setLogLevel("WARN")
     spark.streams.addListener(ProgressLogger({bcfg.query_name: bcfg.status_path,
                                               scfg.query_name: scfg.status_path}))
@@ -63,6 +69,7 @@ def run(bcfg: BronzeJobConfig, scfg: SilverJobConfig, master: str, driver_memory
         "topic": bcfg.topic, "bronze_path": bcfg.table_path, "silver_path": scfg.table_path,
         "control_path": scfg.control_path, "trigger": bcfg.trigger_interval,
         "dedupe_horizon_days": scfg.dedupe_horizon_days,
+        "delta_snapshot_partitions": snapshot_partitions or "default (50)",
         "bronze_allow_rebuild": bcfg.allow_rebuild,
         "silver_allow_rebuild": scfg.allow_rebuild}})
 

@@ -16,6 +16,8 @@ from collections.abc import Mapping
 
 from pyspark.sql import SparkSession
 
+SNAPSHOT_PARTITIONS_CONF = "spark.databricks.delta.snapshotPartitions"
+
 DELTA_CONF: dict[str, str] = {
     "spark.sql.extensions": "io.delta.sql.DeltaSparkSessionExtension",
     "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.delta.catalog.DeltaCatalog",
@@ -24,7 +26,8 @@ DELTA_CONF: dict[str, str] = {
 
 def build_spark(app_name: str, master: str, driver_memory: str,
                 shuffle_partitions: int = 8,
-                extra: Mapping[str, str] | None = None) -> SparkSession:
+                extra: Mapping[str, str] | None = None,
+                delta_snapshot_partitions: int | None = None) -> SparkSession:
     """Create (or reuse) a local-mode SparkSession with Delta enabled.
 
     spark.driver.memory must be set before the JVM starts; PySpark passes
@@ -37,6 +40,8 @@ def build_spark(app_name: str, master: str, driver_memory: str,
         driver_memory: JVM heap, e.g. "2g".
         shuffle_partitions: the default 200 is for clusters, not a laptop.
         extra: further settings, applied last.
+        delta_snapshot_partitions: tasks Delta uses to rebuild a table snapshot;
+            None keeps Delta's default (50). See DECISIONS D2.3.
     """
     builder = (
         SparkSession.builder.appName(app_name)
@@ -46,6 +51,9 @@ def build_spark(app_name: str, master: str, driver_memory: str,
         .config("spark.sql.shuffle.partitions", str(shuffle_partitions))
         .config("spark.ui.showConsoleProgress", "false")
     )
-    for key, value in {**DELTA_CONF, **(extra or {})}.items():
+    conf = dict(DELTA_CONF)
+    if delta_snapshot_partitions is not None:
+        conf[SNAPSHOT_PARTITIONS_CONF] = str(delta_snapshot_partitions)
+    for key, value in {**conf, **(extra or {})}.items():
         builder = builder.config(key, value)
     return builder.getOrCreate()

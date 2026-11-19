@@ -120,3 +120,30 @@ class SilverJobConfig:
             dedupe_horizon_days=int(get("DEDUPE_HORIZON_DAYS", str(d.dedupe_horizon_days))),
             allow_rebuild=get("SILVER_ALLOW_REBUILD", "0").lower() in _TRUE,
         )
+
+
+SNAPSHOT_PARTITIONS_ENV = "DELTA_SNAPSHOT_PARTITIONS"
+
+
+def delta_snapshot_partitions_from_env(env: Mapping[str, str] | None = None) -> int | None:
+    """`spark.databricks.delta.snapshotPartitions` for the streaming job, or None.
+
+    None (unset or empty) leaves Delta's default (50). Measured in the slice 3
+    follow-up (DECISIONS D2.3): on this laptop 4 halves a small silver batch,
+    because every Delta snapshot rebuild otherwise runs ~50 tasks on 4 cores.
+
+    Raises:
+        ValueError: the value is not an integer >= 1.
+    """
+    env = os.environ if env is None else env
+    raw = env.get(SNAPSHOT_PARTITIONS_ENV, "").strip()
+    if raw == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{SNAPSHOT_PARTITIONS_ENV} must be an integer >= 1, got {raw!r}") \
+            from None
+    if value < 1:
+        raise ValueError(f"{SNAPSHOT_PARTITIONS_ENV} must be an integer >= 1, got {value}")
+    return value

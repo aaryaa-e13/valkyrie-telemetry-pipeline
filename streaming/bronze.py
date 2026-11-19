@@ -40,7 +40,7 @@ from pyspark.sql.types import StructField, StructType
 
 from common.delta_log import latest_txn_in_commits, newest_checkpoint_files
 from common.logging_setup import setup_logging
-from streaming.config import BronzeJobConfig
+from streaming.config import BronzeJobConfig, delta_snapshot_partitions_from_env
 from streaming.progress import ProgressLogger
 from streaming.schemas import EVENT_JSON_SCHEMA, EVENT_TIME_FORMAT, REQUIRED_FIELDS
 from streaming.spark_session import build_spark
@@ -260,7 +260,9 @@ def kafka_source(spark: SparkSession, cfg: BronzeJobConfig) -> DataFrame:
 def run(cfg: BronzeJobConfig, master: str, driver_memory: str) -> int:
     """Start the streaming query and block until it stops. Returns an exit code:
     0 stopped cleanly, 1 failed, 2 start-up refused (BronzeStartupError)."""
-    spark = build_spark(cfg.query_name, master, driver_memory)
+    snapshot_partitions = delta_snapshot_partitions_from_env()
+    spark = build_spark(cfg.query_name, master, driver_memory,
+                        delta_snapshot_partitions=snapshot_partitions)
     spark.sparkContext.setLogLevel("WARN")
     spark.streams.addListener(ProgressLogger({cfg.query_name: cfg.status_path}))
     log.info("starting", extra={"fields": {
@@ -268,7 +270,8 @@ def run(cfg: BronzeJobConfig, master: str, driver_memory: str) -> int:
         "topic": cfg.topic, "table_path": cfg.table_path,
         "checkpoint_path": cfg.checkpoint_path, "status_path": cfg.status_path,
         "trigger": cfg.trigger_interval, "allow_rebuild": cfg.allow_rebuild,
-        "max_offsets_per_trigger": cfg.max_offsets_per_trigger}})
+        "max_offsets_per_trigger": cfg.max_offsets_per_trigger,
+        "delta_snapshot_partitions": snapshot_partitions or "default (50)"}})
 
     try:
         kafka_df = kafka_source(spark, cfg)

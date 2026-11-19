@@ -147,6 +147,9 @@ services:
       SILVER_CHECKPOINT_PATH: /data/checkpoints/silver
       SILVER_STATUS_PATH: /data/status/silver.json
       DEDUPE_HORIZON_DAYS: ${DEDUPE_HORIZON_DAYS:-7}
+      # Tasks per Delta snapshot rebuild (Delta default 50). 4 halved a small silver
+      # batch on this laptop (DECISIONS D2.3, slice 3 follow-up). Empty = Delta default.
+      DELTA_SNAPSHOT_PARTITIONS: ${DELTA_SNAPSHOT_PARTITIONS-4}
       # 1 = start although the silver checkpoint and silver/control tables disagree.
       SILVER_ALLOW_REBUILD: ${SILVER_ALLOW_REBUILD:-0}
       LOG_LEVEL: ${SPARK_JOB_LOG_LEVEL:-INFO}
