@@ -7,9 +7,12 @@ Steps:
        reach silver in a LATER batch: this exercises the cross-batch MERGE,
        not the in-batch dedupe.
     3. verify against the FIRST manifest (ground truth), bronze duplicates allowed:
-         bronze: every id exactly twice
-         silver: every id exactly once, and every silver row is a copy from
-                 the first send's offsets (rows_from_this_send == ids)
+         bronze:        every id exactly twice
+         silver ∪ late: every id exactly once (R1-R3), and every kept row is a
+                        copy from the first send's offsets (rows_from_this_send
+                        == ids). Some first copies can be in late when the two
+                        sends' timelines overlap by more than W (plan section 1);
+                        |L| is reported, not asserted.
 
 Exit codes: as e2e.orchestrator (0 PASS, 1 checks failed, 2 setup, 3 catch-up, 4 contiguity).
 
@@ -39,6 +42,7 @@ from e2e.orchestrator import (
     send_and_wait,
     silver_evidence,
     summarize_verify,
+    union_line,
     verify_report,
 )
 
@@ -56,11 +60,12 @@ def dupes_problems(report: dict[str, Any], expected: int) -> list[str]:
     if sv.get("result") != "PASS":
         problems.append(f"silver verify {sv.get('result')}: {sv.get('notes')}")
     if (sv.get("found_unique_ids"), sv.get("duplicate_rows")) != (expected, 0):
-        problems.append(f"silver should hold every id once: found {sv.get('found_unique_ids')}"
-                        f"/{expected}, duplicate rows {sv.get('duplicate_rows')}")
+        problems.append(f"silver ∪ late should hold every id once: found "
+                        f"{sv.get('found_unique_ids')}/{expected}, duplicate rows "
+                        f"{sv.get('duplicate_rows')}")
     if sv.get("rows_from_this_send") != expected:
-        problems.append(f"silver kept {sv.get('rows_from_this_send')} of {expected} rows from "
-                        "the FIRST send (the lower offsets); the rest came from the second")
+        problems.append(f"silver ∪ late kept {sv.get('rows_from_this_send')} of {expected} rows "
+                        "from the FIRST send (the lower offsets); the rest came from the second")
     return problems
 
 
@@ -92,9 +97,10 @@ def run_dupes(run: Run, args: argparse.Namespace) -> None:
         raise Abort(EXIT_VERIFY, "smoke-dupes failed:\n  " + "\n  ".join(problems),
                     short="; ".join(problems))
     sv = report["silver"]
-    say(f"PASS: {expected} ids; bronze {expected * 2} rows (each id twice); silver "
+    say(f"PASS: {expected} ids; bronze {expected * 2} rows (each id twice); silver ∪ late "
         f"{sv['found_unique_ids']} rows, all from the first send; "
         f"{run.summary['total_s']}s total")
+    say("      " + union_line(sv))
 
 
 def main(argv: list[str] | None = None) -> int:

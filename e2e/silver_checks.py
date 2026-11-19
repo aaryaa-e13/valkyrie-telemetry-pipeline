@@ -1,4 +1,4 @@
-"""Silver evidence for the e2e runs: MERGE timing and MERGE pruning (DECISIONS D2.3).
+"""Silver evidence for the e2e runs: MERGE timing, pruning, late path (D2.3, D2.4).
 
 Pure functions over the job's JSON log lines, plus one function that reads the
 Spark UI's REST API and the silver Delta log. Nothing here can fail a run: the
@@ -46,6 +46,35 @@ def merge_timing(records: list[dict[str, Any]], trigger_s: float) -> dict[str, A
         "median_merge_ms": ms[len(ms) // 2] if ms else None,
         "trigger_ms": int(trigger_s * 1000),
         "over_trigger": sum(1 for m in ms if m > trigger_s * 1000),
+    }
+
+
+def _median(values: list[int]) -> int | None:
+    v = sorted(values)
+    return v[len(v) // 2] if v else None
+
+
+def late_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Late-path evidence from the "silver batch" log records of one run (D2.4).
+
+    Sums are over log records, i.e. over batch ATTEMPTS: a replayed batch is
+    logged again. They are evidence, never a check; verify reads the tables.
+    """
+    def total(key: str) -> int:
+        return sum(int(r.get(key) or 0) for r in records)
+
+    late = [r for r in records if (r.get("late_rows") or 0) > 0]
+    return {
+        "batches": len(records),
+        "snapshot_batches": sum(1 for r in records if r.get("in_initial_snapshot")),
+        "batches_with_late_rows": len(late),
+        "late_rows": total("late_rows"), "late_dup_of_silver": total("late_dup_of_silver"),
+        "late_inserted": total("late_inserted_this_attempt"),
+        "dup_of_late": total("dup_of_late"), "clamped_rows": total("clamped_rows"),
+        "watermarks": sorted({r["watermark_used"] for r in records
+                              if r.get("watermark_used")})[-3:],
+        "median_wm_read_ms": _median([int(r.get("wm_read_ms") or 0) for r in records]),
+        "median_late_ms": _median([int(r.get("late_ms") or 0) for r in late]),
     }
 
 

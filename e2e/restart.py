@@ -31,6 +31,12 @@ after the restart (S0 + 1, same query id) must START exactly at S0's end offset
 (SV0, SV1] must equal the run's unique ids (fresh seed: every id is new).
 Version 2 evidence (bronze only) is still accepted; it gets no silver checks.
 
+Late table (evidence_version 4, slice 4, DECISIONS D2.4): LV0/LV1 are the late
+table's Delta versions at the stop and after silver caught up. A row of the run
+can be routed to late (cross-run overlap), so the rule becomes: rows added to
+silver in (SV0, SV1] + rows added to late in (LV0, LV1] == the run's unique ids.
+Version 3 evidence keeps the silver-only rule.
+
 First post-restart batch: in the status history (same Q0), the batch with
 batch_id B0 + 1. Batch ids increase by exactly 1 per executed batch, so
 anything else means the history does not contain it and we cannot prove
@@ -48,8 +54,8 @@ from typing import Any
 
 from common.manifest_reader import OffsetRange
 
-EVIDENCE_VERSION = 3
-ACCEPTED_VERSIONS = (2, 3)
+EVIDENCE_VERSION = 4
+ACCEPTED_VERSIONS = (2, 3, 4)
 PHASE1_POINTER = ("evidence_version 1 is Phase 1 (raw Parquet) evidence; the Delta rules "
                   "cannot check it. Re-check it with the Phase 1 code at tag `phase-1`: "
                   "git switch --detach phase-1 && python -m e2e.smoke_restart "
@@ -265,14 +271,22 @@ def check_silver_resume(status: Mapping[str, Any] | None, s0: Mapping[str, Any]
     return want, []
 
 
-def check_silver_rows(log: Mapping[str, Any] | None, run_unique_ids: int) -> list[str]:
-    """Rows added to silver in (SV0, SV1] == the run's unique ids."""
+def check_silver_rows(log: Mapping[str, Any] | None, run_unique_ids: int,
+                      late_log: Mapping[str, Any] | None = None, with_late: bool = False
+                      ) -> list[str]:
+    """Rows added to silver in (SV0, SV1] (+ late in (LV0, LV1] if with_late) == run ids."""
     if problems := _log_error(log):
         return [p.replace("Delta log", "silver Delta log") for p in problems]
+    if with_late and (problems := _log_error(late_log)):
+        return [p.replace("Delta log", "late Delta log") for p in problems]
     assert log is not None
-    if int(log["rows"]) != run_unique_ids:
-        return [f"silver rows added in versions {log['v_before']}..{log['v_after']}: "
-                f"{log['rows']} != run unique ids {run_unique_ids}"]
+    late_rows = int(late_log["rows"]) if with_late and late_log is not None else 0
+    if int(log["rows"]) + late_rows != run_unique_ids:
+        span = f"silver rows added in versions {log['v_before']}..{log['v_after']}: {log['rows']}"
+        if with_late and late_log is not None:
+            span += (f" + late rows added in versions {late_log['v_before']}.."
+                     f"{late_log['v_after']}: {late_rows}")
+        return [f"{span} != run unique ids {run_unique_ids}"]
     return []
 
 
@@ -395,10 +409,18 @@ def evaluate(ev: Mapping[str, Any]) -> list[Check]:
         checks.append(check("silver resumes at S0 end", problems,
                             f"silver batch {first} starts at bronze version {at}"))
         slog = sv.get("log")
-        checks.append(check("silver rows == run ids",
-                            check_silver_rows(slog, int(ev.get("run_unique_ids") or -1)),
-                            f"+{(slog or {}).get('rows')} rows in "
-                            f"v{(slog or {}).get('v_before')}..v{(slog or {}).get('v_after')}"))
+        if ev["evidence_version"] >= 4:
+            llog = (ev.get("late") or {}).get("log")
+            checks.append(check(
+                "silver + late rows == run ids",
+                check_silver_rows(slog, int(ev.get("run_unique_ids") or -1), llog, True),
+                f"silver +{(slog or {}).get('rows')}, late +{(llog or {}).get('rows')} rows"))
+        else:
+            checks.append(check("silver rows == run ids",
+                                check_silver_rows(slog, int(ev.get("run_unique_ids") or -1)),
+                                f"+{(slog or {}).get('rows')} rows in "
+                                f"v{(slog or {}).get('v_before')}.."
+                                f"v{(slog or {}).get('v_after')}"))
     v = ev.get("verify") or {}
     checks.append(check("verify --fail-on-duplicates",
                         [] if v.get("result") == "PASS" else [f"verify {v.get('result')}: "

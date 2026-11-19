@@ -10,7 +10,7 @@ Steps:
        (bronze + silver)
     8. restart checks (e2e/restart.py): no re-read, no skip, Delta-log delta,
        log == Spark time travel, txn appId == query id; silver resumes at its
-       pre-stop end offset and adds exactly the run's ids (evidence v3)
+       pre-stop end offset; silver + late add exactly the run's ids (evidence v4)
 
 Spark is ALWAYS left running: a `finally` block restarts it if needed, even
 after a failure or Ctrl-C. If that fails, the last lines say how to start it.
@@ -22,8 +22,8 @@ Exit codes: 0 pass, 1 verify failed, 2 setup, 3 not caught up, 4 another
 writer / contiguity, 5 a restart rule failed (stop exit code, re-read, skip,
 Delta-log delta, txn identity, or cannot prove).
 
-Evidence files are evidence_version 3 (bronze + silver Delta); version 2 files
-(bronze only) are still re-checked. `--check-evidence` on a Phase 1 file
+Evidence files are evidence_version 4 (bronze + silver + late Delta); versions 2
+(bronze only) and 3 (+ silver) are still re-checked. `--check-evidence` on a Phase 1 file
 (version 1, Parquet) refuses with exit 2 and points to tag `phase-1`.
 
 Usage:
@@ -65,6 +65,7 @@ from e2e.orchestrator import (
     add_common_args,
     say,
     send_run,
+    summarize_verify,
     verify_report,
     wait_for_catch_up,
     wait_for_silver,
@@ -176,6 +177,10 @@ def scenario(args: argparse.Namespace, run: Run, ev: dict[str, Any]) -> None:
     ev["silver"] = {"table": str(args.silver_path), "sv0": sv0, "s0": {
         "query_id": s_snap.query_id, "batch_id": s_snap.batch_id,
         "end_offset": s_status["last_batch"]["end_offset"]}}
+    lv0 = current_version(args.late_path)
+    if lv0 is None:
+        raise Abort(EXIT_SETUP, f"no late Delta table at {args.late_path}: cannot record LV0")
+    ev["late"] = {"table": str(args.late_path), "lv0": lv0}
     say(f"      exit code {state.exit_code} after {ev['stop_s']}s; E0 {ev['e0']}; B0 {ev['b0']}; "
         f"Delta version V0 {v0}")
 
@@ -241,9 +246,19 @@ def scenario(args: argparse.Namespace, run: Run, ev: dict[str, Any]) -> None:
         ev["silver"]["log"] = {"error": str(exc), "v_before": ev["silver"]["sv0"],
                                "v_after": sv1}
     slog = ev["silver"]["log"]
+    lv1 = current_version(args.late_path)
+    ev["late"]["lv1"] = lv1
+    try:
+        ev["late"]["log"] = appended_between(args.late_path, ev["late"]["lv0"],
+                                             lv1 if lv1 is not None else -1).as_dict()
+    except DeltaLogError as exc:
+        ev["late"]["log"] = {"error": str(exc), "v_before": ev["late"]["lv0"], "v_after": lv1}
+    llog = ev["late"]["log"]
     say(f"      silver caught up {ev['silver_catch_up']['wait_s']}s later; silver "
         f"v{ev['silver']['sv0']}..v{sv1}: "
-        + (f"+{slog['rows']} rows" if "rows" in slog else f"ERROR {slog['error']}"))
+        + (f"+{slog['rows']} rows" if "rows" in slog else f"ERROR {slog['error']}")
+        + f"; late v{ev['late']['lv0']}..v{lv1}: "
+        + (f"+{llog['rows']} rows" if "rows" in llog else f"ERROR {llog['error']}"))
 
     say("[7/8] verify --fail-on-duplicates --versions V0,V1 (spark-tools, read-only data)")
     versions = [v0, v1] if v1 is not None else [v0]
@@ -254,7 +269,9 @@ def scenario(args: argparse.Namespace, run: Run, ev: dict[str, Any]) -> None:
                                                 "duplicate_rows", "duplicate_kafka_offsets",
                                                 "table_version", "notes")}
     ev["verify"]["silver"] = {k: (report.get("silver") or {}).get(k) for k in (
-        "result", "found_unique_ids", "duplicate_rows", "duplicate_event_ids", "notes")}
+        "result", "found_unique_ids", "silver_found_ids", "late_found_ids", "in_both_ids",
+        "duplicate_rows", "duplicate_event_ids", "late_duplicate_event_ids", "notes")}
+    ev["verify"]["silver"]["consistency"] = summarize_verify(report)["silver"]["consistency"]
 
 
 def check_and_report(ev: dict[str, Any]) -> tuple[int, list[restart.Check]]:

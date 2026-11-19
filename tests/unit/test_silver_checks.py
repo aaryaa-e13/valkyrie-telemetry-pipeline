@@ -52,3 +52,36 @@ def test_scan_evidence_uses_version_before_the_merge(tmp_path: Path,
     assert ev["matches_log"] is True
     none = silver_checks.merge_scan_evidence("http://ui", t, [])
     assert none["measured"] is False
+
+
+def test_late_summary_sums_attempts_and_reports_snapshot_batches() -> None:
+    from e2e.silver_checks import late_summary
+
+    recs = [
+        {"batch_id": 0, "in_initial_snapshot": True, "late_rows": 0, "wm_read_ms": 0},
+        {"batch_id": 1, "in_initial_snapshot": False, "late_rows": 3, "late_dup_of_silver": 3,
+         "late_inserted_this_attempt": 0, "dup_of_late": 0, "clamped_rows": 1,
+         "watermark_used": "2026-11-19T12:00:00", "wm_read_ms": 40, "late_ms": 900},
+        {"batch_id": 2, "in_initial_snapshot": False, "late_rows": 0, "dup_of_late": 2,
+         "watermark_used": "2026-11-19T12:01:00", "wm_read_ms": 60},
+    ]
+    s = late_summary(recs)
+    assert (s["batches"], s["snapshot_batches"], s["batches_with_late_rows"]) == (3, 1, 1)
+    assert (s["late_rows"], s["late_dup_of_silver"], s["late_inserted"], s["dup_of_late"],
+            s["clamped_rows"]) == (3, 3, 0, 2, 1)
+    assert s["watermarks"] == ["2026-11-19T12:00:00", "2026-11-19T12:01:00"]
+    assert (s["median_wm_read_ms"], s["median_late_ms"]) == (40, 900)
+    assert late_summary([])["median_wm_read_ms"] is None
+
+
+def test_union_line_has_the_c7_numbers() -> None:
+    from e2e.orchestrator import union_line
+
+    sv = {"silver_found_ids": 11, "late_found_ids": 2, "in_both_ids": 0, "consistency": {
+        "checkable": True, "silver_rows_upto_batch": 500, "late_rows_upto_batch": 7,
+        "bronze_keyed_distinct_ids": 507, "bronze_keyless_rows": 3, "control_excluded_total": 3}}
+    line = union_line(sv)
+    assert "|S| 11, |L| 2, S ∩ L 0" in line
+    assert "silver 500 + late 7 vs bronze distinct keyed ids 507; keyless 3" in line
+    assert "not checkable (x)" in union_line({"consistency": {"checkable": False,
+                                                              "reason": "x"}})

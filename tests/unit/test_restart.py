@@ -240,7 +240,7 @@ def test_txn_identity_ignores_batches_without_rows() -> None:
 def test_evidence_version_1_is_refused_with_pointer() -> None:
     problem = restart.evidence_problem({"evidence_version": 1})
     assert problem is not None and "tag `phase-1`" in problem
-    assert "unknown evidence_version 4" in str(restart.evidence_problem({"evidence_version": 4}))
+    assert "unknown evidence_version 5" in str(restart.evidence_problem({"evidence_version": 5}))
     assert restart.evidence_problem({"evidence_version": 2}) is None   # bronze-only, still OK
     with pytest.raises(ValueError, match="phase-1"):
         restart.evaluate({"evidence_version": 1})
@@ -372,3 +372,33 @@ def test_silver_reread_skip_and_reset_are_caught() -> None:
     ev["silver"]["log"]["rows"] = 9                                          # extra silver row
     assert _failed(ev) == {"silver rows == run ids"}
     assert restart.exit_code_for(restart.evaluate(ev)) == 5
+
+
+# --- late table (evidence_version 4) ---------------------------------------------------
+
+def evidence_v4(silver_rows: int = 6, late_rows: int = 2) -> dict[str, Any]:
+    ev = evidence_v3()
+    ev["evidence_version"] = 4
+    ev["silver"]["log"]["rows"] = silver_rows
+    ev["late"] = {"lv0": 3, "lv1": 4, "log": {"v_before": 3, "v_after": 4, "rows": late_rows,
+                                              "commits": 1, "files": 1, "txns": []}}
+    return ev
+
+
+def test_evaluate_v4_counts_silver_plus_late() -> None:
+    checks = restart.evaluate(evidence_v4())             # 6 + 2 == 8 run ids
+    assert all(c.ok for c in checks), restart.format_checks(checks)
+    names = {c.name for c in checks}
+    assert "silver + late rows == run ids" in names and "silver rows == run ids" not in names
+    assert restart.evaluate(evidence_v4(8, 0))[-2].ok     # nothing routed late
+
+
+def test_v4_extra_or_missing_rows_and_unreadable_late_log_fail() -> None:
+    assert _failed(evidence_v4(6, 3)) == {"silver + late rows == run ids"}
+    assert _failed(evidence_v4(5, 2)) == {"silver + late rows == run ids"}
+    ev = evidence_v4()
+    ev["late"]["log"] = {"error": "boom", "v_before": 3, "v_after": None}
+    checks = {c.name: c for c in restart.evaluate(ev)}
+    assert not checks["silver + late rows == run ids"].ok
+    assert "late Delta log" in checks["silver + late rows == run ids"].detail
+    assert restart.evidence_problem(evidence_v4()) is None

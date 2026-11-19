@@ -104,6 +104,7 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
         os.environ.get("E2E_SILVER_STATUS_PATH", "data/status/silver.json")))
     p.add_argument("--bronze-path", type=Path, default=Path("data/lake/bronze/game_events"))
     p.add_argument("--silver-path", type=Path, default=Path("data/lake/silver/game_events"))
+    p.add_argument("--late-path", type=Path, default=Path("data/lake/silver/late_events"))
     p.add_argument("--silver-timeout", type=float, default=60.0,
                    help="seconds to wait for silver after bronze has the run")
     p.add_argument("--spark-ui", default=os.environ.get("E2E_SPARK_UI", "http://localhost:4040"))
@@ -246,6 +247,7 @@ def silver_evidence(args: argparse.Namespace, since_wall: float) -> dict[str, An
     records = silver_checks.silver_batch_records(container_logs(SPARK_CONTAINER,
                                                                 since=since_wall))
     return {"merge_timing": silver_checks.merge_timing(records, args.trigger_interval_s),
+            "late": silver_checks.late_summary(records),
             "merge_scan": silver_checks.merge_scan_evidence(args.spark_ui, args.silver_path,
                                                             records)}
 
@@ -318,13 +320,27 @@ def summarize_verify(report: dict[str, Any]) -> dict[str, Any]:
     out = {k: report.get(k) for k in (
         "result", "expected_unique_ids", "found_unique_ids", "missing_ids", "duplicate_rows")}
     sv = report.get("silver") or {}
-    out["silver"] = {k: sv.get(k) for k in ("result", "found_unique_ids", "duplicate_rows",
-                                            "duplicate_event_ids", "total_rows")}
+    out["silver"] = {k: sv.get(k) for k in (
+        "result", "found_unique_ids", "silver_found_ids", "late_found_ids", "in_both_ids",
+        "duplicate_rows", "duplicate_event_ids", "late_duplicate_event_ids",
+        "ids_in_both_tables", "total_rows", "late_total_rows")}
     cons = sv.get("consistency") or {}
     out["silver"]["consistency"] = {k: cons.get(k) for k in (
-        "checkable", "silver_rows_upto_batch", "bronze_keyed_distinct_ids",
-        "control_excluded_total", "bronze_keyless_rows")}
+        "checkable", "silver_rows_upto_batch", "late_rows_upto_batch",
+        "bronze_keyed_distinct_ids", "control_excluded_total", "bronze_keyless_rows")}
     return out
+
+
+def union_line(sv: dict[str, Any]) -> str:
+    """C7 numbers in one line: |S|, |L| of the run; whole tables vs bronze."""
+    cons = sv.get("consistency") or {}
+    tables = (f"tables: silver {cons.get('silver_rows_upto_batch')} + late "
+              f"{cons.get('late_rows_upto_batch')} vs bronze distinct keyed ids "
+              f"{cons.get('bronze_keyed_distinct_ids')}; keyless {cons.get('bronze_keyless_rows')}"
+              f" (control excluded {cons.get('control_excluded_total')})"
+              if cons.get("checkable") else f"tables: not checkable ({cons.get('reason')})")
+    return (f"run: |S| {sv.get('silver_found_ids')}, |L| {sv.get('late_found_ids')}, "
+            f"S ∩ L {sv.get('in_both_ids')}; {tables}")
 
 
 def verify(manifest: Manifest, verbose: bool, fail_on_duplicates: bool = True
@@ -404,9 +420,10 @@ def orchestrate(run: Run, args: argparse.Namespace) -> None:
     sv = report.get("silver") or {}
     ms = run.summary["silver_evidence"]["merge_scan"]
     say(f"PASS: bronze {report['found_unique_ids']}/{report['expected_unique_ids']} ids, "
-        f"{report['duplicate_rows']} duplicates; silver {sv.get('found_unique_ids')}/"
+        f"{report['duplicate_rows']} duplicates; silver ∪ late {sv.get('found_unique_ids')}/"
         f"{sv.get('expected_unique_ids')} ids, {sv.get('duplicate_rows')} duplicates; "
         f"{run.summary['total_s']}s total")
+    say("      " + union_line(sv))
     say("      merge scan: " + (f"read {ms['files_read']} files, {ms['files_in_window']} in "
                                 f"window, {ms['live_files']} live" if ms.get("measured")
                                 else f"not measured ({ms.get('reason')})"))
@@ -415,6 +432,7 @@ def orchestrate(run: Run, args: argparse.Namespace) -> None:
             "  Spark UI      http://localhost:4040\n"
             "  bronze Delta  data/lake/bronze/game_events/\n"
             "  silver Delta  data/lake/silver/game_events/\n"
+            "  late Delta    data/lake/silver/late_events/\n"
             f"  status file   {args.status_path}\n"
             f"  manifest      {manifest.path}\n"
             "The stack is still running; `make down` stops it.")
