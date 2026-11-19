@@ -15,8 +15,15 @@ A streaming query reads the bronze table (Delta source) and, per micro-batch
        WHEN NOT MATCHED THEN INSERT *.
        A replayed batch finds every id and writes no commit.
     5. one control row per batch, EVERY batch (also zero-row and all-keyless
-       ones), written with Delta's txn (appId = silver query id, version =
-       batch id): a replay writes nothing. The start-up guard reads that txn.
+       ones), a plain append with txnAppId = silver query id, txnVersion = the
+       batch id Spark passes in: Delta's documented pattern for idempotent
+       writes in foreachBatch, so a replay writes nothing. The guard reads that
+       txn. Silver rows do NOT use txn: they are insert-if-absent (step 4).
+
+Rules for foreachBatch kept here (Delta docs, "Idempotent table writes in
+foreachBatch"; Databricks guidance): no exception is caught or retried inside
+the batch (only try/finally to unpersist), so a failure fails the batch and
+Spark re-runs it after a restart; txnVersion is always the batch id.
 
 Correctness argument (effectively-once, not "exactly-once"): silver is
 insert-if-absent by event_id within the date window, so re-running a batch, or

@@ -845,8 +845,20 @@ table (Delta source) and writes `data/lake/silver/game_events`: Delta, partition
    DATE'hi' WHEN NOT MATCHED THEN INSERT *`. A replayed batch finds every id and commits
    nothing (C4/C11).
 5. **One control row per batch**, also for zero-row and all-keyless batches, in
-   `data/lake/_control/silver_batches` (Delta, appendOnly), written with Delta's idempotent
-   write options `txnAppId = silver query id`, `txnVersion = batch id`. A replay writes nothing.
+   `data/lake/_control/silver_batches` (Delta, appendOnly), written as a plain append with
+   `txnAppId = silver query id`, `txnVersion = batch id`. A replay writes nothing.
+
+**Two idempotency mechanisms, on purpose (parent plan D5).** Silver rows are
+**insert-if-absent** (step 4): it does not depend on the batch id, so it also holds after a
+checkpoint reset. Control rows use **`txnAppId`/`txnVersion`**: Delta's documented pattern
+(Delta docs, "Table streaming reads and writes", section "Idempotent table writes in
+foreachBatch", docs.delta.io, page delta-streaming.html). A control row has no natural key,
+its idempotency should follow the batch, and the start-up guard reads that txn. The txn
+options are used only for this append, never for a MERGE. The Databricks rules for
+foreachBatch are followed: no exception is caught or retried inside `process_batch` (only
+`try/finally` to unpersist), and `txnVersion` is the batch id Spark passes in. Tested:
+replaying a batch from the stream (delete `commits/C` and its `.crc`, re-run) leaves exactly
+one control row for C, batch ids 0..C, and the batch's silver row once.
 
 Silver columns: the event fields, `event_date`, the kept copy's Kafka lineage, bronze
 `ingest_time` (as `bronze_ingest_time`), `silver_query_id`, `silver_batch_id`,

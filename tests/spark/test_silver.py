@@ -344,6 +344,12 @@ def test_silver_guard_refusals_and_crash_state(spark: SparkSession, tmp_path: Pa
     _run(spark, cfg)                                          # re-runs batch C: writes nothing
     assert (current_version(cfg.table_path), current_version(cfg.control_path)) == (vs, vc)
     assert _committed_batches(cfg)[-1] == c
+    # The replay really ran (commits/C is back) and left exactly one control row for C.
+    assert (Path(cfg.checkpoint_path) / "commits" / str(c)).exists()
+    ctl = [r["batch_id"] for r in _control(spark, cfg) if r["silver_query_id"] == state.query_id]
+    assert ctl.count(c) == 1
+    assert sorted(ctl) == list(range(c + 1))
+    assert _silver(spark, cfg).where("event_id = 's-9'").count() == 1   # batch C's row, once
 
     # Control table behind (restored from an older copy): refused.
     live = tmp_path / "control_live"
