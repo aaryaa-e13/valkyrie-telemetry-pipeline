@@ -307,8 +307,13 @@ def test_snapshot_status_error_makes_the_pipeline_exit_2(spark: SparkSession,
           .option("checkpointLocation", str(tmp_path / "cp_ok")).start())
     bad = (rate.writeStream.queryName("bad2").foreachBatch(boom)
            .option("checkpointLocation", str(tmp_path / "cp_bad")).start())
-    assert supervise([ok, bad], lambda: False, poll_s=0.5) == 2
-    assert not ok.isActive and not bad.isActive
+    try:
+        assert supervise([ok, bad], lambda: False, poll_s=0.5) == 2
+        assert not ok.isActive and not bad.isActive
+    finally:
+        # The session is shared: forget the failed query, or a later test's
+        # awaitAnyTermination() re-raises its exception.
+        spark.streams.resetTerminated()
 
 
 # --- crash points (section 3, C2) -----------------------------------------------------------
