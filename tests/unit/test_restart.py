@@ -1,4 +1,4 @@
-"""Unit tests for e2e.restart (pure restart checks, evidence_version 2 = Delta)."""
+"""Unit tests for e2e.restart (pure restart checks; evidence v2 = bronze, v3 = + silver)."""
 
 from __future__ import annotations
 
@@ -240,7 +240,8 @@ def test_txn_identity_ignores_batches_without_rows() -> None:
 def test_evidence_version_1_is_refused_with_pointer() -> None:
     problem = restart.evidence_problem({"evidence_version": 1})
     assert problem is not None and "tag `phase-1`" in problem
-    assert "unknown evidence_version 3" in str(restart.evidence_problem({"evidence_version": 3}))
+    assert "unknown evidence_version 4" in str(restart.evidence_problem({"evidence_version": 4}))
+    assert restart.evidence_problem({"evidence_version": 2}) is None   # bronze-only, still OK
     with pytest.raises(ValueError, match="phase-1"):
         restart.evaluate({"evidence_version": 1})
 
@@ -331,3 +332,43 @@ def test_evaluate_baseline_incomplete() -> None:
     ev = evidence()
     ev["kafka_end_at_baseline"]["1"] = 51
     assert _failed(ev) == {"baseline complete"}
+
+
+# --- silver checks (evidence_version 3) ---------------------------------------------
+
+def _s_end(version: int, index: int = -1) -> dict[str, Any]:
+    return {"reservoir_id": "b", "reservoir_version": version, "index": index,
+            "is_starting_version": False}
+
+
+def evidence_v3() -> dict[str, Any]:
+    ev = evidence()
+    ev["evidence_version"] = 3
+    ev["run_unique_ids"] = 8
+    hist = [{"batch_id": 4, "start_offset": _s_end(18), "end_offset": _s_end(21)},
+            {"batch_id": 5, "start_offset": _s_end(21), "end_offset": _s_end(22)}]
+    ev["silver"] = {"s0": {"query_id": "sq", "batch_id": 4, "end_offset": _s_end(21)},
+                    "log": {"v_before": 9, "v_after": 10, "rows": 8, "commits": 1,
+                            "files": 1, "txns": []}}
+    ev["silver_status_after"] = {"query_id": "sq", "history": hist, "last_batch": hist[-1]}
+    return ev
+
+
+def test_evaluate_v3_all_pass_and_v2_has_no_silver_checks() -> None:
+    checks = restart.evaluate(evidence_v3())
+    assert all(c.ok for c in checks), restart.format_checks(checks)
+    assert {"silver resumes at S0 end", "silver rows == run ids"} <= {c.name for c in checks}
+    assert "silver rows == run ids" not in {c.name for c in restart.evaluate(evidence())}
+
+
+def test_silver_reread_skip_and_reset_are_caught() -> None:
+    ev = evidence_v3()
+    ev["silver_status_after"]["history"][1]["start_offset"] = _s_end(20)   # re-read
+    assert _failed(ev) == {"silver resumes at S0 end"}
+    ev = evidence_v3()
+    ev["silver_status_after"]["query_id"] = "other"                         # reset
+    assert _failed(ev) == {"silver resumes at S0 end"}
+    ev = evidence_v3()
+    ev["silver"]["log"]["rows"] = 9                                          # extra silver row
+    assert _failed(ev) == {"silver rows == run ids"}
+    assert restart.exit_code_for(restart.evaluate(ev)) == 5

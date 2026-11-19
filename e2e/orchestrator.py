@@ -1,10 +1,14 @@
-"""End-to-end run: simulator -> Kafka -> Spark -> bronze Delta -> verify.
+"""End-to-end run: simulator -> Kafka -> Spark -> bronze + silver Delta -> verify.
 
 Steps:
-    1. seed (Python, epoch ms)      5. contiguity check          (exit 4)
-    2. start Spark (idempotent)     6. wait for catch-up         (exit 3)
-    3. baseline status snapshot     7. verify in spark-tools     (exit 0/1)
-    4. simulator run + manifest
+    1. seed (Python, epoch ms)      5. contiguity check                    (exit 4)
+    2. start Spark (idempotent)     6. wait for bronze, then silver        (exit 3)
+    3. baseline status snapshot     7. verify bronze + silver (spark-tools) (exit 0/1)
+    4. simulator run + manifest     8. silver evidence: MERGE timing + pruning (report only)
+
+Silver catch-up (DECISIONS D2.3): once bronze has the run, the bronze table's
+current version V is read from its Delta log; silver has the run when its
+committed Delta source offset is past V (e2e/catchup.check_silver_caught_up).
 
 Exit codes:
     0 PASS
@@ -32,8 +36,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from common.delta_log import current_version, table_id
 from common.manifest_reader import Manifest, ManifestError, load_manifest
-from e2e import catchup
+from e2e import catchup, silver_checks
 from e2e.docker_ops import (
     CommandError,
     compose_up_spark,
@@ -95,6 +100,13 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
                    help="do not start the Spark container (to test failure handling)")
     p.add_argument("--status-path", type=Path, default=Path(
         os.environ.get("E2E_STATUS_PATH", "data/status/bronze.json")))
+    p.add_argument("--silver-status-path", type=Path, default=Path(
+        os.environ.get("E2E_SILVER_STATUS_PATH", "data/status/silver.json")))
+    p.add_argument("--bronze-path", type=Path, default=Path("data/lake/bronze/game_events"))
+    p.add_argument("--silver-path", type=Path, default=Path("data/lake/silver/game_events"))
+    p.add_argument("--silver-timeout", type=float, default=60.0,
+                   help="seconds to wait for silver after bronze has the run")
+    p.add_argument("--spark-ui", default=os.environ.get("E2E_SPARK_UI", "http://localhost:4040"))
     p.add_argument("--manifest-dir", type=Path, default=Path("manifests"))
     p.add_argument("--json-summary", type=Path, help="also write the summary JSON to this file")
 
@@ -131,14 +143,15 @@ def send_run(run: Run, args: argparse.Namespace, stream: bool) -> Manifest:
         extra += ["--matches", str(matches)]
     if args.sim_rate:
         extra += ["--rate", str(args.sim_rate)]
+    before = set(args.manifest_dir.glob(f"run_*_seed{run.seed}.json"))  # smoke-dupes
     res = run_simulator(config, run.seed, extra, stream=stream)
     if res.returncode != 0:
         tail = "\n".join((res.stdout + res.stderr).splitlines()[-15:])
         raise Abort(EXIT_SETUP, f"simulator exited with {res.returncode}:\n{tail}")
 
-    found = sorted(args.manifest_dir.glob(f"run_*_seed{run.seed}.json"))
+    found = sorted(set(args.manifest_dir.glob(f"run_*_seed{run.seed}.json")) - before)
     if len(found) != 1:
-        raise Abort(EXIT_SETUP, f"expected exactly one manifest for seed {run.seed}, "
+        raise Abort(EXIT_SETUP, f"expected exactly one NEW manifest for seed {run.seed}, "
                                 f"found {[str(f) for f in found]}")
     try:
         manifest = load_manifest(found[0])
@@ -189,6 +202,54 @@ def wait_for_catch_up(
         time.sleep(args.poll)
 
 
+def wait_for_silver(args: argparse.Namespace, verbose: bool) -> dict[str, Any]:
+    """After bronze has the run: wait until silver has consumed bronze's current version."""
+    bronze_v = current_version(args.bronze_path)
+    if bronze_v is None:
+        raise Abort(EXIT_SETUP, f"no bronze Delta log at {args.bronze_path}")
+    bronze_id = table_id(args.bronze_path)
+    start = time.monotonic()
+    wait_start_wall = time.time()
+    last_report = start
+    while True:
+        snap = catchup.delta_snapshot_from_status(read_status(args.silver_status_path))
+        result = catchup.check_silver_caught_up(snap, bronze_id, bronze_v)
+        waited = time.monotonic() - start
+        if result.caught_up:
+            return {"wait_s": round(waited, 1), "bronze_version": bronze_v,
+                    "batch_id": snap.batch_id if snap else None, "notes": list(result.reasons)}
+        spark = container_state(SPARK_CONTAINER)
+        if not spark.running or waited >= args.silver_timeout:
+            logs = container_logs(SPARK_CONTAINER, since=wait_start_wall)
+            facts = catchup.parse_log_lines(logs, query="silver")
+            reason = ("Spark container stopped while waiting for silver" if not spark.running
+                      else f"silver timed out after {waited:.0f}s "
+                           f"(limit {args.silver_timeout:.0f}s)")
+            raise Abort(EXIT_TIMEOUT, "\n".join([
+                f"silver did not catch up with bronze version {bronze_v}: {reason}",
+                f"  not caught up: {'; '.join(result.reasons)}",
+                f"  container    : {SPARK_CONTAINER} {spark.describe(datetime.now(UTC))}",
+                f"  status file  : {args.silver_status_path}",
+                f"  during wait  : {len(facts.batch_ids)} silver 'batch progress' lines, "
+                f"{len(facts.errors)} ERROR lines {list(facts.errors)[-3:]}",
+                f"--- last {LOG_TAIL} lines of {SPARK_CONTAINER} logs ---",
+                *(container_logs(SPARK_CONTAINER, tail=LOG_TAIL) or ["(no logs)"]),
+                "--- end of logs ---"]), short=f"silver did not catch up: {reason}")
+        if verbose and time.monotonic() - last_report >= 5:
+            say(f"      ... {waited:4.0f}s  silver: {'; '.join(result.reasons)}")
+            last_report = time.monotonic()
+        time.sleep(args.poll)
+
+
+def silver_evidence(args: argparse.Namespace, since_wall: float) -> dict[str, Any]:
+    """MERGE timing (all silver batches since the run started) and pruning evidence."""
+    records = silver_checks.silver_batch_records(container_logs(SPARK_CONTAINER,
+                                                                since=since_wall))
+    return {"merge_timing": silver_checks.merge_timing(records, args.trigger_interval_s),
+            "merge_scan": silver_checks.merge_scan_evidence(args.spark_ui, args.silver_path,
+                                                            records)}
+
+
 def timeout_report(
     manifest: Manifest, result: catchup.CatchUp, remaining_at_start: dict[int, int],
     spark: catchup.ContainerState, waited: float, timeout: float, wait_start_wall: float,
@@ -232,17 +293,18 @@ def timeout_report(
     return "\n".join(parts)
 
 
-def verify_report(manifest: Manifest, versions: list[int] | None = None
-                  ) -> tuple[int, dict[str, Any]]:
+def verify_report(manifest: Manifest, versions: list[int] | None = None,
+                  fail_on_duplicates: bool = True) -> tuple[int, dict[str, Any]]:
     """Run verify_manifest in spark-tools; (exit code, JSON report), even if it FAILs.
 
     `versions`: also report bronze row counts at these Delta versions.
+    `fail_on_duplicates`: bronze duplicates fail (silver duplicates always fail).
 
     Raises:
         Abort: verify produced no JSON report (crash or unusable manifest).
     """
     extra = ["--versions", ",".join(str(v) for v in versions)] if versions else []
-    res = run_verify(manifest.path.as_posix(), extra)
+    res = run_verify(manifest.path.as_posix(), extra, fail_on_duplicates=fail_on_duplicates)
     try:
         return res.returncode, json.loads(res.stdout)
     except ValueError:
@@ -251,9 +313,24 @@ def verify_report(manifest: Manifest, versions: list[int] | None = None
                     f"verify exited {res.returncode} without a JSON report:\n{tail}") from None
 
 
-def verify(manifest: Manifest, verbose: bool) -> dict[str, Any]:
+def summarize_verify(report: dict[str, Any]) -> dict[str, Any]:
+    """The verify keys that go into the SUMMARY line (bronze top level + silver)."""
+    out = {k: report.get(k) for k in (
+        "result", "expected_unique_ids", "found_unique_ids", "missing_ids", "duplicate_rows")}
+    sv = report.get("silver") or {}
+    out["silver"] = {k: sv.get(k) for k in ("result", "found_unique_ids", "duplicate_rows",
+                                            "duplicate_event_ids", "total_rows")}
+    cons = sv.get("consistency") or {}
+    out["silver"]["consistency"] = {k: cons.get(k) for k in (
+        "checkable", "silver_rows_upto_batch", "bronze_keyed_distinct_ids",
+        "control_excluded_total", "bronze_keyless_rows")}
+    return out
+
+
+def verify(manifest: Manifest, verbose: bool, fail_on_duplicates: bool = True
+           ) -> dict[str, Any]:
     """Run verify_manifest in spark-tools; returns its JSON report, Abort on FAIL."""
-    res_code, report = verify_report(manifest)
+    res_code, report = verify_report(manifest, fail_on_duplicates=fail_on_duplicates)
     if verbose or res_code != 0:
         say(json.dumps(report, indent=2))
     if res_code != 0:
@@ -264,31 +341,28 @@ def verify(manifest: Manifest, verbose: bool) -> dict[str, Any]:
 
 # --- main ----------------------------------------------------------------------
 
-def orchestrate(run: Run, args: argparse.Namespace) -> None:
-    demo = run.mode == "demo"
-    timeout = args.timeout if args.timeout is not None else MODES[run.mode]["timeout"]
-    t0 = time.monotonic()
+def send_and_wait(run: Run, args: argparse.Namespace, timeout: float, verbose: bool,
+                  key: str = "") -> Manifest:
+    """Steps 3-6: baseline, send, contiguity/freshness, bronze catch-up, silver catch-up.
 
-    say(f"[1/6] seed {run.seed} (epoch ms, generated in Python)")
-    say("[2/6] checking services" + ("" if args.no_start_spark else " and starting Spark"))
-    ensure_services(start_spark=not args.no_start_spark)
-
+    `key` prefixes the summary keys (smoke-dupes sends twice: "send1_", "send2_").
+    """
     baseline, _ = snapshot(args.status_path)
-    run.summary["baseline_batch_id"] = baseline.batch_id if baseline else None
-    say(f"[3/6] baseline status: "
+    run.summary[f"{key}baseline_batch_id"] = baseline.batch_id if baseline else None
+    say(f"[3/7] baseline status: "
         f"{'none' if not baseline else f'batch {baseline.batch_id}, query {baseline.query_id}'}")
 
-    say("[4/6] sending run with the simulator")
-    manifest = send_run(run, args, stream=demo)
+    say("[4/7] sending run with the simulator")
+    manifest = send_run(run, args, stream=verbose)
     assert manifest.kafka_offsets is not None and manifest.topic is not None
-    run.summary.update(run_id=manifest.run_id, manifest=str(manifest.path),
-                       events=manifest.events_delivered,
-                       partitions={str(p): [r.min, r.max] for p, r in
-                                   sorted(manifest.kafka_offsets.items())})
+    run.summary.update({f"{key}run_id": manifest.run_id, f"{key}manifest": str(manifest.path),
+                        f"{key}events": manifest.events_delivered,
+                        f"{key}partitions": {str(p): [r.min, r.max] for p, r in
+                                             sorted(manifest.kafka_offsets.items())}})
     say(f"      {manifest.events_delivered} events, offsets "
         + ", ".join(f"p{p} {r.min}..{r.max}" for p, r in sorted(manifest.kafka_offsets.items())))
 
-    say("[5/6] contiguity + freshness checks, then waiting for Spark "
+    say("[5/7] contiguity + freshness checks, then waiting for bronze "
         f"(timeout {timeout:.0f}s)")
     problems = catchup.check_contiguity(manifest.kafka_offsets)
     if problems:
@@ -300,21 +374,47 @@ def orchestrate(run: Run, args: argparse.Namespace) -> None:
         raise Abort(EXIT_SETUP, "status file is inconsistent with the topic:\n  "
                     + "\n  ".join(conflicts), short="status file inconsistent with topic "
                     "(topic recreated?)")
-    run.summary["catch_up"] = wait_for_catch_up(manifest, baseline, args, timeout, demo)
-    say(f"      caught up after {run.summary['catch_up']['wait_s']}s "
-        f"(batch {run.summary['catch_up']['batch_id']})")
+    cu = run.summary[f"{key}catch_up"] = wait_for_catch_up(manifest, baseline, args, timeout,
+                                                          verbose)
+    say(f"      bronze caught up after {cu['wait_s']}s (batch {cu['batch_id']})")
+    say(f"[6/7] waiting for silver (timeout {args.silver_timeout:.0f}s)")
+    sc = run.summary[f"{key}silver_catch_up"] = wait_for_silver(args, verbose)
+    say(f"      silver caught up after {sc['wait_s']}s (silver batch {sc['batch_id']}, "
+        f"past bronze version {sc['bronze_version']})")
+    return manifest
 
-    say("[6/6] verifying bronze against the manifest (spark-tools, read-only data)")
+
+def orchestrate(run: Run, args: argparse.Namespace) -> None:
+    demo = run.mode == "demo"
+    timeout = args.timeout if args.timeout is not None else MODES[run.mode]["timeout"]
+    t0 = time.monotonic()
+    t0_wall = time.time()
+
+    say(f"[1/7] seed {run.seed} (epoch ms, generated in Python)")
+    say("[2/7] checking services" + ("" if args.no_start_spark else " and starting Spark"))
+    ensure_services(start_spark=not args.no_start_spark)
+
+    manifest = send_and_wait(run, args, timeout, demo)
+
+    say("[7/7] verifying bronze + silver against the manifest (spark-tools, read-only data)")
     report = verify(manifest, verbose=demo)
-    run.summary["verify"] = {k: report.get(k) for k in (
-        "result", "expected_unique_ids", "found_unique_ids", "missing_ids", "duplicate_rows")}
+    run.summary["verify"] = summarize_verify(report)
+    run.summary["silver_evidence"] = silver_evidence(args, t0_wall)
     run.summary["total_s"] = round(time.monotonic() - t0, 1)
-    say(f"PASS: {report['found_unique_ids']}/{report['expected_unique_ids']} ids, "
-        f"{report['duplicate_rows']} duplicates, {run.summary['total_s']}s total")
+    sv = report.get("silver") or {}
+    ms = run.summary["silver_evidence"]["merge_scan"]
+    say(f"PASS: bronze {report['found_unique_ids']}/{report['expected_unique_ids']} ids, "
+        f"{report['duplicate_rows']} duplicates; silver {sv.get('found_unique_ids')}/"
+        f"{sv.get('expected_unique_ids')} ids, {sv.get('duplicate_rows')} duplicates; "
+        f"{run.summary['total_s']}s total")
+    say("      merge scan: " + (f"read {ms['files_read']} files, {ms['files_in_window']} in "
+                                f"window, {ms['live_files']} live" if ms.get("measured")
+                                else f"not measured ({ms.get('reason')})"))
     if demo:
         say("\nWhere to look:\n"
             "  Spark UI      http://localhost:4040\n"
             "  bronze Delta  data/lake/bronze/game_events/\n"
+            "  silver Delta  data/lake/silver/game_events/\n"
             f"  status file   {args.status_path}\n"
             f"  manifest      {manifest.path}\n"
             "The stack is still running; `make down` stops it.")

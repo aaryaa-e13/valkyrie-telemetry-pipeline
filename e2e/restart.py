@@ -23,6 +23,14 @@ and whose version is a post-restart batch id. The baseline step makes sure no
 batch was planned before the stop, so every post-restart batch with rows
 wrote exactly one commit.
 
+Silver checks (evidence_version 3, slice 3, DECISIONS D2.3): S0 = silver's
+last committed batch and Delta source end offset at the stop, SV0/SV1 the silver
+Delta versions at the stop and after silver caught up. The first silver batch
+after the restart (S0 + 1, same query id) must START exactly at S0's end offset
+(no re-read, no skipped bronze version), and the rows added to silver in
+(SV0, SV1] must equal the run's unique ids (fresh seed: every id is new).
+Version 2 evidence (bronze only) is still accepted; it gets no silver checks.
+
 First post-restart batch: in the status history (same Q0), the batch with
 batch_id B0 + 1. Batch ids increase by exactly 1 per executed batch, so
 anything else means the history does not contain it and we cannot prove
@@ -40,7 +48,8 @@ from typing import Any
 
 from common.manifest_reader import OffsetRange
 
-EVIDENCE_VERSION = 2
+EVIDENCE_VERSION = 3
+ACCEPTED_VERSIONS = (2, 3)
 PHASE1_POINTER = ("evidence_version 1 is Phase 1 (raw Parquet) evidence; the Delta rules "
                   "cannot check it. Re-check it with the Phase 1 code at tag `phase-1`: "
                   "git switch --detach phase-1 && python -m e2e.smoke_restart "
@@ -222,11 +231,49 @@ def check_no_skip(
 def evidence_problem(ev: Mapping[str, Any]) -> str | None:
     """None if these rules can check the evidence, else why not (v1 = Phase 1)."""
     version = ev.get("evidence_version")
-    if version == EVIDENCE_VERSION:
+    if version in ACCEPTED_VERSIONS:
         return None
     if version == 1:
         return PHASE1_POINTER
-    return f"unknown evidence_version {version!r} (expected {EVIDENCE_VERSION})"
+    return f"unknown evidence_version {version!r} (expected one of {ACCEPTED_VERSIONS})"
+
+
+# --- silver (evidence_version 3) ----------------------------------------------------
+
+OFFSET_FIELDS = ("reservoir_id", "reservoir_version", "index")
+
+
+def check_silver_resume(status: Mapping[str, Any] | None, s0: Mapping[str, Any]
+                        ) -> tuple[int | None, list[str]]:
+    """(first post-restart silver batch id, problems): it starts exactly at S0's end."""
+    if not status:
+        return None, ["silver status file missing after catch-up"]
+    if status.get("query_id") != s0["query_id"]:
+        return None, [f"silver query_id changed {s0['query_id']} -> {status.get('query_id')} "
+                      "(silver checkpoint reset)"]
+    want = int(s0["batch_id"]) + 1
+    first = next((h for h in status.get("history") or [] if int(h["batch_id"]) == want), None)
+    if first is None:
+        return None, [f"no silver batch {want} in the status history"]
+    start = first.get("start_offset") or {}
+    end0 = s0["end_offset"] or {}
+    diff = [f"{k} {end0.get(k)} -> {start.get(k)}" for k in OFFSET_FIELDS
+            if start.get(k) != end0.get(k)]
+    if diff:
+        return want, [f"silver batch {want} does not start at S0's end offset: "
+                      + ", ".join(diff)]
+    return want, []
+
+
+def check_silver_rows(log: Mapping[str, Any] | None, run_unique_ids: int) -> list[str]:
+    """Rows added to silver in (SV0, SV1] == the run's unique ids."""
+    if problems := _log_error(log):
+        return [p.replace("Delta log", "silver Delta log") for p in problems]
+    assert log is not None
+    if int(log["rows"]) != run_unique_ids:
+        return [f"silver rows added in versions {log['v_before']}..{log['v_after']}: "
+                f"{log['rows']} != run unique ids {run_unique_ids}"]
+    return []
 
 
 def _log_error(log: Mapping[str, Any] | None) -> list[str]:
@@ -340,6 +387,18 @@ def evaluate(ev: Mapping[str, Any]) -> list[Check]:
     checks.append(check("txn appId == query id", check_txn_identity(log, ev["q0"], post),
                         f"{len((log or {}).get('txns') or [])} commits, appId {ev['q0']}, "
                         "versions == batch ids"))
+    if ev["evidence_version"] >= 3:
+        sv = ev.get("silver") or {}
+        s0 = sv.get("s0") or {}
+        first, problems = check_silver_resume(ev.get("silver_status_after"), s0)
+        at = (s0.get("end_offset") or {}).get("reservoir_version")
+        checks.append(check("silver resumes at S0 end", problems,
+                            f"silver batch {first} starts at bronze version {at}"))
+        slog = sv.get("log")
+        checks.append(check("silver rows == run ids",
+                            check_silver_rows(slog, int(ev.get("run_unique_ids") or -1)),
+                            f"+{(slog or {}).get('rows')} rows in "
+                            f"v{(slog or {}).get('v_before')}..v{(slog or {}).get('v_after')}"))
     v = ev.get("verify") or {}
     checks.append(check("verify --fail-on-duplicates",
                         [] if v.get("result") == "PASS" else [f"verify {v.get('result')}: "
