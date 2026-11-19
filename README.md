@@ -27,8 +27,9 @@ simulator --> Kafka topic `game-events` --> Spark Structured Streaming --> raw P
 - **Spark job** (`streaming/raw_to_parquet.py` in Phase 1): reads the topic, parses the JSON,
   and appends every message to Parquet. Messages that do not parse are kept and flagged, not
   dropped. Since Phase 2 slice 2 the same job is `streaming/bronze.py` and writes an
-  append-only Delta table instead (DECISIONS D2.2); this section describes Phase 1 (tag
-  `phase-1`).
+  append-only Delta table instead (DECISIONS D2.2). Since slice 3 a second query in the
+  same process writes **silver**, one row per `event_id` (`streaming/silver.py`, D2.3). This
+  section describes Phase 1 (tag `phase-1`).
 - **Manifest**: each simulator run writes a JSON file listing the events the broker
   acknowledged. Every check below compares the pipeline's output with this file.
 

@@ -255,3 +255,28 @@ Template:
   was written.
 - **Lesson:** "The latest history entry" means "the latest commit", not "my operation". This
   matters for slice 3, which will read per-batch MERGE metrics.
+
+### Deleting `commits/N` without its `.crc` made Spark report "concurrent queries" (Phase 2 slice 3, my test)
+- **Symptom:** `test_silver_guard_refusals_and_crash_state` failed with `[STREAM_FAILED] ...
+  Multiple streaming queries are concurrently using .../cp_silver/commits`. Only one query was
+  running.
+- **Root cause:** The test simulated "crash after the control row, before `commits/N`" by
+  deleting `commits/N`, but left the checksum file `.N.crc` behind. Hadoop's local file system
+  writes `commits/N` by rename and also creates `.N.crc`. The leftover checksum made the
+  rename fail, and Spark reports any failure to create a commit file as a concurrent writer.
+  The bronze version of this test already removed both files; I did not copy that line.
+- **Fix:** delete `.N.crc` too. The guard decision itself was right (`resume`) before the
+  failure.
+- **Lesson:** a "simulated crash" must leave exactly what a real crash leaves. A real crash
+  before `commits/N` leaves neither file.
+
+### The Spark test suite was slow because Delta rebuilds snapshots with 50 tasks (Phase 2 slice 3)
+- **Symptom:** the first full `make test-spark` of slice 3 took 25 minutes. One test with 11
+  small MERGEs took 239 s.
+- **Root cause:** every Delta operation rebuilds the table snapshot with
+  `spark.databricks.delta.snapshotPartitions` = 50 tasks. The test session runs `local[1]`, so
+  that is about 5 s per operation, even on tiny tables (seen in the REST API: "Compute
+  snapshot" executions of ~5 s; GC only 1.6 % of uptime).
+- **Fix:** the test session sets it to 2 (`tests/spark/conftest.py`). Full suite 62 tests in
+  6 min 45 s (was 14 min for 46 tests); the MERGE test 239 s -> 52 s. The job still uses
+  the default; see D2.3 for why that matters for silver's batch time.

@@ -201,6 +201,9 @@ are unchanged.*
   deliberately sending duplicates.
 - **How to say it:** "Kafka plus Spark checkpoints give exactly-once *processing* of offsets.
   End-to-end *effectively-once* needs a stable event id and an idempotent sink."
+- **Fixed in Phase 2 slice 3 (D2.3):** silver keeps one row per `event_id`. Seed 501: bronze
+  still has 26 rows (by design), silver has 13, each the first send; verify `--layer all`
+  PASS. `make smoke-dupes` repeats the test with a fresh seed on every run.
 
 ### D1.15 End-to-end checks: how we know Spark has processed a run (slice d)
 Built in steps: d1 = manifest offsets + status file (this entry); d2/d3 add the orchestrator.
@@ -784,7 +787,7 @@ everything with `versionAsOf` that version (`table_version` in the report), so a
 from one snapshot. `--versions V0,V1` adds time-travel row counts. Report keys renamed:
 `total_rows`, `unparsed_rows` (were `parquet_*`). Runs in `spark-tools` with `./data`
 read-only: **reading Delta wrote nothing** (VERIFIED 2026-11-19: `_delta_log` listing unchanged,
-no error on the read-only mount). `--layer` waits for slice 3.
+no error on the read-only mount). `--layer` was added in slice 3 (D2.3).
 
 **smoke-restart on Delta (evidence_version 2).** The status-file checks (stop, baseline, first
 batch, no re-read, no skip) are unchanged. Replaced and new:
@@ -822,3 +825,135 @@ batch, no re-read, no skip) are unchanged. Replaced and new:
 | Spark container memory | 1.09 GiB after batch 0; 1.36 GiB after smoke + restart (limit 3 GiB; Phase 1 measured 626 MiB on tiny data), as `docker stats` reports it; not broken down |
 | Bronze on disk | 1.4 MB for 7,110 rows; checkpoint 84 KB |
 | `make test-spark` | 36 tests, 566 s (the 13 bronze tests are about 4.5 min of it) |
+
+### D2.3 Silver: one row per `event_id`, insert-only MERGE (slice 3)
+
+**What it is.** A second streaming query in the same Spark process reads the bronze Delta
+table (Delta source) and writes `data/lake/silver/game_events`: Delta, partitioned by
+`event_date` (UTC date of `event_time`), `delta.appendOnly=true`, created explicitly at start-up
+(same pattern as bronze, D2.2). Per micro-batch (`streaming/silver.py`, `foreachBatch`):
+
+1. **Key check (D9):** `parse_ok AND event_id IS NOT NULL AND event_time IS NOT NULL`. Other rows
+   are excluded and counted per reason (`excluded_unparsed`, `excluded_null_event_id`,
+   `excluded_null_event_time`, `excluded_total`; one row can hit several reasons).
+2. **In-batch dedupe:** per `event_id` keep the lowest `(kafka_topic, kafka_partition,
+   kafka_offset)`. That key is unique in bronze (R0), so a replay keeps the same copy: the
+   first send.
+3. **MERGE bounds** from keyed rows only: `[min(event_date) - H, max(event_date) + H]`,
+   H = `DEDUPE_HORIZON_DAYS` (7). No keyed rows: no MERGE.
+4. **Insert-only MERGE:** `ON t.event_id = s.event_id AND t.event_date BETWEEN DATE'lo' AND
+   DATE'hi' WHEN NOT MATCHED THEN INSERT *`. A replayed batch finds every id and commits
+   nothing (C4/C11).
+5. **One control row per batch**, also for zero-row and all-keyless batches, in
+   `data/lake/_control/silver_batches` (Delta, appendOnly), written with Delta's idempotent
+   write options `txnAppId = silver query id`, `txnVersion = batch id`. A replay writes nothing.
+
+Silver columns: the event fields, `event_date`, the kept copy's Kafka lineage, bronze
+`ingest_time` (as `bronze_ingest_time`), `silver_query_id`, `silver_batch_id`,
+`silver_inserted_at`. Not copied: `raw_value` and `parse_ok` (bronze keeps the raw message).
+The claim is **effectively-once**: silver is insert-if-absent by `event_id` within the date
+window, so a replayed batch, or a full re-read of bronze after a checkpoint reset, never adds a
+second row for an id. It is not "exactly-once processing".
+
+**The NULL-bound rule (D9), enforced in one place.** In the planning spike, `BETWEEN NULL AND
+NULL` made the whole ON clause NULL and **re-inserted an id already in the table** (1,002 ->
+1,003 rows). So `streaming/silver_merge.py` (stdlib) builds the bounds and the ON clause:
+None, a `datetime` (a subclass of `date`), `min > max` or a negative horizon raise
+`MergeBoundsError`; only `DATE'YYYY-MM-DD'` literals rendered from `date` objects reach the SQL.
+Min/max come from keyed rows only, so a NULL `event_time` cannot reach them. If keyed rows
+existed and a bound were still None, the batch fails, the query stops and nothing is written.
+Tests: unit tests per case; Spark tests for the all-keyless batch (no MERGE, no silver commit),
+the per-reason counts, a forced missing bound (fails, writes nothing), and a **hazard
+regression test** that runs the NULL-bound MERGE and asserts that it duplicates. If a future
+Delta changes that, the test says so.
+
+**Known limit (parent plan D2):** two copies of one id more than H days apart (re-stamped
+`event_time`) are both inserted. A Spark test documents it. Verify reports the largest spread
+and says "not checkable" when it exceeds H. Today's largest spread is 0 days.
+
+**MERGE pruning evidence.** Insert-only MERGE has no files-skipped metric in Delta's
+`operationMetrics` (slice 1). Evidence comes from **Spark's SQL execution metrics** (public
+REST API, `common/spark_rest.py`): the target `Scan parquet` node of the MERGE execution reports
+`number of files read` and `number of partitions read`. The independent expectation is the
+number of live files whose `event_date` is in `[lo, hi]`, counted from the Delta log
+(`common/delta_log.live_files_in_range`) at the version before that MERGE.
+- Spark test (10 date partitions, 1 file each, a batch in 2 of them, H = 0): **files read 2 ==
+  files in window 2 < 10 live**, partitions read 2. VERIFIED.
+- Live (`make smoke`, SUMMARY `merge_scan`): read 4 files, 4 in window, 4 live; smoke-dupes: 6,
+  6, 6. Correct, but **no pruning is visible yet**: all keyed data spans 2026-11-14..19, inside
+  every window. Phase 10 measures it at 1-50M rows. Limit: only `Scan parquet` nodes are
+  counted (the MERGE source is a persisted micro-batch, not a Parquet scan), and a batch
+  running while the orchestrator reads can mismatch; then `matches_log` is false (never PASS).
+
+**Silver start-up guard: the same rule as bronze, with the control table as `txn`.** C = the
+silver checkpoint's newest `commits/N`, T = the control table's newest txn version for the
+checkpoint's query id. Start only if T == C, or T == C + 1. Order per batch: `offsets/N` ->
+MERGE -> control row with `txn(Q, N)` -> `commits/N`. A crash after the control row, before
+`commits/N`, leaves T == C + 1: the replay's MERGE finds every id and the control write is
+skipped (tested by deleting `commits/C`, then re-running: no new silver or control version).
+**T == C - 1 is never a normal state**: `commits/N` is written only after the control row, and
+every batch writes one (condition: also zero-row and all-keyless batches, tested; the
+streaming test asserts control batch ids == committed batch ids, including a batch after an
+OPTIMIZE of bronze). So "behind" means the control table was restored from an older copy:
+refused (tested), and so are a missing control table and a missing silver table while the
+checkpoint has batches. Override: `SILVER_ALLOW_REBUILD=1` (WARNING). The same reasoning for
+bronze is in D2.2 ("Why one ahead is legal and one behind is not").
+- **Not refused: a reset silver checkpoint on a populated silver table.** Unlike bronze, this is
+  safe by design: the new query re-reads bronze and every MERGE is insert-if-absent. It logs
+  `silver rebuild from bronze (idempotent)` (WARNING). Spark test: same silver rows after a
+  reset. Cost: one full re-read of bronze.
+- Live: after smoke-restart the guard logged `resume` with committed 3, control txn 3.
+
+**One process, two queries, and the failure policy (tradeoff).** `streaming/pipeline.py` is the
+container's `CMD`. Both guards run before either query starts, so a refusal never leaves one
+query running alone (exit 2). **If either query fails, the other is stopped and the process
+exits 1** (`supervise()`, Spark test with a deliberately failing query). So **a silver failure
+also stops bronze ingestion.** We accept that: the pipeline fails loudly instead of bronze
+running on while silver silently falls behind, and nothing is lost because **Kafka's 7-day
+retention is the buffer**. After a fix, bronze resumes from its checkpoint
+(`failOnDataLoss=true` stops it if retention deleted unread data). The cost: one bad silver
+batch pauses all ingestion until someone looks. The alternative (separate containers, bronze
+keeps running) needs a second JVM (~1 GiB more on this laptop) and a lag alert (Phase 8).
+`python -m streaming.bronze` still runs bronze alone.
+
+**Status files v2 and the silver catch-up rule.** `streaming/status.py` stores a `source`
+(`kafka` | `delta`). Delta offsets are kept as `{reservoir_id, reservoir_version, index,
+is_starting_version}`; v1 files still read as `kafka`. One listener (`streaming/progress.py`)
+routes by query name: `data/status/bronze.json`, `data/status/silver.json`. **Rule** (spike Q4,
+and a Spark test against real offsets): a committed silver end offset `{V, i, not starting}`
+means every bronze version < V is consumed, so silver has consumed version X iff V > X.
+Conservative: an offset in the middle of X waits for the next batch, and a starting-version
+offset never counts. The orchestrator waits for bronze (unchanged), reads bronze's current
+version from its Delta log, then waits for silver.
+
+**verify `--layer bronze|silver|all`** (default `all`). Silver always FAILs on missing run ids
+(no late table yet), duplicate rows for the run's ids, **R3** (a duplicate `event_id` anywhere in
+silver), **R7** (a NULL `event_id`/`event_time` in silver) and silver ids that bronze lacks.
+Consistency is pinned to what silver has consumed: its newest committed batch C ended at bronze
+version V, so bronze is read at V - 1, and silver rows from batches > C of the current query are
+ignored. Then silver rows == distinct keyed bronze ids (only if no copies are > H days apart),
+`sum(control.excluded_total)` == bronze keyless rows (R7), and control batch ids == 0..C. If the
+preconditions do not hold it says "not checkable", never "pass".
+
+**Measured (2026-11-19, laptop, `local[4]`, heap 2 GiB, container limit 3 GiB):**
+
+| What | Result |
+|---|---|
+| First start (silver reads all of bronze, 10 files, in batch 0) | 7,110 rows in, 1 keyless excluded, 51 duplicates dropped, **7,058 inserted** (= distinct keyed ids, spike Q5) |
+| Seed 501 | bronze 26 rows (13 duplicates reported), **silver 13 rows**, all 13 the lower offset / earlier `event_time`; verify `--layer all` PASS |
+| `make smoke` | PASS 14/14 both layers, 92.8 s; silver 7.3 s after bronze |
+| `make smoke-dupes` | PASS: 12 ids, bronze 24 rows, silver 12 rows all from the first send; the second copies came in a later silver batch (inserted 0), so the cross-batch MERGE did the work |
+| `make smoke-restart` (evidence v3) | PASS, all 11 checks; silver resumed at bronze version 7 and added exactly the run's 13 ids |
+| MERGE duration per batch (trigger 10 s) | batch 0: 4.6 s (7,110 rows); batches 1-4 (12-14 rows): 3.5-5.0 s |
+| Whole silver batch (`addBatch`) / trigger | batch 0: 9.7 s / **13.9 s (over 10 s, Spark warned "falling behind")**; batches 1-4: 7.5-9.6 s / 7.6-9.9 s |
+| Spark container memory (`docker stats`, peak) | first start 1.84 GiB, smoke 1.97, smoke-dupes 2.05, smoke-restart 2.00 (bronze alone: 1.09-1.36) |
+| JVM heap peak / GC share (REST `/executors`) | 0.61-0.83 GiB / 0.3-0.5 % of uptime; no threshold crossed (2.5 GiB, 1.6 GiB, 10 %) |
+| On disk | silver 712 KB, control 240 KB, silver checkpoint 100 KB |
+| `make test-spark` / `make test-spark-fast` | 62 tests, 6 min 45 s / 33 tests, 3 min 42 s |
+
+Honest reading of the timing: the MERGE itself is well under the trigger, but **a silver batch
+of ~12 rows costs 7.5-9.9 s in total**, mostly fixed Delta overhead (several snapshot rebuilds
+per batch, the aggregation, the control write). Silver keeps up at this rate, but it has almost
+no headroom at a 10 s trigger. Not tuned in this slice. The likely lever is
+`spark.databricks.delta.snapshotPartitions` (50 by default; 2 in the test session cut the Spark
+suite from 14 to under 7 minutes). Changing it in the job is a decision for the next slice.
