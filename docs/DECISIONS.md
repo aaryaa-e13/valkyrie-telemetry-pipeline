@@ -603,7 +603,10 @@ and has no record of them.
   - *Accepted risk:* Delta Kernel was compiled against Jackson 2.13.x. A Jackson API change
     that Kernel relies on would surface only on a Kernel code path we do not exercise yet.
 - **Skips where Spark's version wins** (Delta declared a newer one): commons-pool 1.6 -> 1.5.4,
-  log4j 2.25.3 -> 2.24.3, jsr305 3.0.2 -> 3.0.0. C13 found no linkage errors.
+  log4j 2.25.3 -> 2.24.3, jsr305 3.0.2 -> 3.0.0. C13 found no linkage errors. This is verified
+  **only on the code paths C3-C14 exercise** (path tables, MERGE, checkpoints, the streaming
+  sink and source, `foreachBatch`, the Jackson probe). A Delta code path that needs an API only
+  the newer version has would fail at runtime, and the gate would not have seen it.
 - Image size: 1,501.6 MB -> 1,529.2 MB (+27.5 MB).
 
 **Classpath baselines (stock pip pyspark 4.1.4, measured in slice 1).** C2 fails only on
@@ -623,7 +626,8 @@ name before the first `-<digit>`. That misreads names with a digit after a dash:
 Ivy's cache. In this build 2 of 45 names were misparsed (both Kafka connector jars), and **0
 decisions changed**: with the real name they would still be added. 10 skips could be
 confirmed only by name (Spark's jar has no `pom.properties`); all 9 distinct pairs share 100%
-of the fetched jar's classes with Spark's jar (one-off check).
+of the fetched jar's classes with Spark's jar (one-off check). 10 skips but 9 pairs, because
+`hadoop-client-runtime-3.4.2` is skipped twice (Kafka list and Delta list, same Spark jar).
 
 **Integrity: Ivy does not verify checksums; a SHA-256 lock does.**
 - Tested in the image: Ivy (via `spark-submit --packages`) accepted a jar whose `.sha1` was all
