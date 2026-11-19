@@ -69,3 +69,23 @@ def test_read_checkpoint_state(tmp_path: Path) -> None:
     for name in ("0", "1", ".1.crc"):
         (cp / "commits" / name).write_text("x")
     assert read_checkpoint_state(cp) == CheckpointState("qid-1", 2, 1)
+
+
+def test_committed_source_offset(tmp_path) -> None:  # noqa: ANN001
+    from streaming.start_guard import committed_source_offset
+
+    cp = tmp_path / "cp"
+    assert committed_source_offset(cp) is None
+    (cp / "offsets").mkdir(parents=True)
+    (cp / "commits").mkdir()
+    for n in (0, 1):
+        (cp / "offsets" / str(n)).write_text(
+            'v1\n{"batchWatermarkMs":0}\n'
+            + json.dumps({"reservoirId": "r", "reservoirVersion": n + 3, "index": -1,
+                          "isStartingVersion": False}) + "\n")
+    (cp / "commits" / "0").write_text("v1\n{}\n")
+    assert committed_source_offset(cp) == (0, {"reservoirId": "r", "reservoirVersion": 3,
+                                               "index": -1, "isStartingVersion": False})
+    (cp / "commits" / "1").write_text("v1\n{}\n")
+    (cp / "offsets" / "1").write_text("v1\n")
+    assert committed_source_offset(cp) == (1, None)

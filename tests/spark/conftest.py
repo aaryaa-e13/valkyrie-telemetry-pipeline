@@ -29,7 +29,14 @@ def spark() -> Iterator[SparkSession]:
         builder
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.shuffle.partitions", "1")
-        .config("spark.ui.enabled", "false")
+        # Test speed only (slice 3): Delta rebuilds a table snapshot with 50 tasks by
+        # default; on local[1] that is ~5 s per Delta operation on tiny tables.
+        .config("spark.databricks.delta.snapshotPartitions", "2")
+        # UI on (fixed port, inside the test container only) so the MERGE
+        # pruning test can read scan metrics from the REST API (slice 3, Q4).
+        .config("spark.ui.enabled", "true")
+        .config("spark.ui.port", "4050")
+        .config("spark.ui.showConsoleProgress", "false")
         .getOrCreate()
     )
     session.sparkContext.setLogLevel("ERROR")

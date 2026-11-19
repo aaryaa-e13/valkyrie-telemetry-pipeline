@@ -81,6 +81,7 @@ def _populated(spark: SparkSession, tmp_path: Path) -> BronzeJobConfig:
 
 # --- table creation and the append-only guard ------------------------------------------
 
+@pytest.mark.spark_fast
 def test_create_is_idempotent_append_only_and_partitioned(spark: SparkSession,
                                                           tmp_path: Path) -> None:
     path = str(tmp_path / "bronze")
@@ -98,6 +99,7 @@ def test_create_is_idempotent_append_only_and_partitioned(spark: SparkSession,
     assert all(f.nullable for f in cols)
 
 
+@pytest.mark.spark_fast
 def test_existing_table_with_wrong_layout_is_refused(spark: SparkSession,
                                                      tmp_path: Path) -> None:
     path = str(tmp_path / "other")
@@ -109,6 +111,7 @@ def test_existing_table_with_wrong_layout_is_refused(spark: SparkSession,
     assert "delta.appendOnly is not 'true'" in str(exc.value)
 
 
+@pytest.mark.spark_fast
 def test_delete_and_update_are_refused(spark: SparkSession, tmp_path: Path) -> None:
     cfg = _populated(spark, tmp_path)
     v = current_version(cfg.table_path)
@@ -160,6 +163,7 @@ def test_adding_a_nullable_column_still_works(spark: SparkSession, tmp_path: Pat
 
 # --- checkpoint-reset guard ---------------------------------------------------------------
 
+@pytest.mark.spark_fast
 def test_guard_fresh_when_nothing_exists(spark: SparkSession, tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
     assert check_checkpoint_guard(spark, cfg.table_path, cfg.checkpoint_path, False) == "fresh"
@@ -171,6 +175,7 @@ def test_guard_fresh_for_empty_table(spark: SparkSession, tmp_path: Path) -> Non
     assert check_checkpoint_guard(spark, cfg.table_path, cfg.checkpoint_path, False) == "fresh"
 
 
+@pytest.mark.spark_fast
 @pytest.mark.parametrize("checkpoint_state", ["missing", "metadata only", "empty offsets"])
 def test_guard_refuses_data_without_checkpoint_batches(spark: SparkSession, tmp_path: Path,
                                                        checkpoint_state: str) -> None:
@@ -275,6 +280,7 @@ def _guard(spark: SparkSession, cfg: BronzeJobConfig, allow_rebuild: bool = Fals
     return check_checkpoint_guard(spark, cfg.table_path, cfg.checkpoint_path, allow_rebuild)
 
 
+@pytest.mark.spark_fast
 def test_sink_appends_once_per_message_with_stable_txn_app_id(spark: SparkSession,
                                                                tmp_path: Path) -> None:
     cfg, q = _two_runs(spark, tmp_path)

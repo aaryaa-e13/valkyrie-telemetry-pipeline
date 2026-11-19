@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 import pytest
 
 pyspark = pytest.importorskip("pyspark")  # skip cleanly outside the Spark image
+pytestmark = pytest.mark.spark_fast  # quick: part of make test-spark-fast
 
 from pyspark.sql import DataFrame, SparkSession  # noqa: E402
 

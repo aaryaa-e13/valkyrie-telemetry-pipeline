@@ -141,6 +141,14 @@ services:
       # 1 = start even if the table has data but the checkpoint is gone (re-appends
       # everything still in Kafka). Off by default; see DECISIONS D2.2.
       BRONZE_ALLOW_REBUILD: ${BRONZE_ALLOW_REBUILD:-0}
+      # Silver (bronze Delta -> one row per event_id), same process. DECISIONS D2.3.
+      SILVER_PATH: /data/lake/silver/game_events
+      SILVER_CONTROL_PATH: /data/lake/_control/silver_batches
+      SILVER_CHECKPOINT_PATH: /data/checkpoints/silver
+      SILVER_STATUS_PATH: /data/status/silver.json
+      DEDUPE_HORIZON_DAYS: ${DEDUPE_HORIZON_DAYS:-7}
+      # 1 = start although the silver checkpoint and silver/control tables disagree.
+      SILVER_ALLOW_REBUILD: ${SILVER_ALLOW_REBUILD:-0}
       LOG_LEVEL: ${SPARK_JOB_LOG_LEVEL:-INFO}
     volumes:
       # Delta tables + checkpoints (git-ignored). See simulator for why long syntax.

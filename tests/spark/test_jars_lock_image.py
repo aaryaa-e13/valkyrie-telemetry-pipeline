@@ -17,6 +17,7 @@ from types import ModuleType
 import pytest
 
 pyspark = pytest.importorskip("pyspark")  # skip cleanly outside the Spark image
+pytestmark = pytest.mark.spark_fast  # quick: part of make test-spark-fast
 
 LOCK_DIR = Path("/opt/valkyrie")
 if not (LOCK_DIR / "jars_lock.py").is_file():

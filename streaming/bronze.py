@@ -25,7 +25,6 @@ Run (inside the Spark container):
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import signal
@@ -36,16 +35,16 @@ from typing import Any
 
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.streaming import StreamingQuery, StreamingQueryListener
+from pyspark.sql.streaming import StreamingQuery
 from pyspark.sql.types import StructField, StructType
 
 from common.delta_log import latest_txn_in_commits, newest_checkpoint_files
 from common.logging_setup import setup_logging
 from streaming.config import BronzeJobConfig
+from streaming.progress import ProgressLogger
 from streaming.schemas import EVENT_JSON_SCHEMA, EVENT_TIME_FORMAT, REQUIRED_FIELDS
 from streaming.spark_session import build_spark
 from streaming.start_guard import BronzeStartupError, decide, read_checkpoint_state
-from streaming.status import batch_record, read_status, update_status, write_status
 
 log = logging.getLogger("streaming.bronze")
 
@@ -135,7 +134,7 @@ def table_txn_version(spark: SparkSession, table_path: str, app_id: str) -> int 
         return v
     files = newest_checkpoint_files(table_path)
     if not files:
-        raise BronzeStartupError(f"bronze table {table_path}: commit files before the oldest "
+        raise BronzeStartupError(f"Delta table {table_path}: commit files before the oldest "
                                  "remaining one are gone and there is no Delta checkpoint")
     rows = (spark.read.parquet(*[str(f) for f in files])
             .where(F.col("txn").isNotNull() & (F.col("txn.appId") == app_id))
@@ -245,75 +244,17 @@ def start_bronze_query(source_df: DataFrame, cfg: BronzeJobConfig,
     return writer.start(cfg.table_path)
 
 
-class ProgressLogger(StreamingQueryListener):
-    """Per completed micro-batch: log one structured line and update the status file.
-
-    Spark posts the progress event only after the batch's Delta commit and the
-    checkpoint commit (commits/N) are written, so the status file never claims
-    a batch that is not durable (D1.15; checked for the Delta sink in D2.1 C12).
-    """
-
-    def __init__(self, query_name: str, status_path: str | None) -> None:
-        super().__init__()
-        self._query_name = query_name
-        self._status_path = status_path
-        # Keep history across restarts: start from what is on disk.
-        self._status = read_status(status_path) if status_path else None
-
-    def onQueryStarted(self, event) -> None:  # noqa: N802 (Spark API name)
-        log.info("query started", extra={"fields": {
-            "query_id": str(event.id), "run_id": str(event.runId), "name": event.name}})
-
-    def onQueryProgress(self, event) -> None:  # noqa: N802
-        p = event.progress
-        source = p.sources[0] if p.sources else None
-        fields = {
-            "batch_id": p.batchId,
-            "num_input_rows": p.numInputRows,
-            "processed_rows_per_s": round(p.processedRowsPerSecond or 0.0, 1),
-            "trigger_ms": p.durationMs.get("triggerExecution"),
-            "start_offset": _offsets(source.startOffset) if source else None,
-            "end_offset": _offsets(source.endOffset) if source else None,
-        }
-        level = logging.INFO if p.numInputRows > 0 else logging.DEBUG
-        log.log(level, "batch progress", extra={"fields": fields})
-        if self._status_path and source is not None:
-            self._write_status(p, source)
-
-    def _write_status(self, p, source) -> None:
-        """Update the status file. Never raises: status is diagnostics, not data."""
-        try:
-            record = batch_record(
-                batch_id=p.batchId, run_id=str(p.runId), num_input_rows=p.numInputRows,
-                timestamp=p.timestamp, trigger_ms=p.durationMs.get("triggerExecution"),
-                start_offset=source.startOffset, end_offset=source.endOffset,
-            )
-            self._status = update_status(
-                self._status, record, query_name=self._query_name, query_id=str(p.id)
-            )
-            write_status(self._status, self._status_path)
-        except Exception as exc:  # noqa: BLE001 - must not kill the streaming query
-            log.warning("could not write status file", extra={"fields": {
-                "path": self._status_path, "error": str(exc)}})
-
-    def onQueryIdle(self, event) -> None:  # noqa: N802
-        pass
-
-    def onQueryTerminated(self, event) -> None:  # noqa: N802
-        if event.exception:
-            log.error("query failed", extra={"fields": {"error": event.exception}})
-        else:
-            log.info("query stopped", extra={"fields": {"query_id": str(event.id)}})
-
-
-def _offsets(raw: str | None) -> object:
-    """Kafka source offsets arrive as a JSON string; decode for readable logs."""
-    if raw is None or raw in {"None", "null"}:  # first batch has no start offset
-        return None
-    try:
-        return json.loads(raw)
-    except (TypeError, ValueError):
-        return raw
+def kafka_source(spark: SparkSession, cfg: BronzeJobConfig) -> DataFrame:
+    """Lazy Kafka source: nothing connects to Kafka until the query starts."""
+    return (
+        spark.readStream.format("kafka")
+        .option("kafka.bootstrap.servers", cfg.bootstrap_servers)
+        .option("subscribe", cfg.topic)
+        .option("startingOffsets", cfg.starting_offsets)
+        .option("maxOffsetsPerTrigger", cfg.max_offsets_per_trigger)
+        .option("failOnDataLoss", str(cfg.fail_on_data_loss).lower())
+        .load()
+    )
 
 
 def run(cfg: BronzeJobConfig, master: str, driver_memory: str) -> int:
@@ -321,7 +262,7 @@ def run(cfg: BronzeJobConfig, master: str, driver_memory: str) -> int:
     0 stopped cleanly, 1 failed, 2 start-up refused (BronzeStartupError)."""
     spark = build_spark(cfg.query_name, master, driver_memory)
     spark.sparkContext.setLogLevel("WARN")
-    spark.streams.addListener(ProgressLogger(cfg.query_name, cfg.status_path or None))
+    spark.streams.addListener(ProgressLogger({cfg.query_name: cfg.status_path}))
     log.info("starting", extra={"fields": {
         "spark_version": spark.version, "master": master, "driver_memory": driver_memory,
         "topic": cfg.topic, "table_path": cfg.table_path,
@@ -330,15 +271,7 @@ def run(cfg: BronzeJobConfig, master: str, driver_memory: str) -> int:
         "max_offsets_per_trigger": cfg.max_offsets_per_trigger}})
 
     try:
-        kafka_df = (  # lazy: nothing connects to Kafka until the query starts
-            spark.readStream.format("kafka")
-            .option("kafka.bootstrap.servers", cfg.bootstrap_servers)
-            .option("subscribe", cfg.topic)
-            .option("startingOffsets", cfg.starting_offsets)
-            .option("maxOffsetsPerTrigger", cfg.max_offsets_per_trigger)
-            .option("failOnDataLoss", str(cfg.fail_on_data_loss).lower())
-            .load()
-        )
+        kafka_df = kafka_source(spark, cfg)
         mode = prepare_bronze(spark, cfg, kafka_df)
         log.info("bronze table ready", extra={"fields": {
             "mode": mode, "table_path": cfg.table_path}})

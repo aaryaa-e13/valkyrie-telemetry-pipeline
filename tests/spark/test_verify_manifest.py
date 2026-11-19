@@ -93,6 +93,7 @@ def test_complete_run_passes_for_v1_v2_and_v3(spark, tmp_path: Path, manifest) -
     assert evaluate(report, fail_on_duplicates=True)[0] == "PASS"  # ... but never judged
 
 
+@pytest.mark.spark_fast
 def test_duplicates_reported_but_fail_only_with_flag(spark, tmp_path: Path) -> None:
     report = verify(spark, _manifest(tmp_path, V1),
                     _lake(spark, tmp_path, ["e1", "e2", "e3", "e1", "e2", "e3"]))
@@ -104,6 +105,7 @@ def test_duplicates_reported_but_fail_only_with_flag(spark, tmp_path: Path) -> N
     assert evaluate(report, fail_on_duplicates=True)[0] == "FAIL"
 
 
+@pytest.mark.spark_fast
 def test_duplicate_kafka_offset_always_fails_r0(spark, tmp_path: Path) -> None:
     report = verify(spark, _manifest(tmp_path, V1),
                     _lake(spark, tmp_path, ["e1", "e2", "e3"], repeat_offset=True))
@@ -137,6 +139,7 @@ def test_versions_report_time_travel_counts(spark, tmp_path: Path) -> None:
     assert report["version_counts"] == {"0": 6, "1": 7}
 
 
+@pytest.mark.spark_fast
 def test_missing_ids_always_fail(spark, tmp_path: Path) -> None:
     report = verify(spark, _manifest(tmp_path, V2), _lake(spark, tmp_path, ["e1"]))
     assert report["missing_ids"] == 2

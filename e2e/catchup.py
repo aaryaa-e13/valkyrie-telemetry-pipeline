@@ -310,8 +310,14 @@ class LogFacts:
         return max(self.batch_ids) if self.batch_ids else None
 
 
-def parse_log_lines(lines: Iterable[str]) -> LogFacts:
-    """Extract facts from container log lines; non-JSON lines are ignored."""
+def parse_log_lines(lines: Iterable[str], query: str = "bronze") -> LogFacts:
+    """Extract facts about one query from container log lines.
+
+    Since slice 3 the container runs bronze and silver; progress and start lines
+    carry `"query": <name>` and only `query`'s lines count. Lines without that
+    field (written before slice 3) count as bronze. ERROR lines and status
+    write warnings count for every query. Non-JSON lines are ignored.
+    """
     batch_ids: list[int] = []
     warnings = 0
     started = False
@@ -326,11 +332,12 @@ def parse_log_lines(lines: Iterable[str]) -> LogFacts:
         except ValueError:
             continue
         msg = rec.get("msg")
-        if msg == "batch progress" and isinstance(rec.get("batch_id"), int):
+        mine = rec.get("query", "bronze") == query
+        if msg == "batch progress" and mine and isinstance(rec.get("batch_id"), int):
             batch_ids.append(rec["batch_id"])
         elif msg == "could not write status file":
             warnings += 1
-        elif msg == "query started":
+        elif msg == "query started" and mine:
             started = True
             if rec.get("run_id"):
                 run_ids.append(str(rec["run_id"]))

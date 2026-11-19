@@ -113,3 +113,21 @@ def decide(state: CheckpointState, txn: int | None,
     return StartDecision("refuse", (
         f"table is ahead of the checkpoint: txn {txn} for query {q}, checkpoint planned "
         f"only up to {p} (another writer used this query id, or the checkpoint is old)"))
+
+
+def committed_source_offset(checkpoint_path: str | Path) -> tuple[int, dict | None] | None:
+    """(newest committed batch C, its end offset of the first source) from the checkpoint.
+
+    `offsets/C` holds "v1", a metadata line, then one JSON line per source (the
+    batch's END offsets). Returns None if no batch is committed, and
+    (C, None) if the offsets file is missing or unreadable.
+    """
+    cp = Path(checkpoint_path)
+    c = _newest_batch(cp / "commits")
+    if c is None:
+        return None
+    try:
+        lines = (cp / "offsets" / str(c)).read_text(encoding="utf-8").splitlines()
+        return c, json.loads(lines[2])
+    except (OSError, IndexError, ValueError):
+        return c, None

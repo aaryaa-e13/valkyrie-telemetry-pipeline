@@ -72,4 +72,6 @@ RUN useradd --uid 1000 --create-home appuser
 USER appuser
 ENV PYTHONPATH=/app
 
-CMD ["python", "-m", "streaming.bronze"]
+# Bronze + silver in one process (slice 3, DECISIONS D2.3). `python -m streaming.bronze`
+# still runs bronze alone.
+CMD ["python", "-m", "streaming.pipeline"]

@@ -24,7 +24,7 @@ dirs: ## Create bind-mount folders owned by you (Docker would create them as roo
 
 .PHONY: help env up down ps logs topics describe-topic venv sim-dry sim-local sim-tiny sim \
 	sim-realtime sim-late timing-check consume test-unit lint spark-build spark-image spark-up \
-	spark-stop spark-logs verify test-spark demo smoke e2e-images smoke-restart \
+	spark-stop spark-logs verify test-spark test-spark-fast demo smoke smoke-dupes e2e-images smoke-restart \
 	delta-compat jars-lock
 
 help: ## List available targets
@@ -117,14 +117,19 @@ spark-image: ## Rebuild the Spark image quietly if code changed (cached: a few s
 
 # verify depends on spark-image: the manifest reader is baked into the image, so a
 # stale image would verify with old code (it once rejected v3 manifests; WHAT_BROKE).
-verify: dirs spark-image ## Compare bronze Delta with a run manifest (MANIFEST=manifests/run_X.json)
+verify: dirs spark-image ## Compare bronze+silver with a manifest (MANIFEST=... [LAYER=bronze|silver|all])
 	@test -n "$(MANIFEST)" || (echo "usage: make verify MANIFEST=manifests/run_X.json" && exit 2)
 	$(COMPOSE) --profile tools run --rm -T spark-tools \
-		python -m streaming.verify_manifest --manifest /app/$(MANIFEST)
+		python -m streaming.verify_manifest --manifest /app/$(MANIFEST) --layer $(or $(LAYER),all) \
+		$(VERIFY_ARGS)
 
-test-spark: dirs ## Run Spark transformation tests inside the Spark image
+test-spark: dirs ## Run all Spark tests in the Spark image (SPARK_TESTS=path to narrow)
 	$(COMPOSE) --profile spark run --rm --no-deps -T -v ./:/app:ro spark \
-		python -m pytest tests/spark -q -p no:cacheprovider
+		python -m pytest $(or $(SPARK_TESTS),tests/spark) -q -p no:cacheprovider $(SPARK_TEST_ARGS)
+
+test-spark-fast: dirs ## Quick Spark subset for the dev loop (marker spark_fast, < 5 min)
+	$(COMPOSE) --profile spark run --rm --no-deps -T -v ./:/app:ro spark \
+		python -m pytest tests/spark -q -p no:cacheprovider -m spark_fast --durations=10
 
 # Delta compatibility gate (Phase 2 slice 1, DECISIONS D2.1): checks C1-C14 in the
 # container's /tmp, prints one JSON report, exits 0 (PASS) or 1. Runs in spark-tools
@@ -162,6 +167,9 @@ demo: dirs up e2e-images ## Full run with explanations: simulator -> Kafka -> Sp
 
 smoke: dirs up e2e-images ## Quick end-to-end check (tiny run), one JSON SUMMARY line
 	$(PY) -m e2e.orchestrator --mode smoke $(E2E_ARGS)
+
+smoke-dupes: dirs up e2e-images ## Same seed sent twice: bronze 2 rows/id, silver 1 (first send)
+	$(PY) -m e2e.smoke_dupes $(E2E_ARGS)
 
 smoke-restart: dirs up e2e-images ## Graceful stop/restart: no re-read, no skip (~1-2 min)
 	$(PY) -m e2e.smoke_restart $(E2E_ARGS)

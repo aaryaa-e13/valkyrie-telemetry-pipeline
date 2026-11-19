@@ -294,3 +294,17 @@ def test_silver_wrong_table_or_missing_status_is_not_caught_up() -> None:
     unknown = catchup.check_silver_caught_up(
         catchup.delta_snapshot_from_status(_silver_status(9)), None, 7)
     assert unknown.caught_up and "not checked" in unknown.reasons[0]
+
+
+def test_log_facts_are_per_query() -> None:
+    lines = [
+        '{"msg": "query started", "query": "bronze", "run_id": "rb"}',
+        '{"msg": "query started", "query": "silver", "run_id": "rs"}',
+        '{"msg": "batch progress", "query": "bronze", "batch_id": 3}',
+        '{"msg": "batch progress", "query": "silver", "batch_id": 9}',
+        '{"msg": "batch progress", "batch_id": 2}',
+    ]
+    bronze = catchup.parse_log_lines(lines)
+    silver = catchup.parse_log_lines(lines, query="silver")
+    assert bronze.batch_ids == (3, 2) and bronze.started_run_ids == ("rb",)
+    assert silver.batch_ids == (9,) and silver.started_run_ids == ("rs",)
