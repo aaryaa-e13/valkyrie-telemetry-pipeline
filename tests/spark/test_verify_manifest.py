@@ -2,7 +2,9 @@
 
 Covers: manifest v1, v2 and v3 are all accepted, duplicates are reported but only
 fail with --fail-on-duplicates, missing ids always fail, unrelated rows
-(other runs, malformed messages) never affect the result.
+(other runs, malformed messages) never affect the result. Bronze is Delta
+(slice 2): R0 (duplicate Kafka offset) always fails, and --versions reports
+time-travel counts.
 """
 
 from __future__ import annotations
@@ -50,12 +52,24 @@ V3: dict[str, Any] = {
 }
 
 
-def _lake(spark: SparkSession, tmp_path: Path, event_ids: list[str | None]) -> str:
-    """Write a tiny raw table: given event_ids plus unrelated noise rows."""
-    rows = [(e, e is not None) for e in event_ids]
-    rows += [("other-run-1", True), ("other-run-1", True), (None, False)]  # noise
+LAKE_SCHEMA = ("event_id string, parse_ok boolean, kafka_topic string, "
+               "kafka_partition int, kafka_offset long")
+
+
+def _lake(spark: SparkSession, tmp_path: Path, event_ids: list[str | None],
+          repeat_offset: bool = False) -> str:
+    """Write a tiny bronze Delta table: given event_ids plus unrelated noise rows.
+
+    Every row gets its own Kafka offset, as in real bronze. repeat_offset=True
+    gives the last row the offset of the first one (an R0 violation).
+    """
+    ids = [(e, e is not None) for e in event_ids]
+    ids += [("other-run-1", True), ("other-run-1", True), (None, False)]  # noise
+    rows = [(e, ok, "game-events", 3, i) for i, (e, ok) in enumerate(ids)]
+    if repeat_offset:
+        rows[-1] = (*rows[-1][:4], 0)
     path = str(tmp_path / "lake")
-    spark.createDataFrame(rows, "event_id string, parse_ok boolean").write.parquet(path)
+    spark.createDataFrame(rows, LAKE_SCHEMA).write.format("delta").save(path)
     return path
 
 
@@ -71,8 +85,10 @@ def test_complete_run_passes_for_v1_v2_and_v3(spark, tmp_path: Path, manifest) -
     report = verify(spark, _manifest(tmp_path, manifest), lake)
     assert report["manifest_version"] == manifest["manifest_version"]
     assert (report["missing_ids"], report["duplicate_rows"]) == (0, 0)
-    assert report["parquet_total_rows"] == 6        # noise is counted ...
-    assert report["parquet_unparsed_rows"] == 1
+    assert report["total_rows"] == 6        # noise is counted ...
+    assert report["unparsed_rows"] == 1
+    assert report["duplicate_kafka_offsets"] == 0
+    assert report["table_version"] == 0
     assert evaluate(report, fail_on_duplicates=True)[0] == "PASS"  # ... but never judged
 
 
@@ -85,6 +101,25 @@ def test_duplicates_reported_but_fail_only_with_flag(spark, tmp_path: Path) -> N
     assert result == "PASS"
     assert any("duplicate rows reported" in n for n in notes)
     assert evaluate(report, fail_on_duplicates=True)[0] == "FAIL"
+
+
+def test_duplicate_kafka_offset_always_fails_r0(spark, tmp_path: Path) -> None:
+    report = verify(spark, _manifest(tmp_path, V1),
+                    _lake(spark, tmp_path, ["e1", "e2", "e3"], repeat_offset=True))
+    assert (report["missing_ids"], report["duplicate_rows"]) == (0, 0)
+    assert report["duplicate_kafka_offsets"] == 1
+    result, notes = evaluate(report, fail_on_duplicates=False)
+    assert result == "FAIL"
+    assert any(n.startswith("R0:") for n in notes)
+
+
+def test_versions_report_time_travel_counts(spark, tmp_path: Path) -> None:
+    lake = _lake(spark, tmp_path, ["e1", "e2", "e3"])  # version 0: 6 rows
+    spark.createDataFrame([("e9", True, "game-events", 4, 0)], LAKE_SCHEMA) \
+        .write.format("delta").mode("append").save(lake)  # version 1: 7 rows
+    report = verify(spark, _manifest(tmp_path, V1), lake, versions=[0, 1])
+    assert report["table_version"] == 1
+    assert report["version_counts"] == {"0": 6, "1": 7}
 
 
 def test_missing_ids_always_fail(spark, tmp_path: Path) -> None:

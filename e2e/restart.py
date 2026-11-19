@@ -10,7 +10,18 @@ Names:
     E0  committed end offsets per partition after the stop (exclusive)
     B0  last committed batch_id after the stop
     Q0  query_id after the stop (stored in the checkpoint)
-    R0  run_id of the process that committed B0 (changes on every restart)
+    R0  run_id of the process that committed B0 (changes on every restart).
+        Not the same as verify's rule R0 (unique Kafka offset, D2.2).
+    V0  bronze Delta version after the stop; V1 after catch-up
+
+Delta checks (evidence_version 2, Phase 2 slice 2, DECISIONS D2.2): the rows
+added by commits (V0, V1], read from the Delta log JSON by common.delta_log,
+must equal the run's message count; Spark's time-travel counts at V0 and V1
+must give the same difference; and every one of those commits must carry one
+txn whose appId is Q0 (the query `id`, stable across restarts, NOT the run_id)
+and whose version is a post-restart batch id. The baseline step makes sure no
+batch was planned before the stop, so every post-restart batch with rows
+wrote exactly one commit.
 
 First post-restart batch: in the status history (same Q0), the batch with
 batch_id B0 + 1. Batch ids increase by exactly 1 per executed batch, so
@@ -29,7 +40,11 @@ from typing import Any
 
 from common.manifest_reader import OffsetRange
 
-EVIDENCE_VERSION = 1
+EVIDENCE_VERSION = 2
+PHASE1_POINTER = ("evidence_version 1 is Phase 1 (raw Parquet) evidence; the Delta rules "
+                  "cannot check it. Re-check it with the Phase 1 code at tag `phase-1`: "
+                  "git switch --detach phase-1 && python -m e2e.smoke_restart "
+                  "--check-evidence FILE")
 
 
 def _int_keys(d: Mapping[Any, Any] | None) -> dict[int, int] | None:
@@ -204,29 +219,87 @@ def check_no_skip(
     return problems
 
 
-def check_parquet_delta(before_rows: int, after_rows: int, run_count: int) -> list[str]:
-    """Rows on disk grew by exactly the run's message count."""
-    delta = after_rows - before_rows
-    if delta == run_count:
-        return []
-    kind = "EXTRA rows (re-read or duplicate writes)" if delta > run_count else "MISSING rows"
-    return [f"Parquet rows {before_rows} -> {after_rows}: delta {delta} != run messages "
-            f"{run_count} ({delta - run_count:+d}, {kind})"]
+def evidence_problem(ev: Mapping[str, Any]) -> str | None:
+    """None if these rules can check the evidence, else why not (v1 = Phase 1)."""
+    version = ev.get("evidence_version")
+    if version == EVIDENCE_VERSION:
+        return None
+    if version == 1:
+        return PHASE1_POINTER
+    return f"unknown evidence_version {version!r} (expected {EVIDENCE_VERSION})"
 
 
-def check_footer_consistency(footer_rows: int, committed_rows: int | None) -> list[str]:
-    """Footer total == Spark's committed total, i.e. no uncommitted files on disk."""
-    if committed_rows is None:
-        return ["no committed row count from verify (cannot prove footer count is exact)"]
-    if footer_rows != committed_rows:
-        return [f"footer count {footer_rows} != Spark committed count {committed_rows}: "
-                f"{footer_rows - committed_rows:+d} rows in files Spark has not committed, "
-                "so the footer delta is not trustworthy"]
+def _log_error(log: Mapping[str, Any] | None) -> list[str]:
+    if not log:
+        return ["cannot prove: no Delta log summary in the evidence"]
+    if log.get("error"):
+        return [f"cannot prove: Delta log unreadable: {log['error']}"]
     return []
 
 
+def check_log_delta(log: Mapping[str, Any] | None, run_count: int) -> list[str]:
+    """Rows added in commits (V0, V1] == the run's message count."""
+    if problems := _log_error(log):
+        return problems
+    assert log is not None
+    delta = int(log["rows"])
+    if delta == run_count:
+        return []
+    kind = "EXTRA rows (re-read or duplicate writes)" if delta > run_count else "MISSING rows"
+    return [f"Delta log rows added in versions {log['v_before']}..{log['v_after']}: {delta} != "
+            f"run messages {run_count} ({delta - run_count:+d}, {kind})"]
+
+
+def check_log_vs_spark(log: Mapping[str, Any] | None,
+                       version_counts: Mapping[str, int] | None) -> list[str]:
+    """Our log count == Spark's count(V1) - count(V0) (time travel, inside verify)."""
+    if problems := _log_error(log):
+        return problems
+    assert log is not None
+    v0, v1 = str(log["v_before"]), str(log["v_after"])
+    if not version_counts or v0 not in version_counts or v1 not in version_counts:
+        return [f"cannot prove: verify reported no counts for versions {v0} and {v1}"]
+    spark_delta = int(version_counts[v1]) - int(version_counts[v0])
+    if spark_delta != int(log["rows"]):
+        return [f"Delta log delta {log['rows']} != Spark time-travel delta {spark_delta} "
+                f"({version_counts[v0]} at v{v0} -> {version_counts[v1]} at v{v1})"]
+    return []
+
+
+def check_txn_identity(log: Mapping[str, Any] | None, q0: str,
+                       post: list[Batch]) -> list[str]:
+    """Each commit in (V0, V1] has one txn, appId == Q0 (query id), version == a batch id."""
+    if problems := _log_error(log):
+        return problems
+    assert log is not None
+    txns = list(log["txns"])
+    problems = []
+    per_commit: dict[int, int] = {}
+    for t in txns:
+        per_commit[int(t["delta_version"])] = per_commit.get(int(t["delta_version"]), 0) + 1
+    without = [v for v in range(int(log["v_before"]) + 1, int(log["v_after"]) + 1)
+               if per_commit.get(v, 0) != 1]
+    if without:
+        problems.append(f"commits without exactly one txn action: versions {without}")
+    wrong = sorted({str(t["appId"]) for t in txns} - {q0})
+    if wrong:
+        problems.append(f"txn appId {wrong} != query id Q0 {q0}")
+    versions = [int(t["version"]) for t in txns]
+    expected = [b.batch_id for b in post if b.num_input_rows > 0]
+    if versions != expected:
+        problems.append(f"txn versions {versions} != post-restart batch ids with rows "
+                        f"{expected}")
+    return problems
+
+
 def evaluate(ev: Mapping[str, Any]) -> list[Check]:
-    """Run every check on an evidence dict (see smoke_restart.collect_evidence)."""
+    """Run every check on an evidence dict (see smoke_restart.scenario).
+
+    Raises:
+        ValueError: the evidence is not version 2 (see evidence_problem).
+    """
+    if problem := evidence_problem(ev):
+        raise ValueError(problem)
     topic = ev["topic"]
     e0 = _int_keys(ev["e0"]) or {}
     run = {int(p): OffsetRange(*r) for p, r in ev["run_offsets"].items()}
@@ -256,11 +329,17 @@ def evaluate(ev: Mapping[str, Any]) -> list[Check]:
     checks.append(check("no skip (rows + offsets)",
                         check_no_skip(post, e0, final_end, run, run_count),
                         f"{run_count} rows read after restart, offsets contiguous with E0"))
-    before, after = ev["parquet_before"]["rows"], ev["parquet_after"]["rows"]
-    checks.append(check("parquet delta (footers)", check_parquet_delta(before, after, run_count),
-                        f"{before} -> {after} = +{after - before}"))
-    checks.append(check("footers == committed", check_footer_consistency(
-        after, ev.get("committed_rows_after")), f"{after} rows, no uncommitted files"))
+    log = (ev.get("delta") or {}).get("log")
+    rows = (log or {}).get("rows")
+    span = f"v{(log or {}).get('v_before')}..v{(log or {}).get('v_after')}"
+    checks.append(check("delta log rows == run", check_log_delta(log, run_count),
+                        f"+{rows} rows in {span}"))
+    checks.append(check("delta log == spark time travel",
+                        check_log_vs_spark(log, ev.get("version_counts")),
+                        f"both +{rows}"))
+    checks.append(check("txn appId == query id", check_txn_identity(log, ev["q0"], post),
+                        f"{len((log or {}).get('txns') or [])} commits, appId {ev['q0']}, "
+                        "versions == batch ids"))
     v = ev.get("verify") or {}
     checks.append(check("verify --fail-on-duplicates",
                         [] if v.get("result") == "PASS" else [f"verify {v.get('result')}: "

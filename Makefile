@@ -100,10 +100,10 @@ lint: ## Run ruff
 
 # --- Spark (container) --------------------------------------------------------
 
-spark-build: dirs ## Build the Spark image (pyspark 4.1.4 + Kafka connector)
+spark-build: dirs ## Build the Spark image (pyspark 4.1.4 + Kafka connector + Delta)
 	$(COMPOSE) --profile spark build spark
 
-spark-up: dirs ## Start the streaming job Kafka -> raw Parquet (background)
+spark-up: dirs ## Start the streaming job Kafka -> bronze Delta (background)
 	$(COMPOSE) --profile spark up -d spark
 
 spark-stop: ## Stop the streaming job gracefully (checkpoint keeps its position)
@@ -117,7 +117,7 @@ spark-image: ## Rebuild the Spark image quietly if code changed (cached: a few s
 
 # verify depends on spark-image: the manifest reader is baked into the image, so a
 # stale image would verify with old code (it once rejected v3 manifests; WHAT_BROKE).
-verify: dirs spark-image ## Compare raw Parquet with a run manifest (MANIFEST=manifests/run_X.json)
+verify: dirs spark-image ## Compare bronze Delta with a run manifest (MANIFEST=manifests/run_X.json)
 	@test -n "$(MANIFEST)" || (echo "usage: make verify MANIFEST=manifests/run_X.json" && exit 2)
 	$(COMPOSE) --profile tools run --rm -T spark-tools \
 		python -m streaming.verify_manifest --manifest /app/$(MANIFEST)

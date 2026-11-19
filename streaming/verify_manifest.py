@@ -1,29 +1,38 @@
-"""Compare the raw Parquet output against one simulator run manifest.
+"""Compare the bronze Delta table against one simulator run manifest.
 
 The topic contains many runs (and test messages), so raw row counts are
 meaningless. Instead we take the manifest's acknowledged event_ids (ground
 truth) and check, for exactly those ids:
 
-    missing     ids in the manifest but not in Parquet         -> data loss
-    duplicates  ids that appear in more than one Parquet row   -> double counting
+    missing     ids in the manifest but not in bronze           -> data loss
+    duplicates  ids that appear in more than one bronze row     -> double counting
     per-match   rows per match vs manifest counts
 
-Parquet is read with Spark, so only files committed in the sink's
-`_spark_metadata` log are seen (no half-written files from a killed batch).
+and, for the whole table, rule R0 (DECISIONS D2.2):
 
-Accepts manifest v1 and v2 (see common/manifest_reader.py).
+    duplicate_kafka_offsets  rows sharing (kafka_topic, kafka_partition,
+                             kafka_offset). Bronze holds one row per Kafka
+                             message, so this must be 0. Duplicate *event ids*
+                             are expected in bronze; a duplicate *offset* means
+                             the sink wrote one message twice.
 
-Duplicates are always *reported*. They only cause FAIL with
---fail-on-duplicates: Phase 1 deliberately shows duplicates (same seed sent
-twice) as the motivation for Phase 2, so plain verification must not hide
-them behind a failure.
+The table is read through Delta at one pinned version (`table_version` in the
+report), so every number comes from the same snapshot. Only committed data is
+visible. `--versions V0,V1` also reports the row count at those versions (time
+travel), used by smoke-restart to cross-check its Delta-log count.
+
+Accepts manifest v1, v2 and v3 (see common/manifest_reader.py).
+
+Duplicate event ids are always *reported*. They only cause FAIL with
+--fail-on-duplicates: bronze deliberately keeps duplicates (same seed sent
+twice, D1.14) until silver dedupes them, so plain verification must not hide
+them behind a failure. Missing ids and duplicate offsets always FAIL.
 
 Usage (inside the Spark container):
     python -m streaming.verify_manifest --manifest manifests/run_X.json
     python -m streaming.verify_manifest --manifest ... --fail-on-duplicates
 
-Exit code: 0 PASS, 1 FAIL (missing ids, or duplicates with --fail-on-duplicates),
-2 unusable manifest.
+Exit code: 0 PASS, 1 FAIL, 2 unusable manifest or unusable arguments.
 """
 
 from __future__ import annotations
@@ -43,17 +52,25 @@ from common.manifest_reader import ManifestError, load_manifest
 
 log = logging.getLogger("streaming.verify_manifest")
 
+DEFAULT_TABLE = "/data/lake/bronze/game_events"
+OFFSET_KEY = ("kafka_topic", "kafka_partition", "kafka_offset")
+
 
 def evaluate(report: dict[str, Any], fail_on_duplicates: bool) -> tuple[str, list[str]]:
     """Decide PASS/FAIL from a report. Returns (result, human-readable notes).
 
-    Missing ids always fail. Duplicates fail only if `fail_on_duplicates`.
+    Missing ids and duplicate Kafka offsets (R0) always fail. Duplicate event
+    ids fail only if `fail_on_duplicates`.
     """
     notes: list[str] = []
     failed = False
     if report["missing_ids"] > 0:
         failed = True
         notes.append(f"{report['missing_ids']} event ids are missing (data loss)")
+    if report["duplicate_kafka_offsets"] > 0:
+        failed = True
+        notes.append(f"R0: {report['duplicate_kafka_offsets']} extra rows share a Kafka "
+                     "(topic, partition, offset): one message was written twice")
     if report["duplicate_rows"] > 0:
         if fail_on_duplicates:
             failed = True
@@ -61,17 +78,31 @@ def evaluate(report: dict[str, Any], fail_on_duplicates: bool) -> tuple[str, lis
         else:
             notes.append(
                 f"{report['duplicate_rows']} duplicate rows reported, not failing "
-                "(expected in Phase 1 raw layer; use --fail-on-duplicates to enforce)"
+                "(expected in the bronze layer; use --fail-on-duplicates to enforce)"
             )
     return ("FAIL" if failed else "PASS"), notes
 
 
-def verify(spark: SparkSession, manifest_path: Path, parquet_path: str) -> dict[str, Any]:
-    """Compute the comparison report for one manifest (v1 or v2)."""
+def latest_version(spark: SparkSession, table_path: str) -> int:
+    """Newest committed version of a Delta table."""
+    from delta.tables import DeltaTable
+
+    return int(DeltaTable.forPath(spark, table_path).history(1).first()["version"])
+
+
+def count_at(spark: SparkSession, table_path: str, version: int) -> int:
+    """Row count of the table as of `version` (Delta time travel)."""
+    return spark.read.format("delta").option("versionAsOf", version).load(table_path).count()
+
+
+def verify(spark: SparkSession, manifest_path: Path, table_path: str,
+           versions: list[int] | None = None) -> dict[str, Any]:
+    """Compute the comparison report for one manifest (v1, v2 or v3)."""
     manifest = load_manifest(manifest_path)
     pairs = list(manifest.event_pairs)
     expected = spark.createDataFrame(pairs, "match_id string, event_id string")
-    rows = spark.read.parquet(parquet_path)
+    version = latest_version(spark, table_path)
+    rows = spark.read.format("delta").option("versionAsOf", version).load(table_path)
 
     matched = rows.join(expected.select("event_id"), "event_id", "inner")
     per_id = matched.groupBy("event_id").count()
@@ -85,15 +116,24 @@ def verify(spark: SparkSession, manifest_path: Path, parquet_path: str) -> dict[
         .alias("ids_duplicated"),
         F.coalesce(F.max("count"), F.lit(0)).alias("max_copies"),
     ).first()
+    table = rows.agg(
+        F.count("*").alias("total"),
+        F.coalesce(F.sum(F.when(~F.col("parse_ok"), 1).otherwise(0)), F.lit(0))
+        .alias("unparsed"),
+    ).first()
+    distinct_offsets = rows.select(*OFFSET_KEY).distinct().count()
 
     expected_unique = len({event_id for _, event_id in pairs})
     found_unique = int(stats["found_unique"])
     rows_matched = int(stats["rows_matched"])
-    return {
+    total = int(table["total"])
+    report: dict[str, Any] = {
         "manifest": str(manifest_path),
         "manifest_version": manifest.version,
         "run_id": manifest.run_id,
         "seed": manifest.seed,
+        "table_path": table_path,
+        "table_version": version,
         "expected_unique_ids": expected_unique,
         "found_unique_ids": found_unique,
         "missing_ids": expected_unique - found_unique,
@@ -102,17 +142,33 @@ def verify(spark: SparkSession, manifest_path: Path, parquet_path: str) -> dict[
         "duplicate_rows": rows_matched - found_unique,
         "ids_with_duplicates": int(stats["ids_duplicated"]),
         "max_copies_of_one_id": int(stats["max_copies"]),
-        "parquet_total_rows": rows.count(),
-        "parquet_unparsed_rows": rows.filter(~F.col("parse_ok")).count(),
+        "total_rows": total,
+        "unparsed_rows": int(table["unparsed"]),
+        "duplicate_kafka_offsets": total - distinct_offsets,
     }
+    if versions:
+        report["version_counts"] = {str(v): count_at(spark, table_path, v) for v in versions}
+    return report
+
+
+def _versions(text: str) -> list[int]:
+    try:
+        out = [int(v) for v in text.split(",") if v.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected V0,V1 (integers), got {text!r}") from None
+    if not out or any(v < 0 for v in out):
+        raise argparse.ArgumentTypeError(f"expected non-negative versions, got {text!r}")
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point."""
-    p = argparse.ArgumentParser(description="Verify raw Parquet against a run manifest")
+    p = argparse.ArgumentParser(description="Verify the bronze Delta table against a manifest")
     p.add_argument("--manifest", required=True, type=Path)
-    p.add_argument("--parquet-path", default="/data/lake/raw/game_events")
+    p.add_argument("--table-path", default=DEFAULT_TABLE)
     p.add_argument("--fail-on-duplicates", action="store_true")
+    p.add_argument("--versions", type=_versions, default=None,
+                   help="also report row counts at these Delta versions, e.g. 12,15")
     args = p.parse_args(argv)
 
     setup_logging("INFO", component="verify_manifest")
@@ -122,17 +178,13 @@ def main(argv: list[str] | None = None) -> int:
     except (ManifestError, OSError) as exc:
         log.error("unusable manifest", extra={"fields": {"error": str(exc)}})
         return 2
-    spark = (
-        SparkSession.builder.appName("verify_manifest").master("local[2]")
-        .config("spark.driver.memory", "1g")
-        .config("spark.sql.session.timeZone", "UTC")
-        .config("spark.sql.shuffle.partitions", "4")
-        .config("spark.ui.enabled", "false")
-        .getOrCreate()
-    )
+    from streaming.spark_session import build_spark
+
+    spark = build_spark("verify_manifest", "local[2]", "1g", shuffle_partitions=4,
+                        extra={"spark.ui.enabled": "false"})
     spark.sparkContext.setLogLevel("ERROR")
     try:
-        report = verify(spark, args.manifest, args.parquet_path)
+        report = verify(spark, args.manifest, args.table_path, args.versions)
     finally:
         spark.stop()
 

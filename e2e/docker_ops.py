@@ -125,9 +125,9 @@ def run_simulator(config: str, seed: int, extra: Sequence[str], *, stream: bool)
     return run(cmd, timeout=900, stream=stream)
 
 
-def run_verify(manifest_rel: str) -> Result:
+def run_verify(manifest_rel: str, extra: list[str] | None = None) -> Result:
     """Run verify_manifest in the read-only spark-tools container."""
     cmd = [*COMPOSE, "--profile", "tools", "run", "--rm", "-T", "spark-tools",
            "python", "-m", "streaming.verify_manifest",
-           "--manifest", f"/app/{manifest_rel}", "--fail-on-duplicates"]
+           "--manifest", f"/app/{manifest_rel}", "--fail-on-duplicates", *(extra or [])]
     return run(cmd, timeout=600)

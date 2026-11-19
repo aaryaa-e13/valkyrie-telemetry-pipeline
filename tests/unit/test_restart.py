@@ -1,18 +1,14 @@
-"""Unit tests for e2e.restart (pure restart checks) and e2e.parquet_count."""
+"""Unit tests for e2e.restart (pure restart checks, evidence_version 2 = Delta)."""
 
 from __future__ import annotations
 
 import copy
-from pathlib import Path
 from typing import Any
 
-import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
 from common.manifest_reader import OffsetRange
 from e2e import restart
-from e2e.parquet_count import count_rows
 from e2e.restart import Batch
 
 TOPIC = "game-events"
@@ -189,33 +185,64 @@ def test_no_final_end_cannot_prove() -> None:
         "no committed end offset after catch-up"
 
 
-# --- Parquet delta and footers --------------------------------------------------------
+# --- Delta checks (log delta, log vs Spark, txn identity) ---------------------------
 
-def test_parquet_delta() -> None:
-    assert restart.check_parquet_delta(100, 108, 8) == []
-    assert "+3, EXTRA rows" in restart.check_parquet_delta(100, 111, 8)[0]
-    assert "-1, MISSING rows" in restart.check_parquet_delta(100, 107, 8)[0]
-
-
-def test_footer_consistency() -> None:
-    assert restart.check_footer_consistency(10, 10) == []
-    assert "+2 rows in files Spark has not committed" in \
-        restart.check_footer_consistency(12, 10)[0]
-    assert "cannot prove" in restart.check_footer_consistency(10, None)[0]
+def _log(rows: int = 8, txns: list[dict] | None = None, v0: int = 20, v1: int = 21) -> dict:
+    if txns is None:
+        txns = [{"delta_version": 21, "appId": "q", "version": 8}]
+    return {"v_before": v0, "v_after": v1, "rows": rows, "files": 2, "commits": v1 - v0,
+            "txns": txns}
 
 
-def test_count_rows_reads_footers_and_skips_metadata(tmp_path: Path) -> None:
-    table = pa.table({"x": [1, 2, 3]})
-    (tmp_path / "ingest_date=2026-11-15").mkdir()
-    pq.write_table(table, tmp_path / "ingest_date=2026-11-15" / "part-0.snappy.parquet")
-    pq.write_table(table.slice(0, 2), tmp_path / "part-1.parquet")
-    (tmp_path / "_spark_metadata").mkdir()
-    pq.write_table(table, tmp_path / "_spark_metadata" / "ignored.parquet")
-    pq.write_table(table, tmp_path / ".hidden.parquet")
-    (tmp_path / ".part-0.snappy.parquet.crc").write_bytes(b"crc")
-    count = count_rows(tmp_path)
-    assert (count.files, count.rows) == (2, 5)
-    assert count_rows(tmp_path / "missing").rows == 0
+def test_log_delta() -> None:
+    assert restart.check_log_delta(_log(8), 8) == []
+    assert "+3, EXTRA rows" in restart.check_log_delta(_log(11), 8)[0]
+    assert "-1, MISSING rows" in restart.check_log_delta(_log(7), 8)[0]
+    assert "cannot prove" in restart.check_log_delta({"error": "commit file missing"}, 8)[0]
+    assert "cannot prove" in restart.check_log_delta(None, 8)[0]
+
+
+def test_log_vs_spark() -> None:
+    assert restart.check_log_vs_spark(_log(8), {"20": 1000, "21": 1008}) == []
+    assert "!= Spark time-travel delta 9" in \
+        restart.check_log_vs_spark(_log(8), {"20": 1000, "21": 1009})[0]
+    assert "cannot prove" in restart.check_log_vs_spark(_log(8), {"20": 1000})[0]
+    assert "cannot prove" in restart.check_log_vs_spark(_log(8), None)[0]
+
+
+POST = [batch(8, dict(E0), dict(FINAL), 8)]
+
+
+def test_txn_identity_ok() -> None:
+    assert restart.check_txn_identity(_log(), "q", POST) == []
+
+
+def test_txn_identity_run_id_instead_of_query_id_fails() -> None:
+    """Condition: appId must be the stable query `id`, never the per-restart runId."""
+    log = _log(txns=[{"delta_version": 21, "appId": "new", "version": 8}])  # "new" = run_id
+    assert restart.check_txn_identity(log, "q", POST) == ["txn appId ['new'] != query id Q0 q"]
+
+
+def test_txn_identity_commit_without_txn_and_wrong_versions() -> None:
+    log = _log(txns=[], v0=20, v1=21)
+    problems = restart.check_txn_identity(log, "q", POST)
+    assert "commits without exactly one txn action: versions [21]" in problems[0]
+    assert "txn versions [] != post-restart batch ids with rows [8]" in problems[1]
+    twice = _log(txns=[{"delta_version": 21, "appId": "q", "version": 8}] * 2)
+    assert "versions [21]" in restart.check_txn_identity(twice, "q", POST)[0]
+
+
+def test_txn_identity_ignores_batches_without_rows() -> None:
+    post = [*POST, batch(9, dict(FINAL), dict(FINAL), 0)]
+    assert restart.check_txn_identity(_log(), "q", post) == []
+
+
+def test_evidence_version_1_is_refused_with_pointer() -> None:
+    problem = restart.evidence_problem({"evidence_version": 1})
+    assert problem is not None and "tag `phase-1`" in problem
+    assert "unknown evidence_version 3" in str(restart.evidence_problem({"evidence_version": 3}))
+    with pytest.raises(ValueError, match="phase-1"):
+        restart.evaluate({"evidence_version": 1})
 
 
 # --- evaluate (whole evidence) ------------------------------------------------------
@@ -236,8 +263,9 @@ def evidence() -> dict[str, Any]:
         "new_run_ids": ["new"], "run_count": 8,
         "run_offsets": {"0": [100, 104, 5], "2": [70, 72, 3]},
         "status_after": {"query_id": "q", "history": history, "last_batch": history[-1]},
-        "parquet_before": {"files": 3, "rows": 1000}, "parquet_after": {"files": 4, "rows": 1008},
-        "committed_rows_after": 1008,
+        "evidence_version": 2,
+        "delta": {"table": "data/lake/bronze/game_events", "v0": 20, "v1": 21, "log": _log()},
+        "version_counts": {"20": 1000, "21": 1008},
         "verify": {"result": "PASS", "found_unique_ids": 8, "expected_unique_ids": 8,
                    "duplicate_rows": 0},
     }
@@ -259,12 +287,27 @@ def test_evaluate_stop_exit_code() -> None:
     assert _failed(ev) == {"graceful stop"}
 
 
-def test_evaluate_extra_rows_only_fails_parquet_delta() -> None:
+def test_evaluate_extra_rows_only_fails_log_delta() -> None:
     """Data has rows the listener does not know about: only the independent check sees it."""
     ev = evidence()
-    ev["parquet_after"]["rows"] += 3
-    ev["committed_rows_after"] += 3
-    assert _failed(ev) == {"parquet delta (footers)"}
+    ev["delta"]["log"]["rows"] += 3
+    ev["version_counts"]["21"] += 3
+    assert _failed(ev) == {"delta log rows == run"}
+    assert restart.exit_code_for(restart.evaluate(ev)) == 5
+
+
+def test_evaluate_log_parser_disagrees_with_spark() -> None:
+    ev = evidence()
+    ev["version_counts"]["21"] += 1
+    assert _failed(ev) == {"delta log == spark time travel"}
+
+
+def test_evaluate_unreadable_log_cannot_prove() -> None:
+    ev = evidence()
+    ev["delta"]["log"] = {"error": "version 21: add without numRecords", "v_before": 20,
+                          "v_after": 21}
+    assert _failed(ev) == {"delta log rows == run", "delta log == spark time travel",
+                           "txn appId == query id"}
     assert restart.exit_code_for(restart.evaluate(ev)) == 5
 
 

@@ -1,4 +1,4 @@
-"""End-to-end run: simulator -> Kafka -> Spark -> raw Parquet -> verify.
+"""End-to-end run: simulator -> Kafka -> Spark -> bronze Delta -> verify.
 
 Steps:
     1. seed (Python, epoch ms)      5. contiguity check          (exit 4)
@@ -94,7 +94,7 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-start-spark", action="store_true",
                    help="do not start the Spark container (to test failure handling)")
     p.add_argument("--status-path", type=Path, default=Path(
-        os.environ.get("E2E_STATUS_PATH", "data/status/raw_to_parquet.json")))
+        os.environ.get("E2E_STATUS_PATH", "data/status/bronze.json")))
     p.add_argument("--manifest-dir", type=Path, default=Path("manifests"))
     p.add_argument("--json-summary", type=Path, help="also write the summary JSON to this file")
 
@@ -232,13 +232,17 @@ def timeout_report(
     return "\n".join(parts)
 
 
-def verify_report(manifest: Manifest) -> tuple[int, dict[str, Any]]:
+def verify_report(manifest: Manifest, versions: list[int] | None = None
+                  ) -> tuple[int, dict[str, Any]]:
     """Run verify_manifest in spark-tools; (exit code, JSON report), even if it FAILs.
+
+    `versions`: also report bronze row counts at these Delta versions.
 
     Raises:
         Abort: verify produced no JSON report (crash or unusable manifest).
     """
-    res = run_verify(manifest.path.as_posix())
+    extra = ["--versions", ",".join(str(v) for v in versions)] if versions else []
+    res = run_verify(manifest.path.as_posix(), extra)
     try:
         return res.returncode, json.loads(res.stdout)
     except ValueError:
@@ -300,7 +304,7 @@ def orchestrate(run: Run, args: argparse.Namespace) -> None:
     say(f"      caught up after {run.summary['catch_up']['wait_s']}s "
         f"(batch {run.summary['catch_up']['batch_id']})")
 
-    say("[6/6] verifying Parquet against the manifest (spark-tools, read-only data)")
+    say("[6/6] verifying bronze against the manifest (spark-tools, read-only data)")
     report = verify(manifest, verbose=demo)
     run.summary["verify"] = {k: report.get(k) for k in (
         "result", "expected_unique_ids", "found_unique_ids", "missing_ids", "duplicate_rows")}
@@ -310,7 +314,7 @@ def orchestrate(run: Run, args: argparse.Namespace) -> None:
     if demo:
         say("\nWhere to look:\n"
             "  Spark UI      http://localhost:4040\n"
-            "  Parquet       data/lake/raw/game_events/\n"
+            "  bronze Delta  data/lake/bronze/game_events/\n"
             f"  status file   {args.status_path}\n"
             f"  manifest      {manifest.path}\n"
             "The stack is still running; `make down` stops it.")
