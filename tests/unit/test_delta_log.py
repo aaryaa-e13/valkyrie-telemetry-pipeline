@@ -17,8 +17,11 @@ from common.delta_log import (
     appended_between,
     current_version,
     latest_txn_in_commits,
+    live_files_in_range,
     newest_checkpoint_files,
     read_commit,
+    read_commits,
+    table_id,
 )
 
 
@@ -132,3 +135,37 @@ def test_newest_checkpoint_files_multi_part(tmp_path: Path) -> None:
     assert [f.name[21:] for f in newest_checkpoint_files(tmp_path)] == [
         "checkpoint.0000000001.0000000002.parquet", "checkpoint.0000000002.0000000002.parquet"]
     assert newest_checkpoint_files(tmp_path / "none") == []
+
+
+# --- live files per partition (MERGE pruning expectation) and table id -----------
+
+
+def _dated(tmp_path: Path) -> Path:
+    t = tmp_path / "silver"
+    pv = lambda d: {"partitionValues": {"event_date": d}}  # noqa: E731
+    _commit(t, 0, [{"metaData": {"id": "tbl-1"}}])
+    _commit(t, 1, [_add("p1", 1, **pv("2026-11-01")), _add("p2", 1, **pv("2026-11-09")),
+                   _add("p3", 1, **pv("2026-11-10"))])
+    _commit(t, 2, [{"remove": {"path": "p2"}}, _add("p4", 2, **pv("2026-11-09"))])
+    return t
+
+
+def test_live_files_in_range_counts_window_after_removes(tmp_path: Path) -> None:
+    t = _dated(tmp_path)
+    assert live_files_in_range(read_commits(t), "event_date", "2026-11-09", "2026-11-10") == (2, 3)
+    assert live_files_in_range(read_commits(t), "event_date", "2026-11-02", "2026-11-08") == (0, 3)
+
+
+def test_live_files_in_range_needs_commit_zero(tmp_path: Path) -> None:
+    t = _dated(tmp_path)
+    (t / "_delta_log" / f"{0:020d}.json").unlink()
+    with pytest.raises(DeltaLogError, match="version 0"):
+        live_files_in_range(read_commits(t), "event_date", "2026-11-01", "2026-11-30")
+
+
+def test_table_id_from_newest_metadata(tmp_path: Path) -> None:
+    t = _dated(tmp_path)
+    assert table_id(t) == "tbl-1"
+    _commit(t, 3, [{"metaData": {"id": "tbl-1", "configuration": {"x": "y"}}}])
+    assert table_id(t) == "tbl-1"
+    assert table_id(tmp_path / "nope") is None

@@ -102,6 +102,50 @@ def reconcile(commits: list[tuple[int, list[dict[str, Any]]]]) -> dict[str, Any]
             "files_without_numRecords": missing_stats, "files_with_deletion_vector": dv_files}
 
 
+def live_adds(commits: list[tuple[int, list[dict[str, Any]]]]) -> list[dict[str, Any]]:
+    """The live `add` actions after replaying the commits (needs commits from 0)."""
+    live: dict[tuple[str, str], dict[str, Any]] = {}
+    for _, actions in commits:
+        for action in actions:
+            if "add" in action:
+                live[(action["add"]["path"], _dv_key(action["add"]))] = action["add"]
+            elif "remove" in action:
+                live.pop((action["remove"]["path"], _dv_key(action["remove"])), None)
+    return list(live.values())
+
+
+def live_files_in_range(commits: list[tuple[int, list[dict[str, Any]]]], column: str,
+                        lo: str, hi: str) -> tuple[int, int]:
+    """(live files whose partition value of `column` is in [lo, hi], all live files).
+
+    Values are compared as strings, which is correct for ISO dates (YYYY-MM-DD).
+    Used as the independent expectation for MERGE partition pruning (D2.3).
+    Raises DeltaLogError if the commits do not start at version 0.
+    """
+    if not commits or commits[0][0] != 0:
+        raise DeltaLogError("live files need every commit from version 0 (log was cleaned up)")
+    adds = live_adds(commits)
+    inside = sum(1 for a in adds
+                 if (v := (a.get("partitionValues") or {}).get(column)) is not None
+                 and lo <= v <= hi)
+    return inside, len(adds)
+
+
+def table_id(table: Path | str) -> str | None:
+    """The table's id (`metaData.id`, the Delta source's reservoirId) from the newest
+    commit JSON that has a metaData action; None if no remaining commit has one."""
+    log = _log_dir(table)
+    if not log.is_dir():
+        return None
+    versions = sorted((int(f.name[:20]) for f in log.iterdir() if COMMIT_RE.match(f.name)),
+                      reverse=True)
+    for v in versions:
+        for action in read_commit(table, v):
+            if "metaData" in action:
+                return str(action["metaData"]["id"])
+    return None
+
+
 def txn_actions(commits: list[tuple[int, list[dict[str, Any]]]]) -> list[dict[str, Any]]:
     """The `txn` (SetTransaction) actions in commit order, with their version."""
     return [{"delta_version": v, "appId": a["txn"]["appId"], "version": a["txn"]["version"]}

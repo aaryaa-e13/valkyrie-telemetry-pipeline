@@ -85,7 +85,7 @@ def snapshot_from_status(status: Mapping[str, Any] | None) -> StatusSnapshot | N
 
     Returns None for a missing or structurally unusable status.
     """
-    if not status:
+    if not status or status.get("source", "kafka") != "kafka":
         return None
     try:
         last = status["last_batch"]
@@ -212,6 +212,84 @@ def check_caught_up(
                        f"in partitions {[r.partition for r in pending]}")
     caught_up = fresh and topic in current.end_offsets and not pending
     return CatchUp(caught_up, fresh, tuple(reasons), lag)
+
+
+# --- silver (Delta source) catch-up -----------------------------------------------
+
+
+@dataclass(frozen=True)
+class DeltaSnapshot:
+    """Last committed batch of a query that reads a Delta table (silver)."""
+
+    query_id: str
+    batch_id: int
+    updated_at: datetime | None
+    reservoir_id: str
+    reservoir_version: int
+    index: int
+    is_starting_version: bool
+
+
+def delta_snapshot_from_status(status: Mapping[str, Any] | None) -> DeltaSnapshot | None:
+    """Snapshot of a "delta"-source status file; None if missing or not a Delta source."""
+    if not status or status.get("source") != "delta":
+        return None
+    try:
+        last = status["last_batch"]
+        end = last["end_offset"]
+        return DeltaSnapshot(
+            query_id=str(status["query_id"]), batch_id=int(last["batch_id"]),
+            updated_at=parse_timestamp(status.get("updated_at")),
+            reservoir_id=str(end["reservoir_id"]),
+            reservoir_version=int(end["reservoir_version"]), index=int(end["index"]),
+            is_starting_version=bool(end.get("is_starting_version", False)),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+@dataclass(frozen=True)
+class SilverCatchUp:
+    """Result of one silver catch-up check."""
+
+    caught_up: bool
+    reasons: tuple[str, ...]
+
+
+def check_silver_caught_up(
+    current: DeltaSnapshot | None, bronze_table_id: str | None, bronze_version: int
+) -> SilverCatchUp:
+    """Has silver consumed bronze up to and including `bronze_version`?
+
+    Rule (DECISIONS D2.3, spike Q4): a committed Delta source end offset
+    {reservoir_version: V, index: i, is_starting_version: false} means every
+    bronze version < V is fully consumed. So silver has consumed
+    `bronze_version` iff V > bronze_version. Conservative on purpose: an offset
+    in the middle of that version (V == bronze_version, i >= 0) waits for the
+    next batch. A starting-version offset (silver's first snapshot read, still
+    in progress) never counts. The reservoir id must be the bronze table's id
+    (skipped with a note when the id is unknown after log cleanup).
+    """
+    if current is None:
+        return SilverCatchUp(False, ("silver status file missing, unreadable or not a "
+                                     "Delta-source status",))
+    reasons: list[str] = []
+    ok = True
+    if bronze_table_id is None:
+        reasons.append("bronze table id unknown (log cleaned up); reservoir id not checked")
+    elif current.reservoir_id != bronze_table_id:
+        ok = False
+        reasons.append(f"silver reads table {current.reservoir_id}, bronze is "
+                       f"{bronze_table_id} (bronze recreated?)")
+    if current.is_starting_version:
+        ok = False
+        reasons.append(f"silver is still reading its initial snapshot of bronze version "
+                       f"{current.reservoir_version} (batch {current.batch_id})")
+    elif current.reservoir_version <= bronze_version:
+        ok = False
+        reasons.append(f"silver has consumed bronze versions < {current.reservoir_version} "
+                       f"(batch {current.batch_id}); waiting for version {bronze_version}")
+    return SilverCatchUp(ok, tuple(reasons))
 
 
 # --- container logs -------------------------------------------------------------
