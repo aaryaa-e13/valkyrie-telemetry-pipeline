@@ -24,8 +24,11 @@ simulator --> Kafka topic `game-events` --> Spark Structured Streaming --> raw P
   same `event_id`s. It can send as fast as possible (`backfill`, the default) or at the pace of
   the wall clock (`realtime`), and can send a share of events deliberately late.
 - **Kafka**: one broker in KRaft mode, started with Docker Compose.
-- **Spark job** (`streaming/raw_to_parquet.py`): reads the topic, parses the JSON, and appends
-  every message to Parquet. Messages that do not parse are kept and flagged, not dropped.
+- **Spark job** (`streaming/raw_to_parquet.py` in Phase 1): reads the topic, parses the JSON,
+  and appends every message to Parquet. Messages that do not parse are kept and flagged, not
+  dropped. Since Phase 2 slice 2 the same job is `streaming/bronze.py` and writes an
+  append-only Delta table instead (DECISIONS D2.2); this section describes Phase 1 (tag
+  `phase-1`).
 - **Manifest**: each simulator run writes a JSON file listing the events the broker
   acknowledged. Every check below compares the pipeline's output with this file.
 

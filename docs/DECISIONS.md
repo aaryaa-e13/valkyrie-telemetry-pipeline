@@ -133,6 +133,8 @@ Short decision records: context, decision, tradeoffs. Newest phase last.
   need a compaction story."
 
 ### D1.9 Raw Parquet partitioned by `ingest_date`
+*Phase 2 slice 2: the raw layer is now the bronze Delta table (D2.2). The `ingest_date`
+partitioning and the reasons below are unchanged.*
 - **Why:** In the raw layer, late events always land in today's folder and old folders never
   change. That makes reprocessing ("redo yesterday's arrivals") and compaction simple.
   Partitioning by `event_date` moves to the silver layer.
@@ -154,6 +156,9 @@ Short decision records: context, decision, tradeoffs. Newest phase last.
   (`sim`) each get a profile, so only what is needed runs.
 
 ### D1.12 Raw job details (slice c)
+*Phase 2 slice 2: the job is now `streaming/bronze.py` and writes Delta (D2.2). Parsing,
+`ingest_time`/`ingest_date`, `failOnDataLoss`, `startingOffsets` and the SIGTERM handling below
+are unchanged.*
 - **Connector JARs are baked into the image at build time** (`docker/spark/fetch_kafka_jars.sh`,
   renamed `fetch_jars.sh` in Phase 2; jar set, exclusions and SHA-256 lock: D2.1).
   It resolves `spark-sql-kafka-0-10_2.13:4.1.4`, adds `kafka-clients-3.9.1`, `commons-pool2-2.12.1`
@@ -348,6 +353,8 @@ build images quietly first (`make e2e-images`). Live numbers on this laptop: smo
   after. The file sink only adds files, so there were none before either, and the footer delta
   is exactly the committed delta. Checked once by hand: footers 4677 == Spark 4677. Cost: pyarrow
   26.0.1 added to dev requirements (no transitive deps).
+  *Superseded in Phase 2 slice 2 (D2.2): the footer count is replaced by a Delta-log count, the
+  footer-vs-committed cross-check by log-vs-Spark time travel, and a txn identity check is new.*
 - *Why the rewind test matters:* verify only looks at **this** run's ids. A restart that re-read
   the previous run's last message would still pass verify. Only start == E0, the row count and
   the Parquet delta catch it (shown with a faked evidence file).
@@ -676,3 +683,106 @@ of the fetched jar's classes with Spark's jar (one-off check). 10 skips but 9 pa
 - `availableNow` runs few, small batches: C12 shows the order, it is not a stress test.
 - Deletion vectors (and RoaringBitmap 1.3.0 under Delta's 0.9.25 API), Unity Catalog and Delta
   Kernel code paths were not exercised.
+
+### D2.2 Bronze Delta table replaces raw Parquet (slice 2)
+
+**Decision.** The Phase 1 job becomes `streaming/bronze.py`. It writes Kafka to an
+**append-only Delta table** `data/lake/bronze/game_events`, partitioned by `ingest_date`
+(D1.9), with a new checkpoint `data/checkpoints/bronze` and status file
+`data/status/bronze.json`. `to_raw_rows` is byte-for-byte the Phase 1 code. Bronze still holds
+**one row per Kafka message**, so duplicate events stay visible (D1.14) until silver (slice 3).
+The Phase 1 Parquet, checkpoint and status file are left on disk untouched; tag `phase-1` keeps
+the code. Env: `BRONZE_PATH`, `BRONZE_CHECKPOINT_PATH`, `BRONZE_ALLOW_REBUILD` (the `RAW_*`
+names are gone).
+
+**Table created explicitly, `delta.appendOnly = true`.** At start-up the job creates the table
+if absent (`DeltaTable.createIfNotExists`, schema = `to_raw_rows` output with every column
+nullable) and then checks, on every start, that it is partitioned by `ingest_date` only and is
+append-only. Otherwise it exits 2.
+- Why: bronze is the record of what Kafka delivered. Delta itself now refuses `UPDATE`,
+  `DELETE` and row-removing `MERGE`, and the Delta-log count below can treat a data-changing
+  `remove` as an error.
+- All columns nullable: a DataFrame write would create them nullable too; NOT NULL would only
+  make Phase 5 and replays stricter. R0 and `parse_ok` already cover the key columns.
+- Tested (`tests/spark/test_bronze_table.py`): `DELETE` and `UPDATE` refused; **`OPTIMIZE`
+  works** (its removes are `dataChange=false`); **adding a nullable column works** three ways
+  (`ALTER TABLE ... ADD COLUMNS`, then an append without the column, an append that fills it,
+  and a `mergeSchema` append with another new column). The start-up check accepts the grown
+  table, because it only creates when no table exists.
+- Cost: a deliberate delete (e.g. GDPR) first needs `ALTER TABLE ... SET TBLPROPERTIES
+  (delta.appendOnly = false)`, a visible, logged step.
+
+**Checkpoint-reset guard.** At start-up, if the table has at least one row but the checkpoint
+has no batch (folder missing, or no file in `offsets/`), the job refuses to start: ERROR log
+`start-up refused` and exit 2. `BRONZE_ALLOW_REBUILD=1` overrides it with a WARNING
+(`REBUILD: ...`). The guard runs before the table is created or touched.
+- **Why Delta's `txn` cannot protect this case.** The sink's idempotency (D2.1, C9) is a lookup:
+  "does the table already have `txn(appId = this query's id, version = this batch id)`?" The
+  query id is stored in the checkpoint. A new or emptied checkpoint makes Spark generate a
+  **new query id**, so every old `txn` entry has a different `appId` and nothing matches.
+  Batch 0 of the new query re-reads the topic from `earliest` and Delta appends all of it
+  again. `txn` protects replays *within* one query, not a reset that creates a new one.
+  Afterwards R0 would show it, but by then every message is in bronze twice, and append-only
+  makes the clean-up a deliberate operation.
+- Tested: Spark tests for "fresh" (no table, or an empty table), "resume" (checkpoint has
+  batches), refusal for a missing checkpoint, a checkpoint with only `metadata`, and an empty
+  `offsets/` (table version unchanged each time), `run()` returning 2 without starting a query,
+  and the override. Live (2026-11-19): a one-off container with
+  `BRONZE_CHECKPOINT_PATH=/data/checkpoints/bronze_guard_demo` against the populated table
+  exited 2 with the message above, created no checkpoint folder, and wrote no commit.
+- Not guarded (open): the reverse case, a deleted table with a kept checkpoint. The job would
+  create an empty table and resume at the checkpoint's offsets, so the old rows would simply be
+  gone from bronze. Noted for Phase 4.
+
+**R0: `(kafka_topic, kafka_partition, kafka_offset)` is unique in bronze** (parent plan D6).
+`verify_manifest` reports `duplicate_kafka_offsets` over the whole table, and any value > 0 is
+FAIL (duplicate event ids are only reported, as before). It proves "one row per Kafka message"
+at table level, including across restarts.
+- **Known limit: false positives after a topic is deleted and recreated.** Offsets restart at
+  0, so new messages reuse `(topic, partition, offset)` keys already in bronze and R0 fails
+  although nothing was written twice. Bronze does not store Kafka's topic id. Until it does,
+  recreating the topic means starting a new bronze table.
+- Naming: `e2e/restart.py` uses "R0" for the pre-stop `run_id`. That is unrelated; the docstring
+  says so.
+
+**verify reads Delta at one pinned version.** It takes the newest version first and reads
+everything with `versionAsOf` that version (`table_version` in the report), so all numbers come
+from one snapshot. `--versions V0,V1` adds time-travel row counts. Report keys renamed:
+`total_rows`, `unparsed_rows` (were `parquet_*`). Runs in `spark-tools` with `./data`
+read-only: **reading Delta wrote nothing** (VERIFIED 2026-11-19: `_delta_log` listing unchanged,
+no error on the read-only mount). `--layer` waits for slice 3.
+
+**smoke-restart on Delta (evidence_version 2).** The status-file checks (stop, baseline, first
+batch, no re-read, no skip) are unchanged. Replaced and new:
+
+| Check | How |
+|---|---|
+| delta log rows == run | `common/delta_log.appended_between(V0, V1)`: sum of `add.stats.numRecords` (dataChange=true) in commit JSONs V0+1..V1 == run messages |
+| delta log == spark time travel | Spark `count()` at V1 minus at V0 (verify `--versions`) == the log delta. Catches a bug in our log parser. |
+| txn appId == query id | every commit in (V0, V1] has exactly one `txn`; `appId` == Q0, the query **`id`** (stable, from the checkpoint), not the `runId` (new per start); versions == post-restart batch ids with rows |
+
+- The log reader fails loudly (exit 5, "cannot prove") on a missing commit file, an `add`
+  without `numRecords`, a data-changing `remove` or a deletion vector. It never counts 0.
+- Why the Phase 1 "footers == committed" check is gone: a Parquet file could exist without
+  being committed; a Delta data file counts only if a commit JSON lists it, and we read only
+  commit JSONs.
+- The evidence file prints both ids (`txn_identity`: `query_id`, `run_id_before`,
+  `run_ids_after`, `txn_app_ids`, `txn_versions`).
+- Phase 1 evidence (version 1) is refused by `--check-evidence` with exit 2 and a pointer to tag
+  `phase-1`.
+- `common/delta_log.py` is stdlib only (laptop side, D1.16). `read_commits`, `reconcile` and
+  `txn_actions` moved there from the slice 1 gate (one copy); `make delta-compat` still PASSes
+  with them (2026-11-19, 245.5 s, all 14 checks). `e2e/parquet_count.py` was removed.
+
+**Measured (2026-11-19, laptop, WSL2; single runs, not benchmarks)**
+
+| What | Value |
+|---|---|
+| First start, batch 0 (whole topic) | 7,085 rows, 6 files, trigger 6.65 s |
+| Start-up: "starting" log -> "bronze table ready" | 17.7 s first start (incl. create), 18.4 s on restart (guard + table check, first Delta use in the JVM; split not measured) |
+| `make verify` seed 501 (bronze) | 13/13 ids, 26 rows, 13 duplicates reported, R0 0, PASS, 47 s |
+| `make smoke` | PASS, 13/13, 64.3 s total, catch-up 15.3 s (slice 1, Phase 1 job: 46.2 s) |
+| `make smoke-restart` | PASS, all 9 checks, 93.5 s total, caught up 34.6 s after restart; V0 2 -> V1 3, +12 rows |
+| Spark container memory | 1.09 GiB after batch 0; 1.36 GiB after smoke + restart (limit 3 GiB; Phase 1 measured 626 MiB on tiny data), as `docker stats` reports it; not broken down |
+| Bronze on disk | 1.4 MB for 7,110 rows; checkpoint 84 KB |
+| `make test-spark` | 36 tests, 566 s (the 13 bronze tests are about 4.5 min of it) |
