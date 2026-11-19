@@ -28,8 +28,10 @@ simulator --> Kafka topic `game-events` --> Spark Structured Streaming --> raw P
   and appends every message to Parquet. Messages that do not parse are kept and flagged, not
   dropped. Since Phase 2 slice 2 the same job is `streaming/bronze.py` and writes an
   append-only Delta table instead (DECISIONS D2.2). Since slice 3 a second query in the
-  same process writes **silver**, one row per `event_id` (`streaming/silver.py`, D2.3). This
-  section describes Phase 1 (tag `phase-1`).
+  same process writes **silver**, one row per `event_id` (`streaming/silver.py`, D2.3). Since
+  slice 4 rows older than the event-time watermark (W = 60 s) go to a separate **late**
+  table instead of silver, nothing is dropped, and silver and late never share an id (D2.4).
+  This section describes Phase 1 (tag `phase-1`).
 - **Manifest**: each simulator run writes a JSON file listing the events the broker
   acknowledged. Every check below compares the pipeline's output with this file.
 

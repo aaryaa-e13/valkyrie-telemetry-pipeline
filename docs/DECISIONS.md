@@ -465,6 +465,11 @@ delay_ms = round((lo + u3 * (hi - lo)) * assumed_watermark_s * 1000)
   `very` band. It is a setting, not a side effect.
 - `assumed_watermark_s` = W (default **30**, a placeholder). Phase 2 chooses the real
   watermark; the bands are multiples of W, so one number rescales every delay.
+  **Changed in Phase 2 slice 4:** the default is now **60**, the silver job's
+  `WATERMARK_DELAY_S` (D2.4). Bands at W = 60: slight 6-30 s, very 120-180 s, so `make
+  sim-late` takes up to about 3.5 min. Old manifests keep their recorded 30. A unit test
+  (`tests/unit/test_watermark_defaults_agree.py`) checks that the simulator, job and compose
+  defaults agree; there is no shared code on purpose.
 
 | Band | Delay | `expected` |
 |---|---|---|
@@ -1032,3 +1037,111 @@ session, so bronze and silver both use it. `spark-tools` (verify) keeps Delta's 
 The slowest "after" batch (7.6 s) was the first one after the restart. Silver now has headroom
 at a 10 s trigger. **Caveat for Phase 10:** a lower value means fewer, larger tasks when a big
 table with a long log is rebuilt. Today's logs are under 15 commits. Re-measure at 1-50M rows.
+
+### D2.4 Watermark W = 60 s, late table, snapshot rule (slice 4)
+
+**What it is.** Silver now splits every micro-batch into **on-time** rows (to silver, as in
+D2.3) and **late** rows (to `data/lake/silver/late_events`, Delta, appendOnly, not
+partitioned). Nothing is dropped: a late row is kept, in its own table. Code:
+`streaming/watermark.py` (pure rules), `streaming/silver.py` (`plan_batch`, `write_late`,
+`write_silver`, `control_row`).
+
+**The watermark, per batch N of the silver query with id q:**
+- `m_k` = max over the keyed rows (D9) of batch k of `least(event_time, kafka_timestamp)`;
+  rows without a Kafka time do not count. Stored as `batch_max_clamped_event_time`.
+- `wm(N) = max{m_k : k < N, same q} - W`, or **-infinity** (`watermark_used = NULL`) if
+  there is no `m_k`, **or if batch N starts inside the Delta source's initial snapshot**
+  (`in_initial_snapshot = true`; the snapshot rule below).
+- A keyed row is **late iff `event_time <= wm(N)`** (raw event_time). `wm` only goes up.
+- W = `WATERMARK_DELAY_S`, default 60, recorded in every control row. Start-up refuses a W
+  that differs from the W this query id recorded (not overridable): W can only change with a
+  silver checkpoint reset (new query id). That keeps "same wm on replay" exact.
+
+**Why the clamp.** A row with a future event_time would otherwise push the wm ahead and route
+normal rows to late. The clamp caps it at the producer's Kafka CreateTime. Measured on the live
+bronze (2026-11-19): 5,419 of 7,202 rows have Kafka time < event_time, by up to 3,157 s, all
+sent before Phase 1e2 (burst mode sent events from the future, D1.7c). Every row sent since
+2026-11-15 11:00 has Kafka time >= event_time. So for current runs the clamp triggers only in
+tests; on the live data it matters when silver re-reads those old rows after a reset. `least()`
+skips NULL arguments in Spark 4.1.4 (pinned by a test), which is why a NULL Kafka time is
+excluded explicitly instead of relying on `least`.
+
+**The snapshot rule (found in condition C3, fixed with option A).** Silver reads at most
+`SILVER_MAX_FILES_PER_TRIGGER` bronze files per batch (default 1000, which is Delta's own
+default when nothing is set; now explicit). This also holds for the initial snapshot that a
+new query (checkpoint reset) reads first: a reset re-reads bronze in many batches, not one.
+Without a rule, batch 2 of a re-read would route older history to late. Rule: **no row is late
+while silver re-reads bronze's starting snapshot.** Batch N is a snapshot batch if N == 0 or
+`offsets/N-1` has `isStartingVersion: true`. It is the batch's START, not its end: measured with
+Delta 4.4.1, the batch that reads the last snapshot files ends with `isStartingVersion: false`.
+A missing or unreadable offset, or one without a boolean `isStartingVersion`, is never
+defaulted: start-up refuses (exit 2), and inside a batch the batch fails and the pipeline exits
+2. **Cost, written down:** a truly late row inside a re-read, or a tail row that shares a batch
+with the last snapshot files, stays in silver.
+
+**Write order per batch and why every crash point is safe.** Plan (no writes: snapshot status,
+wm, counts, dedupe, split, check `late + on-time == keyed_unique`), then late, then silver,
+then the control row (txn), then Spark's `commits/N`. On a re-run, batch N gets the same input
+(`offsets/N`), the same snapshot status (`offsets/N-1` never changes), the same wm (control
+rows k < N never change, W is fixed) and so the same split; both data writes are
+insert-if-absent and the control append is skipped by txn. Tested at each crash point: the
+tables and the control row equal a crash-free run on every field except `*_this_attempt`,
+`*_ms` and `processed_at` (the attempt's wall-clock time), with exactly one control row.
+
+**Silver and late stay disjoint.** One class per id inside a batch (dedupe before split). A
+late row whose id is already in silver is not inserted (`late_dup_of_silver`); the silver lookup
+is pruned to the late rows' own dates +- H, so an old late row never widens silver's MERGE
+window. An on-time row whose id is already in late is not inserted (`dup_of_late`; full scan
+of late, which is small). This "check the other table, then insert" is safe because the silver
+query is the only writer of both tables (Phase 3 replay must keep that rule). Horizon limit as
+in D2.3: a silver copy more than H days from its late copy is not seen; verify's R1 reports it.
+
+**Checkpoint reset.** The wm restarts at -infinity and stays there for the whole snapshot.
+Rows already in late stay in late (tables are appendOnly; nothing moves); their on-time copies
+count as `dup_of_late`. Guaranteed after a reset: S ∩ L = ∅, S ∪ L == all keyed bronze ids, no
+id twice. Not guaranteed: the same split as before. A clean re-split needs silver, late,
+control and checkpoint reset together, which deletes data: never automatic.
+
+**One-time upgrade of the live tables (Q1 (a)).** At start-up: missing control columns are
+added with `ALTER TABLE ADD COLUMNS` (works on an appendOnly table, tested) and the late table
+is created; both logged as WARNING `upgrade`. Old control rows have no `m_k`, so the wm stays
+-infinity until the first upgraded batch records one. Refused (exit 2): the late table is
+missing although this query already ran with a watermark ("missing after the upgrade"), or
+any control row has `watermark_delay_s` ("the late table existed and is gone").
+
+**Control columns added:** `in_initial_snapshot`, `watermark_delay_s`, `watermark_used`,
+`batch_max_clamped_event_time`, `clamped_rows`, `late_rows`, `late_dup_of_silver`,
+`late_inserted_this_attempt`, `late_merge_lo/hi`, `late_ms`, `ontime_rows`, `dup_of_late`,
+`wm_read_ms`. `merge_lo/hi` now come from on-time rows only; `merge_skipped` means "no on-time
+row to insert". Late table columns: silver's plus `watermark_used`, `lag_behind_wm_ms`.
+
+**verify (R1-R3 moved into slice 4, Q3).** For the run's ids: R1 S ∩ L = ∅ (also over the
+whole tables), R2 S ∪ L == C, R3 no id twice in silver or in late; whole tables: silver rows +
+late rows == distinct keyed bronze ids. `|L|` is reported, not judged. R4-R6 and the
+W-oracle check are slice 5. smoke, smoke-dupes and smoke-restart check silver ∪ late, because
+back-to-back backfill runs can overlap in event time by more than W (a run spans ~100 s and
+puts its last event at "now"); such routing depends on wall-clock gaps, so no test asserts it.
+
+**Measured live (2026-11-19, after the upgrade; 1-13 row batches; 3 x `make smoke`,
+`make smoke-dupes`, `make smoke-restart`, `make sim-late`).** Baseline = slice 3 follow-up
+(`DELTA_SNAPSHOT_PARTITIONS=4`).
+
+| | Baseline | Slice 4 |
+|---|---|---|
+| silver whole batch (`addBatch`), 11 batches | 4.3-7.6 s (median 5.3) | 6.1-15.6 s (median 8.9, +68 %); 3 of 11 over the 10 s trigger |
+| of which: silver MERGE | 1.9-2.6 s (median 2.4) | 1.3-4.1 s (median 2.5) |
+| of which: wm read (control table) | - | 0.8-2.3 s (median 1.4) |
+| of which: late write (the one batch with late rows) | - | 1.4 s |
+| first silver batch after a restart | 7.6 s | 15.6 s (upgrade start), 11.4 s (smoke-restart) |
+| silver caught up after bronze (orchestrator wait) | 13.9, 11.7, 9.6 s | 22.6, 15.0, 16.2 s (smoke); 13.8 / 14.9 s (dupes); 15.2 s (restart) |
+| Spark container peak (`docker stats`) | 1.53 GiB (slice 3 max 2.05) | 1.94 GiB (smokes + dupes), 2.03 GiB (sim-late); limit for this slice 2.26 |
+| JVM heap peak / GC share | 0.55 GiB / 0.3 % | 0.72-0.74 GiB / 0.25-0.48 % |
+| correctness | PASS x3 | every run PASS on both layers; silver + late == distinct keyed bronze ids each time |
+
+Reading: the late path costs little when there are no late rows, but every batch now pays for
+the wm read (a full read of the small control table, one file per batch) and an extra
+anti-join count against late. The median stays under the 10 s trigger, with little headroom.
+The control table grows by one file per batch, so the wm read will grow too; the planned
+fallback (keep the running max in the driver, re-read once at start-up) is an open decision.
+In smoke-dupes the second send's batch routed 7 rows to late, all already in silver
+(`late_dup_of_silver = 7`, nothing inserted): cross-run overlap, as predicted (plan section 1).

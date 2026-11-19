@@ -280,3 +280,50 @@ Template:
 - **Fix:** the test session sets it to 2 (`tests/spark/conftest.py`). Full suite 62 tests in
   6 min 45 s (was 14 min for 46 tests); the MERGE test 239 s -> 52 s. The job still uses
   the default; see D2.3 for why that matters for silver's batch time.
+
+### "A reset's first batch reads all of bronze" was false: Delta caps a batch at 1000 files (Phase 2 slice 4, my plan)
+- **Symptom:** none in production yet. Found while answering the mentor's condition C3 before
+  any slice 4 code: a Spark test put 1005 one-row files into bronze and ran the real silver
+  query from an empty checkpoint. It printed `batches=[(0, 1000), (1, 5)]`.
+- **Root cause:** silver read bronze with no `maxFilesPerTrigger` / `maxBytesPerTrigger`, and
+  my plan assumed that meant "no limit". Delta then uses a default of 1000 files per batch,
+  also for the initial snapshot. With the watermark, batch 1 of a re-read would have routed
+  older history to late.
+- **Fix (mentor's choice A):** the cap is explicit (`SILVER_MAX_FILES_PER_TRIGGER`, 1000), and
+  `wm = -infinity` for every batch that starts inside the initial snapshot (D2.4). Tests use a
+  cap of 2 and run in seconds.
+- **Lesson:** an unset option is not "unlimited"; check the library's default.
+
+### The last snapshot batch ends with `isStartingVersion: false` (Phase 2 slice 4, found by a probe)
+- **Symptom:** none (found before writing the rule, condition A1). With 5 snapshot files and a
+  cap of 2, `offsets/2` (the END of the batch that read the last snapshot file) was
+  `{"reservoirVersion":2,"index":-1,"isStartingVersion":false}`.
+- **Root cause:** Delta moves the offset past the snapshot as soon as the snapshot is used up.
+  A rule based on the batch's own `offsets/N` would have given that snapshot batch a normal
+  watermark.
+- **Fix:** the rule reads where the batch STARTS, `offsets/N-1` (batch 0 always starts in the
+  snapshot). Tests cover 5 files / cap 2, the snapshot ending mid-batch with a tail file, and
+  ending exactly at a batch boundary.
+
+### Crash-point tests failed on `bronze_ingest_time` (Phase 2 slice 4, my test)
+- **Symptom:** all four `test_any_crash_point_then_replay_equals_a_crash_free_run` cases failed:
+  the tables differed only in `bronze_ingest_time`.
+- **Root cause:** the test built each batch with `to_raw_rows(...)`, which stamps
+  `current_timestamp()` every time the DataFrame is evaluated. The reference run and the
+  crashed run therefore had different "bronze" rows. A real replay re-reads the same bronze
+  rows.
+- **Fix:** the test writes each batch to a small Delta table once and reads it back for every
+  attempt. Then all four crash points matched the crash-free run.
+- **Lesson:** same as slice 3's `.crc` mistake: a simulated replay must replay the same input.
+
+### A new test broke an old one through the shared Spark session (Phase 2 slice 4, my test)
+- **Symptom:** in the full `make test-spark`, `test_stream_dedupes_and_writes_a_control_row_for_every_batch`
+  failed with `SnapshotStatusError: offsets/4 is gone`, an error that only my new test raises.
+  It passed when the silver tests ran alone.
+- **Root cause:** `test_snapshot_status_error_makes_the_pipeline_exit_2` leaves a failed streaming
+  query in the session-wide `spark.streams`. The old test calls `awaitAnyTermination(1)`, which
+  re-raises the exception of any query that terminated with an error since the last
+  `resetTerminated()`.
+- **Fix:** the new test calls `spark.streams.resetTerminated()` in a `finally`.
+- **Lesson:** the Spark test session is shared state; a test that makes a query fail must clean
+  up after itself.
