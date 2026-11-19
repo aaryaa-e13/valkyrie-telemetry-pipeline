@@ -69,7 +69,7 @@ def _cfg(tmp_path: Path, **kw: Any) -> SilverJobConfig:
     return SilverJobConfig(
         bronze_path=str(tmp_path / "bronze"), table_path=str(tmp_path / "silver"),
         control_path=str(tmp_path / "control"), checkpoint_path=str(tmp_path / "cp_silver"),
-        status_path="", **kw)
+        late_path=str(tmp_path / "late"), status_path="", **kw)
 
 
 def _bronze(spark: SparkSession, cfg: SilverJobConfig,
@@ -116,20 +116,24 @@ def _committed_batches(cfg: SilverJobConfig) -> list[int]:
 
 @fast
 def test_batch_counts_per_reason_and_bounds_from_keyed_rows_only(spark: SparkSession) -> None:
-    schema = "parse_ok boolean, event_id string, event_time timestamp"
+    schema = ("parse_ok boolean, event_id string, event_time timestamp, "
+              "kafka_timestamp timestamp")
     late = datetime(2027, 1, 1, tzinfo=UTC)
+    k = T0 + timedelta(seconds=1)
     df = spark.createDataFrame([
-        (True, "a", T0), (True, "a", T0 + timedelta(seconds=64)), (True, "b", T0),
-        (False, None, None),        # unparsed + null id + null time
-        (True, None, late),         # null id only (would widen the bounds if counted)
-        (True, "c", None),          # null time only
-        (None, "d", late),          # parse_ok NULL counts as unparsed
+        (True, "a", T0, k), (True, "a", T0 + timedelta(seconds=64), k), (True, "b", T0, k),
+        (False, None, None, k),     # unparsed + null id + null time
+        (True, None, late, late),   # null id only (would widen the bounds if counted)
+        (True, "c", None, late),    # null time only
+        (None, "d", late, late),    # parse_ok NULL counts as unparsed
     ], schema)
     c = batch_counts(df)
     assert (c.rows_in, c.excluded_unparsed, c.excluded_null_event_id,
             c.excluded_null_event_time, c.excluded_total) == (7, 2, 2, 2, 4)
     assert (c.keyed_rows, c.keyed_unique, c.dup_in_batch) == (3, 2, 1)
     assert c.min_date == c.max_date == date(2026, 11, 19)
+    # m_N from keyed rows only, clamped to Kafka time: the +64 s copy counts as k.
+    assert c.clamped_max_us == int(k.timestamp()) * 1_000_000 and c.clamped_rows == 1
 
 
 @fast
@@ -165,9 +169,10 @@ def test_process_batch_inserts_once_and_replay_writes_nothing(spark: SparkSessio
 
 
 @fast
-def test_cross_batch_duplicate_is_not_inserted_again(spark: SparkSession,
-                                                     tmp_path: Path) -> None:
+def test_cross_batch_duplicate_is_not_inserted_again(spark: SparkSession, tmp_path: Path,
+                                                     tail_offsets: Any) -> None:
     cfg = _ready(spark, tmp_path)
+    tail_offsets(cfg.checkpoint_path, 1)
     process_batch(_bronze_rows(spark, [(8, "e-1", T0)]), 0, cfg, "q-1")
     later = _bronze_rows(spark, [(14, "e-1", T0 + timedelta(seconds=64)), (15, "e-2", T0)])
     assert process_batch(later, 1, cfg, "q-1")["inserted_this_attempt"] == 1
@@ -199,13 +204,13 @@ def test_zero_row_batch_writes_control_row(spark: SparkSession, tmp_path: Path) 
 @fast
 def test_missing_bound_with_keyed_rows_fails_the_batch(spark: SparkSession, tmp_path: Path,
                                                        monkeypatch: pytest.MonkeyPatch) -> None:
-    """If min/max were ever None despite keyed rows, the batch fails and writes nothing."""
+    """If a bound were ever None despite on-time rows, the batch fails and writes nothing."""
     from streaming import silver
 
     cfg = _ready(spark, tmp_path)
-    real = silver.batch_counts
-    monkeypatch.setattr(silver, "batch_counts",
-                        lambda df: replace(real(df), min_date=None))
+    real = silver.split_counts
+    monkeypatch.setattr(silver, "split_counts",
+                        lambda rows: replace(real(rows), ontime_min_date=None))
     vs, vc = current_version(cfg.table_path), current_version(cfg.control_path)
     with pytest.raises(MergeBoundsError, match="NULL bound"):
         process_batch(_bronze_rows(spark, [(1, "e-1", T0)]), 0, cfg, "q-1")
@@ -227,19 +232,26 @@ def test_null_bound_hazard_really_duplicates(spark: SparkSession, tmp_path: Path
 
 @fast
 def test_restamped_duplicate_beyond_horizon_is_inserted_twice(spark: SparkSession,
-                                                              tmp_path: Path) -> None:
+                                                              tmp_path: Path,
+                                                              tail_offsets: Any) -> None:
     """Documented limit (parent plan D2): copies more than H days apart both land."""
     cfg = _ready(spark, tmp_path, dedupe_horizon_days=0)
+    tail_offsets(cfg.checkpoint_path, 1)
     process_batch(_bronze_rows(spark, [(1, "e-1", T0)]), 0, cfg, "q-1")
     process_batch(_bronze_rows(spark, [(2, "e-1", T0 + timedelta(days=1))]), 1, cfg, "q-1")
     assert _silver(spark, cfg).where("event_id = 'e-1'").count() == 2
 
 
 @fast
-def test_merge_prunes_target_partitions(spark: SparkSession, tmp_path: Path) -> None:
+def test_merge_prunes_target_partitions(spark: SparkSession, tmp_path: Path,
+                                       tail_offsets: Any) -> None:
     """Pruning evidence (D2.3): Spark's scan metrics of the MERGE read exactly the
-    files the Delta log says are in [lo, hi], and fewer than all files."""
-    cfg = _ready(spark, tmp_path, dedupe_horizon_days=0)
+    files the Delta log says are in [lo, hi], and fewer than all files.
+
+    W is 30 days here so nothing is late: this test is about silver's MERGE only.
+    """
+    cfg = _ready(spark, tmp_path, dedupe_horizon_days=0, watermark_delay_s=30 * 86400)
+    tail_offsets(cfg.checkpoint_path, 11)
     base = datetime(2026, 11, 1, 12, tzinfo=UTC)
     for d in range(10):                     # 10 event_date partitions, 1 file each
         process_batch(_bronze_rows(spark, [(d, f"old-{d}", base + timedelta(days=d))]),
@@ -417,8 +429,8 @@ def test_verify_silver_passes_then_catches_duplicates_and_missing(spark: SparkSe
     _run(spark, cfg)
 
     def check(ids: list[str]) -> tuple[bool, list[str], dict[str, Any]]:
-        rep = verify_silver(spark, _manifest(tmp_path, ids), cfg.table_path, cfg.control_path,
-                            cfg.checkpoint_path, cfg.bronze_path, 7)
+        rep = verify_silver(spark, _manifest(tmp_path, ids), cfg.table_path, cfg.late_path,
+                            cfg.control_path, cfg.checkpoint_path, cfg.bronze_path, 7)
         failed, notes = evaluate_silver(rep)
         return failed, notes, rep
 
@@ -428,9 +440,10 @@ def test_verify_silver_passes_then_catches_duplicates_and_missing(spark: SparkSe
     assert cons["checkable"] and cons["rows_checkable"]
     assert (cons["bronze_rows"], cons["bronze_keyed_distinct_ids"], cons["silver_rows_upto_batch"],
             cons["bronze_keyless_rows"], cons["control_excluded_total"]) == (7, 3, 3, 1, 1)
+    assert (cons["late_rows_upto_batch"], rep["late_found_ids"], rep["in_both_ids"]) == (0, 0, 0)
 
     failed, notes, _ = check(["s-1", "s-404"])
-    assert failed and any("missing in silver" in n for n in notes)
+    assert failed and any("R2" in n and "neither silver nor late" in n for n in notes)
 
     # A second copy of s-1 sneaks into silver (appendOnly allows appends).
     _silver(spark, cfg).where("event_id = 's-1'").write.format("delta").mode("append") \
@@ -446,6 +459,6 @@ def test_verify_silver_reports_missing_table(spark: SparkSession, tmp_path: Path
     from streaming.verify_manifest import evaluate_silver, verify_silver
 
     cfg = _cfg(tmp_path)
-    rep = verify_silver(spark, _manifest(tmp_path, ["a"]), cfg.table_path, cfg.control_path,
-                        cfg.checkpoint_path, cfg.bronze_path, 7)
+    rep = verify_silver(spark, _manifest(tmp_path, ["a"]), cfg.table_path, cfg.late_path,
+                        cfg.control_path, cfg.checkpoint_path, cfg.bronze_path, 7)
     assert evaluate_silver(rep) == (True, [f"silver table {cfg.table_path} does not exist"])

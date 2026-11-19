@@ -13,7 +13,9 @@ silently falls behind. Kafka's 7-day retention is the buffer: after a fix,
 bronze resumes from its checkpoint and nothing is lost if the outage is shorter.
 
 Exit codes: 0 stopped cleanly (SIGTERM/SIGINT), 1 a query failed or could not
-start, 2 start-up refused by a guard or table check.
+start, 2 start-up refused by a guard or table check, or a silver batch refused
+because the checkpoint cannot say whether it re-reads bronze's snapshot
+(SnapshotStatusError, D2.4 A2: never defaulted).
 
 Run (inside the Spark container):
     python -m streaming.pipeline
@@ -48,6 +50,9 @@ from streaming.spark_session import build_spark
 from streaming.start_guard import BronzeStartupError
 
 log = logging.getLogger("streaming.pipeline")
+# SnapshotStatusError puts its class name first in its message; Spark wraps the
+# Python exception in a StreamingQueryException whose text contains it.
+SNAPSHOT_STATUS_MARKER = "SnapshotStatusError: "
 
 
 def _stop_all(queries: list[StreamingQuery]) -> None:
@@ -69,6 +74,8 @@ def run(bcfg: BronzeJobConfig, scfg: SilverJobConfig, master: str, driver_memory
         "topic": bcfg.topic, "bronze_path": bcfg.table_path, "silver_path": scfg.table_path,
         "control_path": scfg.control_path, "trigger": bcfg.trigger_interval,
         "dedupe_horizon_days": scfg.dedupe_horizon_days,
+        "watermark_delay_s": scfg.watermark_delay_s, "late_path": scfg.late_path,
+        "silver_max_files_per_trigger": scfg.max_files_per_trigger,
         "delta_snapshot_partitions": snapshot_partitions or "default (50)",
         "bronze_allow_rebuild": bcfg.allow_rebuild,
         "silver_allow_rebuild": scfg.allow_rebuild}})
@@ -113,7 +120,8 @@ def supervise(queries: list[StreamingQuery], should_stop: Callable[[], bool],
               poll_s: float = 2.0) -> int:
     """Block until a stop request or until any query stops; then stop all queries.
 
-    Returns 0 after a requested stop, 1 if a query failed or stopped on its own.
+    Returns 0 after a requested stop, 1 if a query failed or stopped on its own,
+    2 (EXIT_REFUSED) if a query failed with SnapshotStatusError (D2.4, A2).
     This is the D2.3 failure policy: one failing query stops the other.
     """
     while all(q.isActive for q in queries) and not should_stop():
@@ -129,6 +137,8 @@ def supervise(queries: list[StreamingQuery], should_stop: Callable[[], bool],
                   "stopping the pipeline", extra={"fields": {
                       "stopped": [q.name for q in queries if not q.isActive]}})
     _stop_all(queries)
+    if any(SNAPSHOT_STATUS_MARKER in str(q.exception()) for q in failed):
+        return EXIT_REFUSED
     return 1 if failed or not requested else 0
 
 

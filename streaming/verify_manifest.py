@@ -25,16 +25,19 @@ report), so every number comes from the same snapshot. Only committed data is
 visible. `--versions V0,V1` also reports the row count at those versions (time
 travel), used by smoke-restart to cross-check its Delta-log count.
 
-Silver (--layer silver|all, slice 3, DECISIONS D2.3). Always FAIL:
-    missing ids            the run's ids must all be in silver (no late table yet)
-    duplicate rows         an id of the run in more than one silver row
-    R3 duplicate_event_ids any event_id twice in the whole silver table
-    R7 null_key_rows       a silver row with NULL event_id or event_time
-    ids_not_in_bronze      silver ids that bronze does not have
-and, pinned to what silver has consumed (its newest committed batch C ended at
-bronze version V, so it has read bronze versions < V):
-    silver rows (excluding batches > C of the current query) == distinct keyed
-        event_ids of bronze@V-1    (only if no id's copies are > H days apart)
+Silver + late (--layer silver|all; DECISIONS D2.3, D2.4). With C = the run's ids,
+S = silver ids from C, L = late ids from C. Always FAIL:
+    R1 in_both_ids          S ∩ L must be empty (and no id in both tables at all)
+    R2 missing_ids          S ∪ L must be C (nothing lost)
+    R3 duplicate rows       an id of the run twice in silver or twice in late;
+                            any event_id twice in the whole silver or late table
+    R7 null_key_rows        a silver or late row with NULL event_id or event_time
+    ids_not_in_bronze       silver/late ids that bronze does not have
+|L| (late_found_ids) is reported, not judged: R4-R6 come in slice 5.
+Pinned to what silver has consumed (its newest committed batch C ended at bronze
+version V, so it has read bronze versions < V):
+    silver rows + late rows (excluding batches > C of the current query) ==
+        distinct keyed event_ids of bronze@V-1  (only if no id's copies are > H days apart)
     sum(control excluded_total) == keyless rows of bronze@V-1
     control batch ids of the current query == 0..C (one row per batch)
 These print "not checkable" (never "pass") when the preconditions do not hold.
@@ -76,6 +79,7 @@ log = logging.getLogger("streaming.verify_manifest")
 DEFAULT_TABLE = "/data/lake/bronze/game_events"
 DEFAULT_SILVER = "/data/lake/silver/game_events"
 DEFAULT_CONTROL = "/data/lake/_control/silver_batches"
+DEFAULT_LATE = "/data/lake/silver/late_events"
 DEFAULT_SILVER_CHECKPOINT = "/data/checkpoints/silver"
 OFFSET_KEY = ("kafka_topic", "kafka_partition", "kafka_offset")
 LAYERS = ("bronze", "silver", "all")
@@ -189,55 +193,87 @@ def _keyed(df: Any) -> Any:
                     & F.col("event_time").isNotNull())
 
 
-def verify_silver(spark: SparkSession, manifest_path: Path, silver_path: str, control_path: str,
-                  checkpoint_path: str, bronze_path: str, horizon_days: int) -> dict[str, Any]:
-    """Silver section of the report (see module docstring). Read-only."""
+def _null_key(df: Any) -> Any:
+    return F.coalesce(F.sum(F.when(F.col("event_id").isNull() | F.col("event_time").isNull(), 1)
+                            .otherwise(0)), F.lit(0))
+
+
+def _table_stats(df: Any) -> dict[str, int]:
+    t = df.agg(F.count("*").alias("total"), F.count_distinct("event_id").alias("ids"),
+               _null_key(df).alias("null_key")).first()
+    return {"total": int(t["total"]), "duplicate_event_ids":
+            int(t["total"]) - int(t["null_key"]) - int(t["ids"]), "null_key": int(t["null_key"])}
+
+
+def verify_silver(spark: SparkSession, manifest_path: Path, silver_path: str, late_path: str,
+                  control_path: str, checkpoint_path: str, bronze_path: str,
+                  horizon_days: int) -> dict[str, Any]:
+    """Silver + late section of the report (see module docstring). Read-only."""
     from delta.tables import DeltaTable
 
     from streaming.start_guard import committed_source_offset, read_checkpoint_state
 
-    rep: dict[str, Any] = {"table_path": silver_path}
+    rep: dict[str, Any] = {"table_path": silver_path, "late_path": late_path}
     if not DeltaTable.isDeltaTable(spark, silver_path):
         rep["table_missing"] = True
         return rep
+    if not DeltaTable.isDeltaTable(spark, late_path):
+        rep["late_table_missing"] = True
+        return rep
     manifest = load_manifest(manifest_path)
-    expected = spark.createDataFrame([(e,) for _, e in manifest.event_pairs], "event_id string")
+    expected = spark.createDataFrame([(e,) for _, e in manifest.event_pairs],
+                                     "event_id string").distinct()
+    # Two tables are two snapshots, not one transaction (D5): a batch committing in
+    # between can be half visible. e2e calls verify after silver caught up, when no
+    # batch with rows is in flight. R1 cannot be faked by this: the job keeps the
+    # tables disjoint at every commit. Bronze is read last, so it holds all they read.
+    lv = latest_version(spark, late_path)
+    late = spark.read.format("delta").option("versionAsOf", lv).load(late_path)
     sv = latest_version(spark, silver_path)
     silver = spark.read.format("delta").option("versionAsOf", sv).load(silver_path)
     bronze = spark.read.format("delta").option(
-        "versionAsOf", latest_version(spark, bronze_path)).load(bronze_path)  # read after silver
+        "versionAsOf", latest_version(spark, bronze_path)).load(bronze_path)
 
-    per_id = silver.join(expected.distinct(), "event_id").groupBy("event_id").count()
-    st = per_id.agg(F.count("*").alias("found"),
-                    F.coalesce(F.sum("count"), F.lit(0)).alias("rows")).first()
-    expected_unique = expected.distinct().count()
-    t = silver.agg(F.count("*").alias("total"),
-                   F.count_distinct("event_id").alias("ids"),
-                   F.coalesce(F.sum(F.when(F.col("event_id").isNull()
-                                           | F.col("event_time").isNull(), 1)
-                                    .otherwise(0)), F.lit(0)).alias("null_key")).first()
-    non_null_ids = int(t["total"]) - int(t["null_key"])
+    def per_run(df: Any) -> tuple[Any, int, int]:
+        per_id = df.join(expected, "event_id").groupBy("event_id").count()
+        st = per_id.agg(F.count("*").alias("found"),
+                        F.coalesce(F.sum("count"), F.lit(0)).alias("rows")).first()
+        return per_id.select("event_id"), int(st["found"]), int(st["rows"]) - int(st["found"])
+
+    s_ids, s_found, s_dupes = per_run(silver)
+    l_ids, l_found, l_dupes = per_run(late)
+    union = s_ids.union(l_ids).distinct()
+    expected_unique = expected.count()
+    found = union.count()
+    s_tab, l_tab = _table_stats(silver), _table_stats(late)
     rep.update({
-        "table_version": sv,
+        "table_version": sv, "late_table_version": lv,
         "expected_unique_ids": expected_unique,
-        "found_unique_ids": int(st["found"]),
-        "missing_ids": expected_unique - int(st["found"]),
+        "found_unique_ids": found,                       # |S ∪ L|
+        "silver_found_ids": s_found, "late_found_ids": l_found,   # |S|, |L|
+        "missing_ids": expected_unique - found,          # R2
         "missing_examples": [r.event_id for r in
-                             expected.join(per_id, "event_id", "left_anti").limit(20).collect()],
-        "duplicate_rows": int(st["rows"]) - int(st["found"]),
-        "total_rows": int(t["total"]),
-        "duplicate_event_ids": non_null_ids - int(t["ids"]),
-        "null_key_rows": int(t["null_key"]),
-        "ids_not_in_bronze": silver.select("event_id").join(
+                             expected.join(union, "event_id", "left_anti").limit(20).collect()],
+        "in_both_ids": s_ids.join(l_ids, "event_id").count(),     # R1 (this run)
+        "duplicate_rows": s_dupes + l_dupes,             # R3 (this run)
+        "total_rows": s_tab["total"], "late_total_rows": l_tab["total"],
+        "duplicate_event_ids": s_tab["duplicate_event_ids"],       # R3 (whole silver)
+        "late_duplicate_event_ids": l_tab["duplicate_event_ids"],  # R3 (whole late)
+        "ids_in_both_tables": silver.select("event_id").join(      # R1 (whole tables)
+            late.select("event_id"), "event_id").distinct().count(),
+        "null_key_rows": s_tab["null_key"] + l_tab["null_key"],     # R7
+        "ids_not_in_bronze": silver.select("event_id").union(late.select("event_id")).join(
             bronze.select("event_id"), "event_id", "left_anti").distinct().count(),
     })
-    # Which send's copy did silver keep? (smoke-dupes: must be this manifest's send.)
+    # Which send's copy was kept? (smoke-dupes: must be this manifest's send.)
     if manifest.kafka_offsets and manifest.topic:
         in_send = reduce(lambda x, y: x | y, [
             (F.col("kafka_partition") == part) & F.col("kafka_offset").between(r.min, r.max)
             for part, r in manifest.kafka_offsets.items()])
-        rep["rows_from_this_send"] = silver.join(expected.distinct(), "event_id").where(
-            (F.col("kafka_topic") == manifest.topic) & in_send).count()
+        cols = ["event_id", "kafka_topic", "kafka_partition", "kafka_offset"]
+        rep["rows_from_this_send"] = silver.select(*cols).union(late.select(*cols)).join(
+            expected, "event_id").where((F.col("kafka_topic") == manifest.topic) & in_send
+                                        ).count()
 
     # --- consistency, pinned to what silver has consumed --------------------------
     cons: dict[str, Any] = {"checkable": False}
@@ -269,15 +305,15 @@ def verify_silver(spark: SparkSession, manifest_path: Path, silver_path: str, co
                       F.coalesce(F.min("batch_id"), F.lit(-1)).alias("lo"),
                       F.coalesce(F.max("batch_id"), F.lit(-1)).alias("hi"),
                       F.coalesce(F.sum("excluded_total"), F.lit(0)).alias("excl")).first()
-    silver_upto = silver.where(~((F.col("silver_query_id") == qid)
-                                 & (F.col("silver_batch_id") > c))).count()
+    upto = ~((F.col("silver_query_id") == qid) & (F.col("silver_batch_id") > c))
+    silver_upto, late_upto = silver.where(upto).count(), late.where(upto).count()
     cons.update(
         checkable=True,
         bronze_rows=b.count(),
         bronze_keyed_distinct_ids=keyed.select("event_id").distinct().count(),
         bronze_keyless_rows=b.count() - keyed.count(),
         max_copy_spread_days=int(spread), horizon_days=horizon_days,
-        silver_rows_upto_batch=silver_upto,
+        silver_rows_upto_batch=silver_upto, late_rows_upto_batch=late_upto,
         control_rows=int(ctl["n"]), control_distinct_batches=int(ctl["ids"]),
         control_batch_range=[int(ctl["lo"]), int(ctl["hi"])],
         control_excluded_total=int(ctl["excl"]),
@@ -290,14 +326,19 @@ def evaluate_silver(rep: dict[str, Any]) -> tuple[bool, list[str]]:
     """(failed, notes) for the silver section."""
     if rep.get("table_missing"):
         return True, [f"silver table {rep['table_path']} does not exist"]
+    if rep.get("late_table_missing"):
+        return True, [f"late table {rep['late_path']} does not exist"]
     notes: list[str] = []
     failed = False
     for key, text in (
-        ("missing_ids", "event ids of the run are missing in silver"),
-        ("duplicate_rows", "extra silver rows for the run's ids (silver must be unique)"),
+        ("missing_ids", "R2: event ids of the run are in neither silver nor late"),
+        ("in_both_ids", "R1: event ids of the run are in both silver and late"),
+        ("ids_in_both_tables", "R1: event ids are in both the silver and the late table"),
+        ("duplicate_rows", "R3: extra silver/late rows for the run's ids"),
         ("duplicate_event_ids", "R3: extra rows share an event_id in silver"),
-        ("null_key_rows", "R7: silver rows with a NULL event_id or event_time"),
-        ("ids_not_in_bronze", "silver event_ids that bronze does not have"),
+        ("late_duplicate_event_ids", "R3: extra rows share an event_id in late"),
+        ("null_key_rows", "R7: silver/late rows with a NULL event_id or event_time"),
+        ("ids_not_in_bronze", "silver/late event_ids that bronze does not have"),
     ):
         if rep[key] > 0:
             failed = True
@@ -320,10 +361,12 @@ def evaluate_silver(rep: dict[str, Any]) -> tuple[bool, list[str]]:
         notes.append(f"silver rows vs bronze ids not checkable: copies up to "
                      f"{cons['max_copy_spread_days']} days apart > horizon "
                      f"{cons['horizon_days']} (both copies are kept by design)")
-    elif cons["silver_rows_upto_batch"] != cons["bronze_keyed_distinct_ids"]:
+    elif (cons["silver_rows_upto_batch"] + cons["late_rows_upto_batch"]
+          != cons["bronze_keyed_distinct_ids"]):
         failed = True
-        notes.append(f"silver rows {cons['silver_rows_upto_batch']} != distinct keyed "
-                     f"bronze ids {cons['bronze_keyed_distinct_ids']} (bronze versions < "
+        notes.append(f"silver rows {cons['silver_rows_upto_batch']} + late rows "
+                     f"{cons['late_rows_upto_batch']} != distinct keyed bronze ids "
+                     f"{cons['bronze_keyed_distinct_ids']} (bronze versions < "
                      f"{cons['bronze_versions_consumed_below']})")
     return failed, notes
 
@@ -346,6 +389,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--table-path", default=DEFAULT_TABLE, help="bronze table")
     p.add_argument("--silver-path", default=DEFAULT_SILVER)
     p.add_argument("--control-path", default=DEFAULT_CONTROL)
+    p.add_argument("--late-path", default=DEFAULT_LATE)
     p.add_argument("--silver-checkpoint", default=DEFAULT_SILVER_CHECKPOINT)
     p.add_argument("--dedupe-horizon-days", type=int,
                    default=int(os.environ.get("DEDUPE_HORIZON_DAYS", "7")))
@@ -370,8 +414,8 @@ def main(argv: list[str] | None = None) -> int:
     silver: dict[str, Any] | None = None
     try:
         if args.layer in ("silver", "all"):  # silver first: bronze is read after it
-            silver = verify_silver(spark, args.manifest, args.silver_path, args.control_path,
-                                   args.silver_checkpoint, args.table_path,
+            silver = verify_silver(spark, args.manifest, args.silver_path, args.late_path,
+                                   args.control_path, args.silver_checkpoint, args.table_path,
                                    args.dedupe_horizon_days)
         if args.layer in ("bronze", "all"):
             report = verify(spark, args.manifest, args.table_path, args.versions)

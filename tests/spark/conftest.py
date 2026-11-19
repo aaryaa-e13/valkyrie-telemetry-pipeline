@@ -42,3 +42,27 @@ def spark() -> Iterator[SparkSession]:
     session.sparkContext.setLogLevel("ERROR")
     yield session
     session.stop()
+
+
+TAIL_OFFSET = ('{"sourceVersion":1,"reservoirId":"test","reservoirVersion":%d,"index":-1,'
+               '"isStartingVersion":false}')
+
+
+@pytest.fixture
+def tail_offsets():  # noqa: ANN201 (returns a helper function)
+    """Write offsets/0..n-1 as TAIL offsets (isStartingVersion false) into a checkpoint.
+
+    Tests that call process_batch directly for batch N > 0 need offsets/N-1: the
+    batch reads its snapshot status there (D2.4, A1). Real shape, Delta 4.4.1.
+    """
+    from pathlib import Path
+
+    def write(checkpoint_path: str, n: int) -> None:
+        d = Path(checkpoint_path) / "offsets"
+        d.mkdir(parents=True, exist_ok=True)
+        for k in range(n):
+            (d / str(k)).write_text(
+                'v1\n{"batchWatermarkMs":0,"batchTimestampMs":0,"conf":{}}\n'
+                + TAIL_OFFSET % (k + 1), encoding="utf-8")
+
+    return write
