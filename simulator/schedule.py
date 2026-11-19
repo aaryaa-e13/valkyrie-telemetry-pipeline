@@ -63,14 +63,14 @@ class LatenessConfig:
     Attributes:
         late_fraction: Share of events that are sent late (0 = feature off).
         too_late_share: Share of the late events that fall in the "very" band.
-        assumed_watermark_s: The Phase 2 watermark we assume, in seconds. It is a
-            placeholder: the bands are multiples of it, so changing this one
-            number rescales every delay.
+        assumed_watermark_s: The silver job's watermark W in seconds (default 60,
+            WATERMARK_DELAY_S, DECISIONS D2.4). The bands are multiples of it, so
+            changing this one number rescales every delay.
     """
 
     late_fraction: float = 0.0
     too_late_share: float = 0.2
-    assumed_watermark_s: float = 30.0
+    assumed_watermark_s: float = 60.0
 
     def __post_init__(self) -> None:
         errors: list[str] = []

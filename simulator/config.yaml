@@ -32,7 +32,7 @@ time_scale: 1.0              # 10 = game time runs ten times faster (gaps divide
 # --- Deliberate lateness: a late event keeps its event_time but is sent later. ---
 late_fraction: 0.0           # share of events sent late (0 = off)
 late_too_late_share: 0.2     # of the late events, the share that is VERY late
-assumed_watermark_s: 30      # placeholder for the Phase 2 watermark W.
+assumed_watermark_s: 60      # = the silver job's WATERMARK_DELAY_S (D2.4).
                              # slightly late = 0.1-0.5 x W, very late = 2-3 x W
 
 # --- Output ---

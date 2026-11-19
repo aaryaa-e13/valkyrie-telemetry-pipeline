@@ -197,7 +197,7 @@ def test_v3_pacing_defaults_and_missing_stats() -> None:
     m, _ = _manifest()                      # no plan, no stats: an old-style caller
     assert m["pacing"]["mode"] == "backfill"
     assert m["pacing"]["time_scale"] == 1.0
-    assert m["pacing"]["assumed_watermark_s"] == 30.0
+    assert m["pacing"]["assumed_watermark_s"] == 60.0
     assert m["pacing"]["measured"] == {"sent": None, "future_events": None,
                                        "max_ahead_ms": None, "max_behind_ms": None}
     assert m["late_counts"] == {"slight": 0, "very": 0}

@@ -78,6 +78,7 @@ class SilverJobConfig:
     bronze_path: str = "/data/lake/bronze/game_events"
     table_path: str = "/data/lake/silver/game_events"
     control_path: str = "/data/lake/_control/silver_batches"
+    late_path: str = "/data/lake/silver/late_events"
     checkpoint_path: str = "/data/checkpoints/silver"
     status_path: str = "/data/status/silver.json"  # "" disables the status file
     trigger_interval: str = "10 seconds"
@@ -86,6 +87,14 @@ class SilverJobConfig:
     # re-stamped duplicate more than H days from its first copy is inserted
     # twice, by design (parent plan D2); verify reports when that can happen.
     dedupe_horizon_days: int = 7
+    # Event-time watermark W in seconds (DECISIONS D2.4): a keyed row is late iff
+    # event_time <= max(clamped event_time of earlier batches of this query) - W.
+    # Fixed per query id: start-up refuses a W that differs from the recorded one.
+    watermark_delay_s: int = 60
+    # Bronze files per silver micro-batch. 1000 is Delta's own default when no
+    # limit is set; it is written down here so the cap is explicit (slice 4, C3)
+    # and tests can use a small one. It also caps the initial snapshot.
+    max_files_per_trigger: int = 1000
     # Start although the silver checkpoint and silver/control tables disagree
     # (streaming/silver.py, DECISIONS D2.3). A reset silver checkpoint alone
     # needs no override: rebuilding silver from bronze is idempotent.
@@ -94,9 +103,14 @@ class SilverJobConfig:
     def __post_init__(self) -> None:
         if self.dedupe_horizon_days < 0:
             raise ValueError("dedupe_horizon_days must be >= 0")
-        paths = {self.bronze_path, self.table_path, self.control_path, self.checkpoint_path}
-        if "" in paths or len(paths) != 4:
-            raise ValueError("bronze, silver, control and checkpoint paths must be set "
+        if isinstance(self.watermark_delay_s, bool) or self.watermark_delay_s < 1:
+            raise ValueError("watermark_delay_s must be an integer >= 1")
+        if self.max_files_per_trigger < 1:
+            raise ValueError("max_files_per_trigger must be >= 1")
+        paths = {self.bronze_path, self.table_path, self.control_path, self.checkpoint_path,
+                 self.late_path}
+        if "" in paths or len(paths) != 5:
+            raise ValueError("bronze, silver, late, control and checkpoint paths must be set "
                              "and distinct")
 
     @classmethod
@@ -113,11 +127,15 @@ class SilverJobConfig:
             bronze_path=get("BRONZE_PATH", d.bronze_path),
             table_path=get("SILVER_PATH", d.table_path),
             control_path=get("SILVER_CONTROL_PATH", d.control_path),
+            late_path=get("SILVER_LATE_PATH", d.late_path),
             checkpoint_path=get("SILVER_CHECKPOINT_PATH", d.checkpoint_path),
             status_path=env.get("SILVER_STATUS_PATH", d.status_path),
             trigger_interval=get("TRIGGER_INTERVAL", d.trigger_interval),
             query_name=get("SILVER_QUERY_NAME", d.query_name),
             dedupe_horizon_days=int(get("DEDUPE_HORIZON_DAYS", str(d.dedupe_horizon_days))),
+            watermark_delay_s=int(get("WATERMARK_DELAY_S", str(d.watermark_delay_s))),
+            max_files_per_trigger=int(get("SILVER_MAX_FILES_PER_TRIGGER",
+                                          str(d.max_files_per_trigger))),
             allow_rebuild=get("SILVER_ALLOW_REBUILD", "0").lower() in _TRUE,
         )
 

@@ -84,7 +84,7 @@ sim-realtime: dirs ## Realtime pace: tiny run, game time 10x faster, ~15 s (fres
 	$(PY) -m simulator.main --config simulator/config.tiny.yaml --seed $(FRESH_SEED) \
 		--pace realtime --time-scale 10
 
-sim-late: dirs ## Realtime pace with 30% deliberately late events, up to ~2 min (fresh seed unless SEED=)
+sim-late: dirs ## Realtime pace, 30% deliberately late events (very late = 120-180 s), ~3.5 min (fresh seed unless SEED=)
 	$(PY) -m simulator.main --config simulator/config.tiny.yaml --seed $(FRESH_SEED) \
 		--pace realtime --time-scale 10 --late-fraction 0.3
 

@@ -368,7 +368,9 @@ def start_silver_query(spark: SparkSession, cfg: SilverJobConfig,
                        trigger: dict[str, Any] | None = None) -> StreamingQuery:
     """Start the streaming read of bronze with process_batch as the sink."""
     Path(cfg.checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
-    writer = (spark.readStream.format("delta").load(cfg.bronze_path)
+    writer = (spark.readStream.format("delta")
+              .option("maxFilesPerTrigger", cfg.max_files_per_trigger)
+              .load(cfg.bronze_path)
               .writeStream.queryName(cfg.query_name)
               .option("checkpointLocation", cfg.checkpoint_path)
               .foreachBatch(BatchProcessor(cfg)))

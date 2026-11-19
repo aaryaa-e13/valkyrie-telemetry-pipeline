@@ -79,7 +79,7 @@ def _band_definition(
 
 def _pacing_section(config: Mapping[str, Any], stats: SendStats | None) -> dict[str, Any]:
     """The `pacing` block: settings as used, band definitions, measurements."""
-    watermark_s = float(config.get("assumed_watermark_s", 30.0))
+    watermark_s = float(config.get("assumed_watermark_s", 60.0))
     return {
         "mode": config.get("pace", "backfill"),
         "time_scale": float(config.get("time_scale", 1.0)),
