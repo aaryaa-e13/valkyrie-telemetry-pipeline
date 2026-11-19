@@ -953,7 +953,7 @@ preconditions do not hold it says "not checkable", never "pass".
 |---|---|
 | First start (silver reads all of bronze, 10 files, in batch 0) | 7,110 rows in, 1 keyless excluded, 51 duplicates dropped, **7,058 inserted** (= distinct keyed ids, spike Q5) |
 | Seed 501 | bronze 26 rows (13 duplicates reported), **silver 13 rows**, all 13 the lower offset / earlier `event_time`; verify `--layer all` PASS |
-| `make smoke` | PASS 14/14 both layers, 92.8 s; silver 7.3 s after bronze |
+| `make smoke` | PASS 14/14 both layers, 92.8 s; silver caught up 17.3 s after bronze (corrected in the follow-up; first written as 7.3 s) |
 | `make smoke-dupes` | PASS: 12 ids, bronze 24 rows, silver 12 rows all from the first send; the second copies came in a later silver batch (inserted 0), so the cross-batch MERGE did the work |
 | `make smoke-restart` (evidence v3) | PASS, all 11 checks; silver resumed at bronze version 7 and added exactly the run's 13 ids |
 | MERGE duration per batch (trigger 10 s) | batch 0: 4.6 s (7,110 rows); batches 1-4 (12-14 rows): 3.5-5.0 s |
@@ -1024,7 +1024,7 @@ session, so bronze and silver both use it. `spark-tools` (verify) keeps Delta's 
 | silver whole batch (`addBatch`) | 7.5-9.6 s (median 8.7) | 4.3-7.6 s (median 5.3, -39 %) |
 | silver trigger (10 s interval) | 7.6-9.9 s | 4.4-7.8 s |
 | bronze `addBatch` | 4.0-4.2 s | 2.9-5.1 s (3 batches; no clear change) |
-| silver caught up after bronze | 7.3 s (smoke) | 8.6, 1.1, -0.1 s (smoke 1-3) |
+| silver caught up after bronze (orchestrator wait, starts when bronze has the run) | 17.3 s (smoke), 14.2 / 13.1 s (smoke-dupes), 12.1 s (restart) | 13.9, 11.7, 9.6 s (smoke 1-3) |
 | Spark container peak (`docker stats`) | 2.05 GiB (slice 3 max) | 1.53 GiB |
 | JVM heap peak / GC share | 0.83 GiB / 0.3 % | 0.55 GiB / 0.3 % |
 | correctness | PASS | PASS x3, both layers; silver rows == distinct keyed bronze ids each time |
