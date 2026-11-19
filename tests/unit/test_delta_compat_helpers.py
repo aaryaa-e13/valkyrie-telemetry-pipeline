@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from common.delta_log import read_commits, reconcile, txn_actions
 from streaming.delta_compat_check import (
     CLASS_LIST_MARK,
     STOCK_DUP_BASELINE,
@@ -18,12 +19,9 @@ from streaming.delta_compat_check import (
     overall,
     own_coordinate,
     parse_entries,
-    read_commits,
-    reconcile,
     same_artifact_twice,
     scan_log,
     stock_drift,
-    txn_actions,
 )
 
 # --- file-name rule (shared with fetch_jars.sh) --------------------------------------

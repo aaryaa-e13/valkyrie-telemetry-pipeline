@@ -10,20 +10,23 @@ pyspark = pytest.importorskip("pyspark")  # skip cleanly outside the Spark image
 
 from pyspark.sql import SparkSession  # noqa: E402
 
+from streaming.spark_session import DELTA_CONF  # noqa: E402
+
 
 @pytest.fixture(scope="session")
 def spark() -> Iterator[SparkSession]:
     """One small local SparkSession for the whole test session (JVM start is slow).
 
     Delta's SQL extension and catalog are static settings (they cannot be added
-    once the session exists), so they are set here for every Spark test. The
-    Delta jars are baked into the image (DECISIONS D2.1).
+    once the session exists), so they are set here for every Spark test, from
+    the same DELTA_CONF the job uses. The Delta jars are baked into the image
+    (DECISIONS D2.1).
     """
+    builder = SparkSession.builder.master("local[1]").appName("valkyrie-tests")
+    for key, value in DELTA_CONF.items():
+        builder = builder.config(key, value)
     session = (
-        SparkSession.builder.master("local[1]").appName("valkyrie-tests")
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config("spark.sql.catalog.spark_catalog",
-                "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+        builder
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.shuffle.partitions", "1")
         .config("spark.ui.enabled", "false")

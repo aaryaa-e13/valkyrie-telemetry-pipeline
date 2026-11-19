@@ -72,4 +72,4 @@ RUN useradd --uid 1000 --create-home appuser
 USER appuser
 ENV PYTHONPATH=/app
 
-CMD ["python", "-m", "streaming.raw_to_parquet"]
+CMD ["python", "-m", "streaming.bronze"]

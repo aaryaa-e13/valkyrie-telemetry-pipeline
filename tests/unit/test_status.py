@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from streaming.config import RawJobConfig
+from streaming.config import BronzeJobConfig
 from streaming.status import (
     HISTORY_LIMIT,
     STATUS_VERSION,
@@ -143,6 +143,6 @@ def test_missing_status_reads_as_none(tmp_path: Path) -> None:
 # --- config --------------------------------------------------------------------------
 
 def test_status_path_default_and_explicit_disable() -> None:
-    assert RawJobConfig.from_env({}).status_path == "/data/status/raw_to_parquet.json"
-    assert RawJobConfig.from_env({"STATUS_PATH": ""}).status_path == ""
-    assert RawJobConfig.from_env({"STATUS_PATH": "/x/s.json"}).status_path == "/x/s.json"
+    assert BronzeJobConfig.from_env({}).status_path == "/data/status/bronze.json"
+    assert BronzeJobConfig.from_env({"STATUS_PATH": ""}).status_path == ""
+    assert BronzeJobConfig.from_env({"STATUS_PATH": "/x/s.json"}).status_path == "/x/s.json"

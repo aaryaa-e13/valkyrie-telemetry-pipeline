@@ -1,4 +1,4 @@
-"""Status file for the raw streaming job (standard library only).
+"""Status file for the bronze streaming job (standard library only).
 
 After every completed micro-batch the job's progress listener rewrites a small
 JSON file (atomically) describing the last committed batch and a short batch
@@ -6,9 +6,9 @@ history. Test tooling polls this file to decide whether Spark has processed a
 given run, instead of parsing Spark's internal checkpoint format.
 
 Why this is a safe "batch is committed" signal (verified for Spark 4.1.4, see
-docs/DECISIONS.md D1.15): Spark writes the sink commit (_spark_metadata/N),
-then the checkpoint commit (commits/N), and only then posts the progress event
-that triggers this write.
+docs/DECISIONS.md D1.15 and D2.1 C12): Spark writes the sink commit (a Delta
+commit; `_spark_metadata/N` in Phase 1), then the checkpoint commit
+(commits/N), and only then posts the progress event that triggers this write.
 
 Offsets follow Kafka/Spark semantics: a batch's `end_offset` for a partition is
 EXCLUSIVE, i.e. the next offset to read. Offset N has been processed iff
@@ -17,7 +17,7 @@ committed end_offset > N.
 File format (status_version 1):
 {
   "status_version": 1,
-  "query_name": "raw_to_parquet",
+  "query_name": "bronze",
   "query_id": "...",            # stable across restarts (stored in the checkpoint)
   "updated_at": "...Z",
   "last_batch": {batch record},

@@ -1,4 +1,4 @@
-"""Tests for streaming.raw_to_parquet.to_raw_rows (runs in the Spark container).
+"""Tests for streaming.bronze.to_raw_rows (runs in the Spark container).
 
 Run with: make test-spark
 """
@@ -15,7 +15,7 @@ pyspark = pytest.importorskip("pyspark")  # skip cleanly outside the Spark image
 from pyspark.sql import DataFrame, SparkSession  # noqa: E402
 
 from simulator.events import EventType, GameEvent  # noqa: E402
-from streaming.raw_to_parquet import to_raw_rows  # noqa: E402
+from streaming.bronze import to_raw_rows  # noqa: E402
 from streaming.schemas import EVENT_JSON_SCHEMA  # noqa: E402
 
 KAFKA_SCHEMA = (

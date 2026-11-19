@@ -64,6 +64,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+# Log readers moved to common/ in slice 2 (one copy, also used by e2e; D2.2).
+from common.delta_log import read_commits, reconcile, txn_actions
+
 log = logging.getLogger("streaming.delta_compat_check")
 
 # --- expected stack -------------------------------------------------------------
@@ -123,7 +126,6 @@ SKIP_EPOCH_RE = re.compile(r"Skipping already complete epoch", re.IGNORECASE)
 CLASS_LIST_MARK = "[C2 class list] "
 
 _ARTIFACT_RE = re.compile(r"-[0-9][^-]*(-[^-]+)?\.jar$")
-_COMMIT_RE = re.compile(r"^\d{20}\.json$")
 
 
 # --- results ------------------------------------------------------------------
@@ -291,59 +293,6 @@ def jackson_problems(jackson_jars: dict[str, str]) -> list[str]:
         if version != expected:
             problems.append(f"{jar}: version {version}, expected {expected}")
     return problems
-
-
-def read_commits(table: Path) -> list[tuple[int, list[dict[str, Any]]]]:
-    """All JSON commits of a Delta table as (version, actions), oldest first."""
-    out = []
-    for f in sorted((table / "_delta_log").iterdir()):
-        if _COMMIT_RE.match(f.name):
-            actions = [json.loads(line) for line in f.read_text().splitlines() if line.strip()]
-            out.append((int(f.name[:20]), actions))
-    return out
-
-
-def _dv_key(action: dict[str, Any]) -> str:
-    dv = action.get("deletionVector") or {}
-    return f"{dv.get('storageType', '')}{dv.get('pathOrInlineDv', '')}{dv.get('offset', '')}"
-
-
-def reconcile(commits: list[tuple[int, list[dict[str, Any]]]]) -> dict[str, Any]:
-    """Replay add/remove actions; sum live numRecords minus deletion vectors.
-
-    A file is identified by (path, deletion vector), because Delta re-adds the
-    same path with a new deletion vector when rows are deleted from it.
-    """
-    live: dict[tuple[str, str], dict[str, Any]] = {}
-    removes = 0
-    for _, actions in commits:
-        for action in actions:
-            if "add" in action:
-                add = action["add"]
-                live[(add["path"], _dv_key(add))] = add
-            elif "remove" in action:
-                rem = action["remove"]
-                removes += 1
-                live.pop((rem["path"], _dv_key(rem)), None)
-    records = 0
-    missing_stats = 0
-    dv_files = 0
-    for add in live.values():
-        stats = json.loads(add["stats"]) if add.get("stats") else {}
-        if "numRecords" not in stats:
-            missing_stats += 1
-            continue
-        dv = add.get("deletionVector")
-        dv_files += 1 if dv else 0
-        records += int(stats["numRecords"]) - int((dv or {}).get("cardinality", 0))
-    return {"live_files": len(live), "removes": removes, "records": records,
-            "files_without_numRecords": missing_stats, "files_with_deletion_vector": dv_files}
-
-
-def txn_actions(commits: list[tuple[int, list[dict[str, Any]]]]) -> list[dict[str, Any]]:
-    """The `txn` (SetTransaction) actions in commit order, with their version."""
-    return [{"delta_version": v, "appId": a["txn"]["appId"], "version": a["txn"]["version"]}
-            for v, actions in commits for a in actions if "txn" in a]
 
 
 def scan_log(lines: Iterable[str], max_examples: int = 20) -> dict[str, Any]:
