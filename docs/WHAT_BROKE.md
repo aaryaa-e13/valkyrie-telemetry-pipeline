@@ -191,6 +191,8 @@ Template:
   "written twice", compare the Kafka offsets of the runs. And a shell glob in a command is only
   safe while exactly one file matches.
 
+## Phase 2
+
 ### Delta brought two jars that duplicate Spark's classes (Phase 2 slice 1)
 - **Symptom:** The first Delta build passed, and the planned C2 check (no artifact in two
   versions, by file name) would have passed too. But the build log added
@@ -255,6 +257,9 @@ Template:
   was written.
 - **Lesson:** "The latest history entry" means "the latest commit", not "my operation". This
   matters for slice 3, which will read per-batch MERGE metrics.
+- *Updated in slice 7:* slice 3 takes the inserted-row count from the MERGE's own result row
+  (`num_inserted_rows`, `streaming/silver.py:574` and `:616`), not from `history()`, so this
+  trap does not apply there.
 
 ### Deleting `commits/N` without its `.crc` made Spark report "concurrent queries" (Phase 2 slice 3, my test)
 - **Symptom:** `test_silver_guard_refusals_and_crash_state` failed with `[STREAM_FAILED] ...
@@ -280,6 +285,8 @@ Template:
 - **Fix:** the test session sets it to 2 (`tests/spark/conftest.py`). Full suite 62 tests in
   6 min 45 s (was 14 min for 46 tests); the MERGE test 239 s -> 52 s. The job still uses
   the default; see D2.3 for why that matters for silver's batch time.
+- *Updated in slice 7:* since the slice 3 follow-up the job uses 4 too
+  (`DELTA_SNAPSHOT_PARTITIONS`, D2.3).
 
 ### "A reset's first batch reads all of bronze" was false: Delta caps a batch at 1000 files (Phase 2 slice 4, my plan)
 - **Symptom:** none in production yet. Found while answering the mentor's condition C3 before
@@ -346,4 +353,25 @@ Template:
   looked green.
 - **Root cause:** `pytest ... | tail` returns `tail`'s exit code, so `&& git commit` ran anyway.
 - **Fix:** `96c4adf` fixed the test; command chains now start with `set -o pipefail`.
+- **Lesson:** in a shell pipeline the exit code is the last command's unless `pipefail` is
+  set. Read the test result line itself before committing.
+
+### A fresh clone failed `make test-unit`: pyarrow imported but not pinned (Phase 2 slice 7, my mistake in slice 6)
+- **Symptom:** the slice 7 fresh-clone check (`git clone` into an empty folder, `make venv`,
+  `make lint`, `make test-unit`) stopped at collection: `ModuleNotFoundError: No module named
+  'pyarrow'` in `tests/unit/test_faults_check.py`. Lint and the other 503 unit tests passed.
+  In my working copy all 519 passed.
+- **Root cause:** slice 2 dropped `pyarrow==26.0.1` from `requirements/dev.txt`, because
+  nothing imported it then (D2.2). Slice 6 added `e2e/faults_check.py`, which reads Parquet
+  files with pyarrow, and its unit test, but did not add the pin back. My `.venv` still had
+  pyarrow from before: removing a line from a requirements file does not uninstall anything.
+- **Fix:** `pyarrow==26.0.1` is pinned again (it has no dependencies of its own). A scan of
+  every third-party import in tracked `.py` files, per environment (laptop venv, simulator
+  image, Spark image), found no other missing pin. Its other hits are `pyspark`/`delta`
+  imports inside functions that only run in the Spark image. The Spark image's pip gate still
+  passes (`requirements/spark.txt` unchanged). A new clone then passed lint and all 519 unit
+  tests, and the tests left `git status` clean.
+- **Lesson:** a long-lived venv hides a missing pin; only a fresh environment shows it.
+  **For Phase 10:** CI starts from a fresh checkout every time, so running `make venv lint
+  test-unit` there would have caught this on the commit that introduced it.
 
