@@ -103,7 +103,7 @@ lint: ## Run ruff
 spark-build: dirs ## Build the Spark image (pyspark 4.1.4 + Kafka connector + Delta)
 	$(COMPOSE) --profile spark build spark
 
-spark-up: dirs ## Start the streaming job Kafka -> bronze Delta (background)
+spark-up: dirs ## Start the streaming job Kafka -> bronze -> silver + late Delta (background)
 	$(COMPOSE) --profile spark up -d spark
 
 spark-stop: ## Stop the streaming job gracefully (checkpoint keeps its position)
@@ -171,13 +171,13 @@ smoke: dirs up e2e-images ## Quick end-to-end check (tiny run), one JSON SUMMARY
 smoke-dupes: dirs up e2e-images ## Same seed sent twice: bronze 2 rows/id, silver 1 (first send)
 	$(PY) -m e2e.smoke_dupes $(E2E_ARGS)
 
-smoke-restart: dirs up e2e-images ## Graceful stop/restart: no re-read, no skip (~1-2 min)
+smoke-restart: dirs up e2e-images ## Graceful stop/restart: no re-read, no skip (~3 min)
 	$(PY) -m e2e.smoke_restart $(E2E_ARGS)
 
-smoke-late: dirs up e2e-images ## Realtime run with late events, judged by R1-R6 (~6-8 min)
+smoke-late: dirs up e2e-images ## Realtime run with late events, judged by R1-R6 (~7-9 min)
 	$(PY) -m e2e.smoke_late $(E2E_ARGS)
 
-smoke-faults: dirs up e2e-images ## SIGKILL silver at each write boundary + bronze, restart, judge (~30 min)
+smoke-faults: dirs up e2e-images ## SIGKILL silver at each write boundary + bronze, restart, judge (~45 min; one point ~10)
 	$(PY) -m e2e.smoke_faults $(E2E_ARGS)
 
 faults-config-check: ## Default compose config must not mention the fault hooks: prints 0

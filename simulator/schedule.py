@@ -225,7 +225,7 @@ def build_schedule(
 
     Returns:
         Planned sends sorted by (send_at, event_time, match_id, match_seq).
-        Every input event appears exactly once.
+        Every input event appears once: none dropped, none repeated.
     """
     drafts: list[tuple[datetime, GameEvent, int, str | None]] = []
     for e in events:

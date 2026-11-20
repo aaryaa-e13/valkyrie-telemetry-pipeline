@@ -8,7 +8,7 @@ Steps:
        not the in-batch dedupe.
     3. verify against the FIRST manifest (ground truth), bronze duplicates allowed:
          bronze:        every id exactly twice
-         silver ∪ late: every id exactly once (R1-R3), and every kept row is a
+         silver ∪ late: one copy of every id (R1-R3), and every kept row is a
                         copy from the first send's offsets (rows_from_this_send
                         == ids). Some first copies can be in late when the two
                         sends' timelines overlap by more than W (plan section 1);
