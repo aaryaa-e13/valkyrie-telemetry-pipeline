@@ -25,5 +25,6 @@ def test_simulator_job_and_compose_defaults_are_all_60() -> None:
         "LatenessConfig": LatenessConfig().assumed_watermark_s,
         "config.yaml": load_config("simulator/config.yaml", env={}).assumed_watermark_s,
         "config.tiny.yaml": load_config("simulator/config.tiny.yaml", env={}).assumed_watermark_s,
+        "config.late.yaml": load_config("simulator/config.late.yaml", env={}).assumed_watermark_s,
     }
     assert set(values.values()) == {60}, values
