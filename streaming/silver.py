@@ -11,9 +11,13 @@ SILVER_MAX_FILES_PER_TRIGGER files per batch) and, per micro-batch
        this query's control rows k < N) - W. One small control-table read.
     3. key check (D9): parse_ok AND event_id IS NOT NULL AND event_time IS NOT NULL.
        Rows without a usable key are excluded and counted per reason.
-    4. in-batch dedupe: per event_id keep the lowest (kafka_topic, kafka_partition,
-       kafka_offset), then the split: late iff event_time <= wm(N). One class per id.
-       late + on-time must equal keyed_unique, or the batch fails before any write.
+       in-batch dedupe: per event_id keep the keyed row with the lowest
+       (kafka_topic, kafka_partition, kafka_offset); split: late iff
+       event_time <= wm(N). Both are flag columns on the persisted batch.
+    4. ONE aggregation over the flagged batch: the control counts, m_N, and the
+       late/on-time counts and date bounds. late + on-time must equal keyed_unique,
+       or the batch fails before any write. wm(N) (step 2) is read before this and
+       uses only rows k < N; m_N from this step feeds wm(N+1), never wm(N).
   writes, in this order:
     5. late: late rows minus ids already in silver (silver pruned to the late rows'
        own dates +- H), then insert-if-absent MERGE on event_id into late.
@@ -48,7 +52,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
-from pyspark.sql import Column, DataFrame, SparkSession, Window
+from pyspark.sql import Column, DataFrame, Row, SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.streaming import StreamingQuery
 from pyspark.sql.types import (
@@ -87,6 +91,7 @@ LINEAGE_COLUMNS = ("kafka_key", "kafka_topic", "kafka_partition", "kafka_offset"
 MERGE_VIEW = "valkyrie_silver_batch"
 LATE_VIEW = "valkyrie_late_batch"
 LATE_FLAG = "_is_late"
+KEEP_FLAG = "_keep"     # the one row per event_id a batch keeps (dedupe)
 
 CONTROL_SCHEMA = StructType([
     StructField("silver_query_id", StringType(), True),
@@ -173,29 +178,69 @@ def clamped_event_time() -> Column:
     return F.when(key_ok() & kts.isNotNull(), F.least(F.col("event_time"), kts))
 
 
-def batch_counts(df: DataFrame) -> BatchCounts:
-    """Counts for the control row, plus m_N for the watermark (keyed rows only).
+def _count_if(cond: Column) -> Column:
+    return F.coalesce(F.sum(F.when(cond, 1).otherwise(0)), F.lit(0))
 
-    A row can hit several exclusion reasons; excluded_total counts it once.
+
+def first_copy() -> Column:
+    """True for the row a batch keeps per event_id: keyed, lowest (topic, partition, offset).
+
+    The window is partitioned by (event_id, key_ok), so a non-keyed row (for example
+    a copy with a NULL event_time) never takes rank 1 from a keyed copy of the same id.
+    Ties cannot happen: R0 (one bronze row per Kafka topic/partition/offset, checked by
+    verify) makes ORDER_KEY unique, so row_number has exactly one answer, on every
+    attempt of the batch.
     """
-    k = key_ok()
-    one = lambda cond: F.coalesce(F.sum(F.when(cond, 1).otherwise(0)), F.lit(0))  # noqa: E731
-    keyed_date = F.when(k, F.to_date("event_time"))
+    w = Window.partitionBy(F.col("event_id"), key_ok()).orderBy(*ORDER_KEY)
+    return key_ok() & (F.row_number().over(w) == 1)
+
+
+def flag_rows(df: DataFrame, wm_us: int | None) -> DataFrame:
+    """The batch with KEEP_FLAG (dedupe) and LATE_FLAG (split), without raw_value. Lazy."""
+    return (df.drop("raw_value").withColumn(KEEP_FLAG, first_copy())
+            .withColumn(LATE_FLAG, is_late(wm_us)))
+
+
+def batch_aggregate(flagged: DataFrame) -> Row:
+    """The ONE aggregation of a batch (one Spark action): control counts and the split.
+
+    Batch counts run over all rows (exclusions) or all keyed rows (keyed_unique,
+    dates, m_N), exactly as before the T1 change. Split counts run over KEEP_FLAG rows.
+    keyed_unique (count_distinct) and deduped (sum of KEEP_FLAG) are two separate
+    formulas, so check_split still catches a broken dedupe.
+    """
+    k, keep = key_ok(), F.col(KEEP_FLAG)
+    late, ontime = keep & F.col(LATE_FLAG), keep & ~F.col(LATE_FLAG)
+    d = F.to_date("event_time")
+    keyed_date = F.when(k, d)
     kts = F.col("kafka_timestamp")
-    r = df.agg(
+    r = flagged.agg(
         F.count(F.lit(1)).alias("rows_in"),
-        one(~F.coalesce(F.col("parse_ok"), F.lit(False))).alias("unparsed"),
-        one(F.col("event_id").isNull()).alias("null_id"),
-        one(F.col("event_time").isNull()).alias("null_time"),
-        one(~k).alias("excluded"),
-        one(k).alias("keyed"),
+        _count_if(~F.coalesce(F.col("parse_ok"), F.lit(False))).alias("unparsed"),
+        _count_if(F.col("event_id").isNull()).alias("null_id"),
+        _count_if(F.col("event_time").isNull()).alias("null_time"),
+        _count_if(~k).alias("excluded"),
+        _count_if(k).alias("keyed"),
         F.count_distinct(F.when(k, F.col("event_id"))).alias("keyed_unique"),
         F.min(keyed_date).alias("min_date"),
         F.max(keyed_date).alias("max_date"),
         F.max(F.unix_micros(clamped_event_time())).alias("clamped_max_us"),
-        one(k & kts.isNotNull() & (kts < F.col("event_time"))).alias("clamped"),
+        _count_if(k & kts.isNotNull() & (kts < F.col("event_time"))).alias("clamped"),
+        _count_if(keep).alias("deduped"),
+        _count_if(late).alias("late"),
+        _count_if(ontime).alias("ontime"),
+        F.min(F.when(late, d)).alias("llo"), F.max(F.when(late, d)).alias("lhi"),
+        F.min(F.when(ontime, d)).alias("olo"), F.max(F.when(ontime, d)).alias("ohi"),
     ).first()
     assert r is not None  # an aggregate without grouping always returns one row
+    return r
+
+
+def batch_counts(r: Row) -> BatchCounts:
+    """Counts for the control row, plus m_N for the watermark, from batch_aggregate's row.
+
+    A row can hit several exclusion reasons; excluded_total counts it once.
+    """
     cmax = r["clamped_max_us"]
     return BatchCounts(int(r["rows_in"]), int(r["unparsed"]), int(r["null_id"]),
                        int(r["null_time"]), int(r["excluded"]), int(r["keyed"]),
@@ -205,14 +250,15 @@ def batch_counts(df: DataFrame) -> BatchCounts:
 
 def dedupe_in_batch(df: DataFrame) -> DataFrame:
     """Keyed rows only, one per event_id: the lowest (topic, partition, offset)."""
-    w = Window.partitionBy("event_id").orderBy(*ORDER_KEY)
-    return (df.where(key_ok()).withColumn("_rn", F.row_number().over(w))
-            .where(F.col("_rn") == 1).drop("_rn"))
+    return df.withColumn(KEEP_FLAG, first_copy()).where(F.col(KEEP_FLAG)).drop(KEEP_FLAG)
 
 
 def to_silver_rows(df: DataFrame, query_id: str, batch_id: int,
-                   inserted_at: datetime) -> DataFrame:
-    """Project bronze rows to the silver columns (no raw_value, no parse_ok: Q5)."""
+                   inserted_at: datetime, keep: tuple[str, ...] = ()) -> DataFrame:
+    """Project bronze rows to the silver columns (no raw_value, no parse_ok: Q5).
+
+    `keep`: extra columns appended at the end (plan_batch keeps LATE_FLAG).
+    """
     return df.select(
         *EVENT_COLUMNS,
         F.to_date("event_time").alias(PARTITION_COLUMN),
@@ -221,6 +267,7 @@ def to_silver_rows(df: DataFrame, query_id: str, batch_id: int,
         F.lit(query_id).alias("silver_query_id"),
         F.lit(batch_id).cast("long").alias("silver_batch_id"),
         F.lit(inserted_at).cast("timestamp").alias("silver_inserted_at"),
+        *keep,
     )
 
 
@@ -245,7 +292,7 @@ def is_late(wm_us: int | None) -> Column:
 
 @dataclass(frozen=True)
 class SplitCounts:
-    """One aggregation over the deduped, flagged rows of a batch."""
+    """The split part of batch_aggregate: KEEP_FLAG rows, per class."""
 
     deduped: int
     late: int
@@ -256,16 +303,9 @@ class SplitCounts:
     ontime_max_date: date | None
 
 
-def split_counts(rows: DataFrame) -> SplitCounts:
-    """Counts and date bounds per class (rows carry the LATE_FLAG column)."""
-    late, d = F.col(LATE_FLAG), F.col(PARTITION_COLUMN)
-    one = lambda cond: F.coalesce(F.sum(F.when(cond, 1).otherwise(0)), F.lit(0))  # noqa: E731
-    r = rows.agg(F.count(F.lit(1)).alias("n"), one(late).alias("late"), one(~late).alias("ontime"),
-                 F.min(F.when(late, d)).alias("llo"), F.max(F.when(late, d)).alias("lhi"),
-                 F.min(F.when(~late, d)).alias("olo"), F.max(F.when(~late, d)).alias("ohi"),
-                 ).first()
-    assert r is not None
-    return SplitCounts(int(r["n"]), int(r["late"]), int(r["ontime"]), r["llo"], r["lhi"],
+def split_counts(r: Row) -> SplitCounts:
+    """Counts and date bounds per class, from batch_aggregate's row (no Spark action)."""
+    return SplitCounts(int(r["deduped"]), int(r["late"]), int(r["ontime"]), r["llo"], r["lhi"],
                        r["olo"], r["ohi"])
 
 
@@ -478,7 +518,8 @@ class BatchProcessor:
 
 @dataclass
 class BatchPlan:
-    """Steps 1-4 of a batch (no writes). `rows` is persisted; call release()."""
+    """Steps 1-4 of a batch (no writes). `rows` reads the persisted `flagged`;
+    call release()."""
 
     batch_id: int
     query_id: str
@@ -488,10 +529,11 @@ class BatchPlan:
     wm_read_ms: int
     counts: BatchCounts
     split: SplitCounts
-    rows: DataFrame          # deduped silver-shaped rows + LATE_FLAG
+    rows: DataFrame          # deduped silver-shaped rows + LATE_FLAG (from `flagged`)
+    flagged: DataFrame       # the persisted flagged batch (flag_rows)
 
     def release(self) -> None:
-        self.rows.unpersist()
+        self.flagged.unpersist()
 
 
 def prior_max_us(spark: SparkSession, control_path: str, query_id: str,
@@ -505,7 +547,12 @@ def prior_max_us(spark: SparkSession, control_path: str, query_id: str,
 
 def plan_batch(df: DataFrame, batch_id: int, cfg: SilverJobConfig, query_id: str,
                started: datetime) -> BatchPlan:
-    """Snapshot status, wm(N), counts, dedupe and split; fails before any write.
+    """Snapshot status, wm(N), then dedupe, split and all counts in ONE aggregation.
+
+    Order matters for replay: wm(N) is read first and uses only control rows k < N,
+    offsets/N-1 and W, none of which batch N changes. The aggregation is a pure
+    function of (the batch's rows, wm(N)), so every attempt gets the same split.
+    Fails before any write.
 
     Raises:
         SnapshotStatusError: offsets/N-1 cannot say whether N is a snapshot batch.
@@ -517,17 +564,18 @@ def plan_batch(df: DataFrame, batch_id: int, cfg: SilverJobConfig, query_id: str
     prior = None if in_snapshot else prior_max_us(spark, cfg.control_path, query_id, batch_id)
     wm_read_ms = int((time.monotonic() - t0) * 1000)
     wm = watermark_us(prior, cfg.watermark_delay_s, in_snapshot)
-    counts = batch_counts(df)
-    rows = (to_silver_rows(dedupe_in_batch(df), query_id, batch_id, started)
-            .withColumn(LATE_FLAG, is_late(wm)).persist())
+    flagged = flag_rows(df, wm).persist()
     try:
-        split = split_counts(rows)
+        r = batch_aggregate(flagged)
+        counts, split = batch_counts(r), split_counts(r)
         check_split(counts.keyed_unique, split.deduped, split.late, split.ontime)
     except BaseException:
-        rows.unpersist()
+        flagged.unpersist()
         raise
+    rows = to_silver_rows(flagged.where(F.col(KEEP_FLAG)), query_id, batch_id, started,
+                          keep=(LATE_FLAG,))
     return BatchPlan(int(batch_id), query_id, started, in_snapshot, wm, wm_read_ms, counts,
-                     split, rows)
+                     split, rows, flagged)
 
 
 @dataclass(frozen=True)

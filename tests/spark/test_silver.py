@@ -27,12 +27,15 @@ from streaming.config import SilverJobConfig  # noqa: E402
 from streaming.progress import ProgressLogger  # noqa: E402
 from streaming.silver import (  # noqa: E402
     SilverStartupError,
+    batch_aggregate,
     batch_counts,
     check_silver_guard,
     dedupe_in_batch,
     ensure_silver_tables,
+    flag_rows,
     prepare_silver,
     process_batch,
+    split_counts,
     start_silver_query,
 )
 from streaming.silver_merge import MergeBoundsError  # noqa: E402
@@ -114,26 +117,63 @@ def _committed_batches(cfg: SilverJobConfig) -> list[int]:
 
 # --- pure parts (fast) ------------------------------------------------------------------
 
+# The dedupe window sorts by (kafka_topic, kafka_partition, kafka_offset), so the
+# aggregate tests carry those columns too (distinct offsets: R0).
+AGG_SCHEMA = ("parse_ok boolean, event_id string, event_time timestamp, "
+              "kafka_timestamp timestamp, kafka_topic string, kafka_partition int, "
+              "kafka_offset long")
+
+
+def _agg_rows(spark: SparkSession, rows: list[tuple[Any, ...]]) -> DataFrame:
+    """rows: (parse_ok, event_id, event_time, kafka_timestamp); offset = position."""
+    return spark.createDataFrame([(*r, "game-events", 0, i) for i, r in enumerate(rows)],
+                                 AGG_SCHEMA)
+
+
 @fast
 def test_batch_counts_per_reason_and_bounds_from_keyed_rows_only(spark: SparkSession) -> None:
-    schema = ("parse_ok boolean, event_id string, event_time timestamp, "
-              "kafka_timestamp timestamp")
     late = datetime(2027, 1, 1, tzinfo=UTC)
     k = T0 + timedelta(seconds=1)
-    df = spark.createDataFrame([
+    df = _agg_rows(spark, [
         (True, "a", T0, k), (True, "a", T0 + timedelta(seconds=64), k), (True, "b", T0, k),
         (False, None, None, k),     # unparsed + null id + null time
         (True, None, late, late),   # null id only (would widen the bounds if counted)
         (True, "c", None, late),    # null time only
         (None, "d", late, late),    # parse_ok NULL counts as unparsed
-    ], schema)
-    c = batch_counts(df)
+    ])
+    r = batch_aggregate(flag_rows(df, None))
+    c = batch_counts(r)
     assert (c.rows_in, c.excluded_unparsed, c.excluded_null_event_id,
             c.excluded_null_event_time, c.excluded_total) == (7, 2, 2, 2, 4)
     assert (c.keyed_rows, c.keyed_unique, c.dup_in_batch) == (3, 2, 1)
     assert c.min_date == c.max_date == date(2026, 11, 19)
     # m_N from keyed rows only, clamped to Kafka time: the +64 s copy counts as k.
     assert c.clamped_max_us == int(k.timestamp()) * 1_000_000 and c.clamped_rows == 1
+    # The split comes from the same aggregation, over the kept rows only.
+    s = split_counts(r)
+    assert (s.deduped, s.late, s.ontime) == (c.keyed_unique, 0, 2)
+
+
+@fast
+def test_non_keyed_copy_with_lower_offset_does_not_hide_the_keyed_copy(
+        spark: SparkSession) -> None:
+    """Same event_id twice: offset 0 has a NULL event_time (not keyed), offset 1 is keyed.
+
+    The keyed copy is kept, and the counts are what they were before the T1 change:
+    one excluded row (null time), one keyed row, one unique id, one row deduped.
+    """
+    k = T0 + timedelta(seconds=1)
+    df = _agg_rows(spark, [(True, "x", None, k), (True, "x", T0, k)])
+    kept = dedupe_in_batch(df).collect()
+    assert [(row.event_id, row.kafka_offset) for row in kept] == [("x", 1)]
+    for wm in (None, int((T0 - timedelta(minutes=5)).timestamp()) * 1_000_000):
+        r = batch_aggregate(flag_rows(df, wm))
+        c, s = batch_counts(r), split_counts(r)
+        assert (c.rows_in, c.excluded_null_event_time, c.excluded_total) == (2, 1, 1)
+        assert (c.keyed_rows, c.keyed_unique, c.dup_in_batch) == (1, 1, 0)
+        assert c.min_date == c.max_date == date(2026, 11, 19)
+        assert (s.deduped, s.late, s.ontime) == (1, 0, 1)
+        assert s.ontime_min_date == s.ontime_max_date == date(2026, 11, 19)
 
 
 @fast
