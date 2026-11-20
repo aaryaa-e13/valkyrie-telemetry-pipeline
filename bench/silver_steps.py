@@ -193,7 +193,8 @@ def steps_of(outer: Exec, top: list[Exec], jobs: dict[int, dict[str, Any]]) -> d
                                 for j in job_ids if j in jobs)
         out[step] = {"wall_ms": round(wall_ms), "spark_ms": round(spark_ms),
                      "driver_ms": round(wall_ms - spark_ms), "jobs": len(job_ids),
-                     "tasks": tasks, "tasks_incl_skipped": tasks_all, "executions": [x.id for x in members]}
+                     "tasks": tasks, "tasks_incl_skipped": tasks_all,
+                     "executions": [x.id for x in members]}
         views = [x for x in members if "CreateViewCommand" in str(x.raw.get("planDescription"))]
         if views:   # what the job's merge_ms / late_ms timer covers: after the view
             out[step]["after_view_ms"] = round((end - views[-1].end) * 1000)
