@@ -1141,7 +1141,24 @@ puts its last event at "now"); such routing depends on wall-clock gaps, so no te
 Reading: the late path costs little when there are no late rows, but every batch now pays for
 the wm read (a full read of the small control table, one file per batch) and an extra
 anti-join count against late. The median stays under the 10 s trigger, with little headroom.
-The control table grows by one file per batch, so the wm read will grow too; the planned
-fallback (keep the running max in the driver, re-read once at start-up) is an open decision.
+The control table grows by one file per batch, so we expected the wm read to grow too; the
+timing follow-up below measured no growth up to 500 rows, and the cache fallback (keep the
+running max in the driver, re-read once at start-up) was decided against for now.
 In smoke-dupes the second send's batch routed 7 rows to late, all already in silver
 (`late_dup_of_silver = 7`, nothing inserted): cross-run overlap, as predicted (plan section 1).
+
+**Timing follow-up (2026-11-19, measured with `bench/silver_steps.py` and
+`bench/wm_probe.py`; method in the probes' docstrings).**
+- **3-smoke median `addBatch` 10.7 s, 2 of 3 batches over the 10 s trigger** (9.3, 10.7 and
+  12.2 s). Over 9 batches (13-21) the median was 9.1-9.3 s. A batch longer than the trigger
+  is a delay, not a loss: the next batch starts when it ends.
+- **Delta writes a checkpoint every 10 commits** (Delta's default). The silver commit that
+  lands on one adds ~3 s to that batch's MERGE; the control commit that lands on one adds
+  ~2 s to that batch's control write. The first batch after a start pays ~2 s of warm-up in
+  the control write.
+- **wm read**: no growth with the control table up to 500 rows (1.2-1.4 s after an append at
+  1-10 rows and at 451-500 rows, in the probe). A read replays the last checkpoint plus at
+  most 9 JSON commits (UNVERIFIED as the cause; the numbers agree). Decision: no cache, no
+  anti-join change.
+- **Revisit when** the median `addBatch` across a run is over 10 s, or `wm_read_ms` is over
+  3 s, or at the Phase 10 benchmark (run `wm_probe.py` at 5,000 control rows).
