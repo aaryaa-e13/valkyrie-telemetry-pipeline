@@ -17,6 +17,7 @@ import pytest
 pytest.importorskip("pyspark")
 
 from pyspark.sql import DataFrame, SparkSession  # noqa: E402
+from pyspark.sql import functions as F  # noqa: E402
 
 from common import spark_rest  # noqa: E402
 from common.delta_log import current_version, live_files_in_range, read_commits  # noqa: E402
@@ -26,13 +27,17 @@ from streaming.bronze import bronze_schema, ensure_bronze_table, to_raw_rows  # 
 from streaming.config import SilverJobConfig  # noqa: E402
 from streaming.progress import ProgressLogger  # noqa: E402
 from streaming.silver import (  # noqa: E402
+    LATE_FLAG,
+    PARTITION_COLUMN,
     SilverStartupError,
     batch_counts,
     check_silver_guard,
     dedupe_in_batch,
     ensure_silver_tables,
+    is_late,
     prepare_silver,
     process_batch,
+    split_counts,
     start_silver_query,
 )
 from streaming.silver_merge import MergeBoundsError  # noqa: E402
@@ -134,6 +139,34 @@ def test_batch_counts_per_reason_and_bounds_from_keyed_rows_only(spark: SparkSes
     assert c.min_date == c.max_date == date(2026, 11, 19)
     # m_N from keyed rows only, clamped to Kafka time: the +64 s copy counts as k.
     assert c.clamped_max_us == int(k.timestamp()) * 1_000_000 and c.clamped_rows == 1
+
+
+@fast
+def test_non_keyed_copy_with_lower_offset_does_not_hide_the_keyed_copy(
+        spark: SparkSession) -> None:
+    """Same event_id twice: offset 0 has a NULL event_time (not keyed), offset 1 is keyed.
+
+    The keyed copy is kept, and the counts are: one excluded row (null time), one keyed
+    row, one unique id, one row deduped. The split runs like plan_batch runs it: on the
+    deduped rows, flagged with is_late, with the DATE partition column.
+    """
+    schema = ("parse_ok boolean, event_id string, event_time timestamp, "
+              "kafka_timestamp timestamp, kafka_topic string, kafka_partition int, "
+              "kafka_offset long")
+    k = T0 + timedelta(seconds=1)
+    df = spark.createDataFrame([(True, "x", None, k, "game-events", 0, 0),
+                                (True, "x", T0, k, "game-events", 0, 1)], schema)
+    kept = dedupe_in_batch(df)
+    assert [(row.event_id, row.kafka_offset) for row in kept.collect()] == [("x", 1)]
+    c = batch_counts(df)
+    assert (c.rows_in, c.excluded_null_event_time, c.excluded_total) == (2, 1, 1)
+    assert (c.keyed_rows, c.keyed_unique, c.dup_in_batch) == (1, 1, 0)
+    assert c.min_date == c.max_date == date(2026, 11, 19)
+    for wm in (None, int((T0 - timedelta(minutes=5)).timestamp()) * 1_000_000):
+        s = split_counts(kept.withColumn(PARTITION_COLUMN, F.to_date("event_time"))
+                         .withColumn(LATE_FLAG, is_late(wm)))
+        assert (s.deduped, s.late, s.ontime) == (1, 0, 1)
+        assert s.ontime_min_date == s.ontime_max_date == date(2026, 11, 19)
 
 
 @fast

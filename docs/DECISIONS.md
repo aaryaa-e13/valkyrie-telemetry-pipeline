@@ -1162,3 +1162,9 @@ In smoke-dupes the second send's batch routed 7 rows to late, all already in sil
   anti-join change.
 - **Revisit when** the median `addBatch` across a run is over 10 s, or `wm_read_ms` is over
   3 s, or at the Phase 10 benchmark (run `wm_probe.py` at 5,000 control rows).
+- **Tried one aggregation for the plan step** (counts, m_N and split in one Spark action
+  instead of two; 2026-11-20): 8 -> 6 jobs per batch, plan-count median -0.4 s (2,653 ->
+  2,259 ms over 3 smokes each side), before-run spread 1.37 s, so within noise. **Reverted**
+  by the rule set before measuring (keep only if the median drops by more than the
+  before-run spread). Revisit in Phase 10. The test it added (a non-keyed copy with a lower
+  offset does not hide the keyed copy) stays.
