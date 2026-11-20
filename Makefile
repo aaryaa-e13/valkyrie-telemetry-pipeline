@@ -24,7 +24,7 @@ dirs: ## Create bind-mount folders owned by you (Docker would create them as roo
 
 .PHONY: help env up down ps logs topics describe-topic venv sim-dry sim-local sim-tiny sim \
 	sim-realtime sim-late timing-check consume test-unit lint spark-build spark-image spark-up \
-	spark-stop spark-logs verify test-spark test-spark-fast demo smoke smoke-dupes e2e-images smoke-restart smoke-late faults-config-check \
+	spark-stop spark-logs verify test-spark test-spark-fast demo smoke smoke-dupes e2e-images smoke-restart smoke-late smoke-faults faults-config-check \
 	delta-compat jars-lock
 
 help: ## List available targets
@@ -176,6 +176,9 @@ smoke-restart: dirs up e2e-images ## Graceful stop/restart: no re-read, no skip 
 
 smoke-late: dirs up e2e-images ## Realtime run with late events, judged by R1-R6 (~6-8 min)
 	$(PY) -m e2e.smoke_late $(E2E_ARGS)
+
+smoke-faults: dirs up e2e-images ## SIGKILL silver at each write boundary + bronze, restart, judge (~30 min)
+	$(PY) -m e2e.smoke_faults $(E2E_ARGS)
 
 faults-config-check: ## Default compose config must not mention the fault hooks: prints 0
 	@n=$$($(COMPOSE) --profile spark --profile tools --profile sim config | grep -c VALKYRIE_FAULT || true); \
