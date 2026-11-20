@@ -33,7 +33,15 @@ S = silver ids from C, L = late ids from C. Always FAIL:
                             any event_id twice in the whole silver or late table
     R7 null_key_rows        a silver or late row with NULL event_id or event_time
     ids_not_in_bronze       silver/late ids that bronze does not have
-|L| (late_found_ids) is reported, not judged: R4-R6 come in slice 5.
+Oracle rules R4-R6 (slice 5, D2.5; pure parts in streaming/oracle.py):
+    R4 L ⊆ may_drop ids, R5 keep ids ⊆ S. Judged only when two gates hold:
+       the W check (manifest assumed_watermark_s == the one W recorded for the
+       run's batches) and isolation (no foreign bronze row could have moved a
+       watermark past one of the run's events). Otherwise "not checkable".
+    R6a-d the job against its own control table, for every slice-4 batch:
+       late rows at or behind their batch's wm, silver rows ahead of it, the wm
+       formula and its order, recorded m_k >= the clamped times it inserted.
+    Timing evidence (G, per very event, slight margin) is reported, not judged.
 Pinned to what silver has consumed (its newest committed batch C ended at bronze
 version V, so it has read bronze versions < V):
     silver rows + late rows (excluding batches > C of the current query) ==
@@ -68,11 +76,12 @@ from functools import reduce
 from pathlib import Path
 from typing import Any
 
-from pyspark.sql import SparkSession
+from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from common.logging_setup import setup_logging
-from common.manifest_reader import ManifestError, load_manifest
+from common.manifest_reader import Manifest, ManifestError, load_manifest
+from streaming import oracle as orc
 
 log = logging.getLogger("streaming.verify_manifest")
 
@@ -275,6 +284,13 @@ def verify_silver(spark: SparkSession, manifest_path: Path, silver_path: str, la
             expected, "event_id").where((F.col("kafka_topic") == manifest.topic) & in_send
                                         ).count()
 
+    # Control is read after late and silver, so it holds a row for every batch whose
+    # late or silver rows they show (the job writes the control row last).
+    rep["oracle"] = oracle_section(spark, manifest, expected, silver, late, bronze,
+                                   spark.read.format("delta").option(
+                                       "versionAsOf", latest_version(spark, control_path))
+                                   .load(control_path))
+
     # --- consistency, pinned to what silver has consumed --------------------------
     cons: dict[str, Any] = {"checkable": False}
     rep["consistency"] = cons
@@ -322,6 +338,189 @@ def verify_silver(spark: SparkSession, manifest_path: Path, silver_path: str, la
     return rep
 
 
+# --- oracle R4-R6 (slice 5) --------------------------------------------------------
+
+
+def _job_key() -> Column:
+    """The silver job's key check (streaming/silver.py key_ok), written again here."""
+    return (F.coalesce(F.col("parse_ok"), F.lit(False)) & F.col("event_id").isNotNull()
+            & F.col("event_time").isNotNull())
+
+
+def _clamped_us(keyed: Column) -> Column:
+    """The job's clamp (streaming/silver.py clamped_event_time), written again here:
+    least(event_time, kafka_timestamp) for keyed rows WITH a Kafka time, else NULL.
+    least() skips NULLs, so without the explicit check a row with no Kafka time
+    would count unclamped; the job never counts it."""
+    kts = F.col("kafka_timestamp")
+    return F.when(keyed & kts.isNotNull(), F.unix_micros(F.least(F.col("event_time"), kts)))
+
+
+def _count(cond: Column) -> Column:
+    return F.coalesce(F.sum(F.when(cond, 1).otherwise(0)), F.lit(0))
+
+
+def _median(values: list[int]) -> int | None:
+    v = sorted(values)
+    return v[len(v) // 2] if v else None
+
+
+def _with_ctl(df: DataFrame, ctl: DataFrame) -> DataFrame:
+    return df.join(ctl, (df.silver_query_id == ctl.ctl_q) & (df.silver_batch_id == ctl.ctl_b),
+                   "left")
+
+
+def _r6_tables(silver: DataFrame, late: DataFrame, control: DataFrame) -> dict[str, Any]:
+    """R6a, R6b, R6d over the WHOLE silver and late tables (every query id)."""
+    ctl = control.select(F.col("silver_query_id").alias("ctl_q"),
+                         F.col("batch_id").alias("ctl_b"),
+                         F.col("watermark_delay_s").alias("ctl_w"),
+                         F.col("watermark_used").alias("ctl_wm"),
+                         F.unix_micros("batch_max_clamped_event_time").alias("ctl_max_us"))
+    lj = _with_ctl(late, ctl)
+    no_ctl = F.col("ctl_w").isNull()                      # no control row, or pre-slice-4
+    ahead = F.col("watermark_used").isNull() | (F.col("event_time") > F.col("watermark_used"))
+    wm_diff = ~F.col("watermark_used").eqNullSafe(F.col("ctl_wm"))
+    a = lj.agg(F.count("*").alias("rows"), _count(no_ctl).alias("no_ctl"),
+               _count(ahead).alias("ahead"), _count(wm_diff).alias("wm_diff"),
+               _count(no_ctl | ahead | wm_diff).alias("bad")).first()
+    sj = _with_ctl(silver, ctl)
+    s4 = F.col("ctl_w").isNotNull()
+    behind = s4 & F.col("ctl_wm").isNotNull() & (F.col("event_time") <= F.col("ctl_wm"))
+    b = sj.agg(_count(s4).alias("checked"),
+               _count(F.col("ctl_b").isNotNull() & ~s4).alias("pre"),
+               _count(F.col("ctl_b").isNull()).alias("no_ctl"),
+               _count(behind).alias("bad")).first()
+    b_ex = [r.event_id for r in sj.where(behind).select("event_id").limit(orc.MAX_EXAMPLES)
+            .collect()]
+    keyed = F.col("event_id").isNotNull() & F.col("event_time").isNotNull()
+    cols = ["silver_query_id", "silver_batch_id", "event_id", "event_time", "kafka_timestamp"]
+    inserted = (silver.select(*cols).unionByName(late.select(*cols))
+                .withColumn("c_us", _clamped_us(keyed))
+                .groupBy("silver_query_id", "silver_batch_id").agg(F.max("c_us").alias("rows_max")))
+    dj = _with_ctl(inserted, ctl).where(F.col("ctl_w").isNotNull())
+    low = F.col("rows_max").isNotNull() & (F.col("ctl_max_us").isNull()
+                                           | (F.col("ctl_max_us") < F.col("rows_max")))
+    d = dj.agg(F.count("*").alias("checked"), _count(low).alias("bad")).first()
+    d_ex = [{"query_id": r.silver_query_id, "batch_id": r.silver_batch_id,
+             "recorded_us": r.ctl_max_us, "rows_max_us": r.rows_max}
+            for r in dj.where(low).limit(orc.MAX_EXAMPLES).collect()]
+    return {
+        "r6a": {"late_rows": int(a["rows"]), "violations": int(a["bad"]),
+                "detail": {"without_slice4_control_row": int(a["no_ctl"]),
+                           "event_time_after_wm": int(a["ahead"]),
+                           "wm_differs_from_control": int(a["wm_diff"])}},
+        "r6b": {"silver_rows_checked": int(b["checked"]), "violations": int(b["bad"]),
+                "examples": b_ex, "rows_of_pre_slice4_batches": int(b["pre"]),
+                "rows_without_control_row": int(b["no_ctl"])},
+        "r6d": {"batches_checked": int(d["checked"]), "violations": int(d["bad"]),
+                "examples": d_ex},
+    }
+
+
+def oracle_section(spark: SparkSession, manifest: Manifest, expected: DataFrame,
+                   silver: DataFrame, late: DataFrame, bronze: DataFrame,
+                   control: DataFrame) -> dict[str, Any]:
+    """R4-R6, both gates and the timing evidence (report only). Read-only."""
+    run_cols = [F.col("event_id"), F.col("silver_query_id"), F.col("silver_batch_id"),
+                F.unix_micros("event_time").alias("t_us"),
+                F.unix_micros("kafka_timestamp").alias("k_us")]
+    s_rows = {r.event_id: r for r in silver.join(expected, "event_id").select(*run_cols)
+              .collect()}
+    l_rows = {r.event_id: r for r in late.join(expected, "event_id").select(*run_cols)
+              .collect()}
+    ctl_rows = control.select(
+        "silver_query_id", "batch_id", "in_initial_snapshot", "watermark_delay_s",
+        F.unix_micros("watermark_used").alias("wm_us"),
+        F.unix_micros("batch_max_clamped_event_time").alias("max_us"),
+        F.unix_micros("processed_at").alias("at_us"), "rows_in", "late_rows",
+        "late_inserted_this_attempt", "ontime_rows", "inserted_this_attempt").collect()
+    ctl = {(r.silver_query_id, int(r.batch_id)): orc.ControlRow(
+        r.silver_query_id, int(r.batch_id), r.in_initial_snapshot,
+        None if r.watermark_delay_s is None else int(r.watermark_delay_s), r.wm_us, r.max_us)
+        for r in ctl_rows}
+    raw = {(r.silver_query_id, int(r.batch_id)): r for r in ctl_rows}
+    run_rows = list(s_rows.values()) + list(l_rows.values())
+    run_batches = {(r.silver_query_id, int(r.silver_batch_id)) for r in run_rows}
+
+    w = orc.w_gate(manifest, run_batches, ctl)
+    flag = expected.select("event_id", F.lit(True).alias("_run"))
+    bj = bronze.join(F.broadcast(flag), "event_id", "left")
+    keyed = _job_key()
+    iso_row = bj.agg(
+        F.min(F.when(F.col("_run") & keyed, F.unix_micros("event_time"))).alias("min_t"),
+        F.max(F.when(F.col("_run").isNull(), _clamped_us(keyed))).alias("foreign_max"),
+    ).first()
+    min_t = iso_row["min_t"]
+    iso = orc.isolation_gate(w.get("w_s"), min_t, iso_row["foreign_max"])
+    s_ids, l_ids = set(s_rows), set(l_rows)
+    out: dict[str, Any] = {
+        "w_check": w, "isolation": iso,
+        "late_counts": manifest.late_counts, "pace": manifest.pacing.mode
+        if manifest.pacing else None,
+        "bands": orc.band_counts(manifest, s_ids, l_ids),
+        "r4_r5": orc.r4_r5(manifest, s_ids, l_ids)
+        if w["checkable"] and iso["checkable"] else None,
+        "r6": {**_r6_tables(silver, late, control), "r6c": orc.r6c(ctl.values())},
+    }
+    out["verdicts"] = orc.verdicts(out)
+
+    # --- timing evidence: reported, never judged (plan S3, S6) -----------------------
+    def wm_of(r: Any) -> int | None:
+        c = ctl.get((r.silver_query_id, int(r.silver_batch_id)))
+        return c.wm_us if c else None
+
+    g = [(raw[k].at_us - r.k_us) // 1000 for r in run_rows
+         if (k := (r.silver_query_id, int(r.silver_batch_id))) in raw
+         and raw[k].at_us is not None and r.k_us is not None]
+    late_ev = manifest.late_events or {}
+    very, slight = [], []
+    for e, x in sorted(late_ev.items(), key=lambda kv: kv[1].delay_ms):
+        r = l_rows.get(e) or s_rows.get(e)
+        if r is None:
+            continue
+        wm = wm_of(r)
+        ahead_ms = None if wm is None else (r.t_us - wm) // 1000
+        if x.band == "very":
+            very.append({"event_id": e, "delay_ms": x.delay_ms, "stream_lag_ms": x.stream_lag_ms,
+                         "batch_id": int(r.silver_batch_id), "wm_us": wm,
+                         "event_time_minus_wm_ms": ahead_ms, "routed": e in l_ids})
+        else:
+            slight.append(ahead_ms)
+    per_batch = []
+    for k in sorted(run_batches, key=lambda k: (k[0], k[1])):
+        c = raw.get(k)
+        per_batch.append({
+            "query_id": k[0], "batch_id": k[1],
+            "run_silver": sum(1 for r in s_rows.values()
+                              if (r.silver_query_id, int(r.silver_batch_id)) == k),
+            "run_late": sum(1 for r in l_rows.values()
+                            if (r.silver_query_id, int(r.silver_batch_id)) == k),
+            **({"processed_at_us": c.at_us, "wm_us": c.wm_us, "rows_in": c.rows_in,
+                "late_rows": c.late_rows, "late_inserted_this_attempt":
+                c.late_inserted_this_attempt, "ontime_rows": c.ontime_rows,
+                "inserted_this_attempt": c.inserted_this_attempt} if c else {})})
+    prior = None
+    if run_batches:
+        q0, b0 = min(run_batches, key=lambda k: k[1])
+        maxima = [c.max_us for c in ctl.values()
+                  if c.query_id == q0 and c.batch_id < b0 and c.max_us is not None]
+        prior = {"query_id": q0, "first_run_batch": b0,
+                 "max_m_k_before_us": max(maxima) if maxima else None,
+                 "gap_to_min_t_ms": (min_t - max(maxima)) // 1000
+                 if maxima and min_t is not None else None}
+    finite = [x for x in slight if x is not None]
+    out["timing"] = {
+        "g_ms": {"rows": len(g), "median": _median(g), "max": max(g) if g else None},
+        "very_events": very,
+        "slight_margin_ms": min(finite) if finite else None,
+        "slight_with_wm_null": len(slight) - len(finite),
+        "run_batches": per_batch,
+        "control_before_run": prior,
+    }
+    return out
+
+
 def evaluate_silver(rep: dict[str, Any]) -> tuple[bool, list[str]]:
     """(failed, notes) for the silver section."""
     if rep.get("table_missing"):
@@ -343,6 +542,10 @@ def evaluate_silver(rep: dict[str, Any]) -> tuple[bool, list[str]]:
         if rep[key] > 0:
             failed = True
             notes.append(f"{rep[key]} {text}")
+    if "oracle" in rep:
+        v = orc.verdicts(rep["oracle"])
+        failed = failed or "FAIL" in v.values()
+        notes += orc.failure_notes(rep["oracle"], v)
     cons = rep["consistency"]
     if not cons["checkable"]:
         notes.append(f"consistency not checkable: {cons['reason']}")
