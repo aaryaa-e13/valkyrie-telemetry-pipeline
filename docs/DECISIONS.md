@@ -1335,8 +1335,10 @@ reached, so "in Delta but not in the checkpoint" for bronze is covered only by t
 
 **Orphan files (K3).** Data files on disk that no `add` in any Delta commit references. None of
 the kills left an orphan with rows. Empty (0-row) orphans exist in late and control from before
-slice 6 (23 and 117 at the start): control gains one per committed control row, late one per MERGE
-that inserts nothing, also in normal runs. Why Delta leaves those 0-row files is UNVERIFIED. They
+slice 6 (23 and 117 at the start). Observed: control gained exactly one per committed control
+row (127 rows, 127 empty orphans at the end); late gained one in each replay whose late MERGE
+inserted nothing (after_late, after_silver, after_control) and none when it inserted rows. Why
+Delta leaves these 0-row files is UNVERIFIED. They
 are counted separately and never deleted.
 
 **R4/R5 are "not checkable" in fault runs, by design.** Isolation needs no foreign bronze row
