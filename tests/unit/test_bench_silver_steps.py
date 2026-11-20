@@ -30,6 +30,9 @@ def test_parse_time_and_batch_of() -> None:
     assert parse_time("1970-01-01T00:00:01.500GMT") == 1.5
     assert batch_of("silver\nid = a\nrunId = b\nbatch = 12", "silver") == 12
     assert batch_of("bronze\nid = a\nrunId = b\nbatch = 12", "silver") is None
+    # Delta's nested executions carry the batch description with a suffix.
+    assert batch_of("Delta: silver\nid = a\nrunId = b\nbatch = 12: Filtering", "silver") == 12
+    assert batch_of("silver\nid = a\nrunId = b\nbatch = 12 - MERGE operation", "silver") == 12
 
 
 def test_tables_read_separates_delta_log_only() -> None:
@@ -48,6 +51,10 @@ def test_classify_in_code_order() -> None:
     assert classify(both, "late anti-join + count") == "silver MERGE"
     assert classify(ex(scan("control")), "silver MERGE") == "control write"
     assert classify(ex(scan("silver", log=True)), "late anti-join + count") is None
+    # The persisted micro-batch shows no table path: an action on it is a plan count.
+    assert classify(ex("InMemoryTableScan HashAggregate"), "wm read") == "plan counts"
+    assert classify(ex("LocalTableScan [path, partitionValues, deletionVector]"), None) is None
+    assert classify(ex("Execute CreateViewCommand"), "late anti-join + count") is None
 
 
 def test_steps_nest_children_and_give_snapshot_loads_the_next_step() -> None:
@@ -57,7 +64,7 @@ def test_steps_nest_children_and_give_snapshot_loads_the_next_step() -> None:
     outer = e(0, 0.0, 10.0, "")
     execs = [outer, e(1, 0.1, 1.0, scan("control")), e(2, 1.5, 3.0, scan("bronze")),
              e(3, 3.2, 4.0, scan("bronze", "late")),
-             e(4, 4.1, 4.5, scan("silver", log=True)),            # snapshot load -> MERGE
+             e(4, 4.1, 4.5, "Execute CreateViewCommand"),          # source view -> MERGE
              e(5, 4.6, 8.0, scan("late", "silver"), merge=True),
              e(6, 5.0, 6.0, scan("silver", log=True)),             # inside the MERGE
              e(7, 8.5, 9.5, scan("control"))]
@@ -68,5 +75,6 @@ def test_steps_nest_children_and_give_snapshot_loads_the_next_step() -> None:
     assert steps["silver MERGE"]["jobs"] == 3                     # 4, 5 and child 6
     assert steps["silver MERGE"]["wall_ms"] == 4000               # 4.0 -> 8.0
     assert steps["silver MERGE"]["driver_ms"] == 4000 - 400 - 3400
+    assert steps["silver MERGE"]["after_view_ms"] == 3500           # 4.5 -> 8.0
     assert steps["control write"]["wall_ms"] == 1500
     assert steps["other"]["wall_ms"] == 500
