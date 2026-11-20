@@ -1,0 +1,5 @@
+== docker inspect valkyrie-spark: VALKYRIE_FAULT* entries
+0
+== make faults-config-check
+0
+exit=0

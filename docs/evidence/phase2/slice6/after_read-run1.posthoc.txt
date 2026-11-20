@@ -1,0 +1,9 @@
+{'A': ['run_20261120T161719Z_seed1795191436486.json', 'run_20261120T161935Z_seed1795191436486.json'], 'B': ['run_20261120T161816Z_seed1795191436487.json'], 'C': ['run_20261120T161932Z_seed1795191436488.json']}
+sizes A 12 A' 12 B 14 C 14
+A PASS S 12 L 0 dups 0 from this send 12 verdicts {'R4': 'not checkable: isolation: not isolated: a foreign bronze row has clamped time >= min_t + W (margin -197255 ms)', 'R5': 'not checkable: isolation: not isolated: a foreign bronze row has clamped time >= min_t + W (margin -197255 ms)', 'R6a': 'PASS', 'R6b': 'PASS', 'R6c': 'PASS', 'R6d': 'PASS'} problems []
+B PASS S 0 L 14 dups 0 from this send 14 verdicts {'R4': 'not checkable: isolation: not isolated: a foreign bronze row has clamped time >= min_t + W (margin -1818495 ms)', 'R5': 'not checkable: isolation: not isolated: a foreign bronze row has clamped time >= min_t + W (margin -1818495 ms)', 'R6a': 'PASS', 'R6b': 'PASS', 'R6c': 'PASS', 'R6d': 'PASS'} problems []
+C PASS S 14 L 0 dups 0 from this send 14 verdicts {'R4': 'not checkable: isolation: not isolated: a foreign bronze row has clamped time >= min_t + W (margin -57368 ms)', 'R5': 'not checkable: isolation: not isolated: a foreign bronze row has clamped time >= min_t + W (margin -57368 ms)', 'R6a': 'PASS', 'R6b': 'PASS', 'R6c': 'PASS', 'R6d': 'PASS'} problems []
+control rows of q 119 unique 119 range 0 118 contiguous True
+delta before->now {"bronze": {"rows": 52, "orphan_files_empty": 0, "orphan_files_with_rows": 0, "orphan_rows": 0}, "silver": {"rows": 26, "orphan_files_empty": 0, "orphan_files_with_rows": 0, "orphan_rows": 0}, "late": {"rows": 14, "orphan_files_empty": 0, "orphan_files_with_rows": 0, "orphan_rows": 0}, "control": {"rows": 2, "orphan_files_empty": 2, "orphan_files_with_rows": 0, "orphan_rows": 0}}
+expected rows delta: bronze 52 silver 26 late 14 control +2 (batches 117, 118)
+PROBLEMS []
