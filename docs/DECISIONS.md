@@ -370,6 +370,10 @@ build images quietly first (`make e2e-images`). Live numbers on this laptop: smo
   with exit 4 (shown live with a second simulator: "p5: run starts at 966 but E0 is 888").
 - *Out of scope until Phase 4:* `kill -9`, killing a batch midway, Kafka restarts, topic
   recreation.
+- *Update (Phase 2 slice 6, D2.6):* both statements above are now narrowly out of date. Test-only
+  hooks exist at the silver write boundaries (`streaming/faults.py`, inert unless
+  `docker-compose.faults.yml` sets them), and `make smoke-faults` SIGKILLs the job at each of
+  them plus once inside bronze. Kafka restarts and topic recreation are still not tested.
 
 ### D1.13 Plan: simulator pacing modes + deliberate lateness (BUILT in slice e, see D1.17)
 > **Status: built on 2026-11-15.** This is the original plan, kept for the record. D1.17
@@ -1258,3 +1262,91 @@ line tied to the container limit, **set before runs 2-3 and not changed after**:
 peak > 2.8 GiB (200 MB under the 3 GiB limit), or the peak growing > 0.1 GiB from one run to
 the next with Spark not restarted (a leak signal), or heap > 1.6 GiB, GC > 10 %, OOM. Runs 2-3
 crossed none of them. Lowering the driver memory is left for the Phase 10 benchmarks.
+
+### D2.6 Fault injection: SIGKILL at the write boundaries, `make smoke-faults` (slice 6)
+
+**What is injected.** A real process kill, not a Python exception: an exception would run
+`finally` blocks, `plan.release()` and Spark's own error handling, which a crash does not.
+`streaming/faults.py` adds four test-only points to silver's `process_batch`: `after_read`
+(plan built, nothing written), `after_late` (late MERGE done), `after_silver` (silver MERGE
+done), `after_control` (control row committed, `commits/N` not yet written, so it is also the
+"before commits/N" point). At its point, the first batch with late AND on-time rows writes a
+marker file (`data/faults/<tag>/<point>.reached`, fsync'd), logs `FAULT REACHED` and holds still.
+`e2e/smoke_faults.py` sees the marker and runs `docker kill --signal KILL valkyrie-spark`. The
+container's PID 1 is tini, so the kernel kills every process at once: no `finally`, no atexit, no
+JVM shutdown hook. If no kill arrives within 120 s, the hook logs `FAULT FALLBACK` and SIGKILLs
+the JVM and itself; smoke-faults then reports exit 6 (did not fire as claimed).
+*Tradeoff:* the kill lands at a chosen boundary, not at a random instant inside a write. Torn
+writes inside a single Delta commit are left to Delta's own atomic commit (not tested here).
+
+**How the hooks stay off (F1, K4).** Active only if `VALKYRIE_FAULTS_ENABLED` is exactly `"1"` AND
+a valid point and tag are set. Only `docker-compose.faults.yml` sets them, and only
+`e2e/smoke_faults.py` passes that file. It is not named `docker-compose.override.yml`, which
+Compose would load by itself. smoke-faults refuses to run if `COMPOSE_FILE` is set. The env is
+read once at start-up; when inactive, `hit()` is one comparison of a module global (no env read,
+no file I/O, no marker folder; unit test with an env that raises on any read). Active: a loud
+WARNING plus a stderr banner at start-up. Tests: `tests/unit/test_faults.py` (18),
+`tests/unit/test_compose_faults_isolated.py` (5); `make faults-config-check` prints the number of
+`VALKYRIE_FAULT` mentions in the default compose config (must be 0). The full Spark suite (111)
+passed with the hooks in place and inert, and created no faults folder.
+
+**Data per silver point** (tiny config, ~12-14 events per run):
+A = backfill ending now, caught up, then a graceful stop. While Spark is down: B (start 30 min
+ago, so every event is late by >= ~26 min), C (ends now, sent >= 125 + 15 - 60 s after A's end so
+that it is on time by >= 15 s), A' (A's seed again: re-stamped duplicates). Spark starts with the
+fault file; the first silver batch N holds late = |B| and on time = |C| + |A'|.
+
+**Proof that it fired (F4), read while the job is down, else exit 6:** the marker (point, batch,
+both kinds of rows); exactly one `FAULT REACHED point=X batch=N` line and no `FAULT FALLBACK` in the
+killed container's logs; exit code 137 with OOMKilled false; `offsets/N` present and `commits/N`
+absent; and the tables in the state the point claims (B in late from batch N or not, C in silver
+from batch N or not, 0 or 1 control row for N), read from the Delta log on the laptop with pyarrow
+(`e2e/faults_check.py`, a reader independent of Spark).
+
+**Judged after the restart (F3), without the fault file (container env checked: no
+`VALKYRIE_FAULT*`):** verify A, B and C (every id exactly once in silver ∪ late; B all in late, C
+and A all in silver; A's kept rows are from its first send; R6a-d not FAIL; R4/R5 are "not
+checkable" here, see below); the silver guard's exact (mode, T, C, P), (resume, N-1, N-1, N) and
+for `after_control` (resume, N, N-1, N); batch N re-run once; exactly one control row per batch
+and its fields, including which attempt wrote it (`late_inserted_this_attempt`,
+`inserted_this_attempt`); `watermark_used` = max(m_k, k < N) - W; row deltas bronze
+2|A| + |B| + |C|, silver |A| + |C|, late |B|.
+
+**Results (2026-11-20, VERIFIED, logs in the slice 6 report):**
+
+| point | batch N | (T, C, P) at restart | control row N written by | late / on-time inserts in it | non-empty orphan files |
+|---|---|---|---|---|---|
+| after_read | 120 | 119, 119, 120 | the re-run | 12 / 13 | 0 |
+| after_late | 122 | 121, 121, 122 | the re-run | 0 / 14 | 0 |
+| after_silver | 124 | 123, 123, 124 | the re-run | 0 / 0 | 0 |
+| after_control | 126 | 126, 125, 126 | the killed attempt (re-run skipped by txn) | 12 / 13 | 0 |
+
+A first `after_read` run (batch 118) fired, but smoke-faults crashed while reading the down state
+(see WHAT_BROKE), so its F4 evidence is incomplete; it is counted as "fired, evidence incomplete",
+not as a pass. Its after-the-fact checks (guard, control row, verify A/B/C) agreed.
+
+**inside_bronze (best effort).** Bronze uses the native Delta sink, so it has no hook: smoke-faults
+starts Spark normally and SIGKILLs it as soon as bronze's `offsets/N` appears (polled every 10 ms),
+then classifies: (i) planned, not in Delta (txn = N-1), (ii) in Delta, not committed (txn = N),
+(iii) too late (`commits/N` present). Up to 3 attempts. Result: **(i) on attempt 1** (batch 133,
+txn 132, no file written, 0 orphans); after the restart the bronze guard read (T, C, P) =
+(132, 132, 133), and the Delta log added exactly 14 rows = the run's 14 events. State (ii) was not
+reached, so "in Delta but not in the checkpoint" for bronze is covered only by the D2.2 tests.
+
+**Orphan files (K3).** Data files on disk that no `add` in any Delta commit references. None of
+the kills left an orphan with rows. Empty (0-row) orphans exist in late and control from before
+slice 6 (23 and 117 at the start): control gains one per committed control row, late one per MERGE
+that inserts nothing, also in normal runs. Why Delta leaves those 0-row files is UNVERIFIED. They
+are counted separately and never deleted.
+
+**R4/R5 are "not checkable" in fault runs, by design.** Isolation needs no foreign bronze row
+within W of the run; A, B and C are sent within ~3 minutes of each other, so each is foreign to the
+others. The exact per-run assertions above replace R4/R5 here.
+
+**What we can NOT inject on this laptop (F6):** disk full, a slow or failing disk, network
+partitions between Spark and Kafka, losing the single Kafka broker's data (only one broker, no
+replication), clock jumps, kills at random instants inside one Parquet or Delta write, and memory
+pressure from other tenants. Kafka restarts and topic recreation are not covered in Phase 2.
+
+**Memory:** the same M1 stop lines as smoke-late (D2.5), set before the runs. Container peaks
+1.50-1.94 GiB, heap peak <= 0.66 GiB; none crossed.

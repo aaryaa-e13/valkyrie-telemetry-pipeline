@@ -327,3 +327,23 @@ Template:
 - **Fix:** the new test calls `spark.streams.resetTerminated()` in a `finally`.
 - **Lesson:** the Spark test session is shared state; a test that makes a query fail must clean
   up after itself.
+
+### smoke-faults lost its own evidence on the first run (Phase 2 slice 6, my script)
+- **Symptom:** the first `after_read` fault run fired (marker for batch 118, container SIGKILLed),
+  then smoke-faults crashed with `pyarrow ArrowInvalid: No match for FieldRef.Name(late_rows)`
+  while reading the control table with the job down. Its `finally` restarted Spark, so the
+  down-state tables and the killed container's logs were gone.
+- **Root cause:** the control table's schema grew in slice 4; Delta reads older files with the
+  new columns as NULL, but my pyarrow reader asked every file for every column.
+- **Fix:** read each file's own schema and fill missing columns with None (unit test); write
+  the killed container's logs and the down state to files right after the kill; catch any
+  crash so the SUMMARY is still written. One extra, approved Kafka write re-ran `after_read`.
+- **Lesson:** evidence that only exists while the system is down must be saved first, before
+  any code that can fail runs.
+
+### A failing test was committed because a pipe hid pytest's exit code (Phase 2 slice 6)
+- **Symptom:** commit `3329f8b` contained a failing isolation test; the command chain had
+  looked green.
+- **Root cause:** `pytest ... | tail` returns `tail`'s exit code, so `&& git commit` ran anyway.
+- **Fix:** `96c4adf` fixed the test; command chains now start with `set -o pipefail`.
+
