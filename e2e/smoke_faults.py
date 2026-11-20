@@ -65,7 +65,6 @@ from e2e.orchestrator import (
     send_and_wait,
     snapshot,
     verify_report,
-    wait_for_catch_up,
     wait_for_silver,
 )
 from e2e.smoke_late import MemorySampler, memory_stops
@@ -138,6 +137,19 @@ def stop_gracefully() -> None:
     st = container_state(SPARK_CONTAINER)
     if st.running or st.exit_code != 0:
         raise Abort(EXIT_SETUP, f"graceful stop failed: {st.describe(datetime.now(UTC))}")
+
+
+def wait_for_bronze_rows(v_before: int | None, n: int, timeout: float = 180.0) -> None:
+    """Until bronze's Delta log has added n rows since v_before (no status file)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        v = current_version(PATHS["bronze"])
+        if v is not None and v_before is not None and v > v_before and \
+                appended_between(PATHS["bronze"], v_before, v).rows >= n:
+            return
+        if time.monotonic() > deadline or not container_state(SPARK_CONTAINER).running:
+            raise Abort(3, f"bronze did not add {n} rows after the restart (version {v})")
+        time.sleep(1.0)
 
 
 def wait_stopped(timeout: float = 60.0) -> catchup.ContainerState:
@@ -227,6 +239,7 @@ def run_silver_point(point: str, args: argparse.Namespace, out: dict[str, Any]) 
         raise Abort(EXIT_SETUP, "A' has different event ids than A")
 
     say(f"[3] start Spark WITH {FAULTS_FILE} (point {point}); wait for the marker")
+    v_bronze_before = current_version(PATHS["bronze"])
     sampler = MemorySampler(f"smoke-faults {point}")
     marker_path = FAULT_ROOT / tag / f"{point}.reached"
     try:
@@ -274,8 +287,10 @@ def run_silver_point(point: str, args: argparse.Namespace, out: dict[str, Any]) 
         out["fault_env_after_restart"] = env_left
         if env_left:
             raise Abort(EXIT_VERIFY, f"restarted container still has {env_left}")
-        for m in (b, c, a2):
-            wait_for_catch_up(m, baseline, args, 120.0, False)
+        # Not the bronze status file: its listener may not have run before the SIGKILL.
+        # First bronze's Delta log must hold all of B, C, A'; only then is bronze's
+        # current version the one silver must pass (wait_for_silver reads it once).
+        wait_for_bronze_rows(v_bronze_before, len(ids(b)) + len(ids(c)) + len(ids(a2)))
         wait_for_silver(args, False)
     finally:
         memory = sampler.stop()
@@ -386,7 +401,7 @@ def run_bronze_point(args: argparse.Namespace, out: dict[str, Any]) -> None:
             env_left = up_normal()
             if env_left:
                 raise Abort(EXIT_VERIFY, f"restarted container has {env_left}")
-            wait_for_catch_up(d, baseline, args, 120.0, False)
+            wait_for_bronze_rows(v_before, d.events_delivered)
             wait_for_silver(args, False)
         finally:
             att_mem = sampler.stop()
@@ -434,6 +449,7 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="VALKYRIE smoke-faults (SIGKILL at write boundaries)")
     add_common_args(p)
     p.add_argument("--point", choices=[*POINTS, "all"], default="all")
+    p.set_defaults(silver_timeout=180.0)      # includes a JVM restart
     args = p.parse_args(argv)
     points = list(POINTS) if args.point == "all" else [args.point]
     code = EXIT_PASS
