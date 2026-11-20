@@ -1168,3 +1168,93 @@ In smoke-dupes the second send's batch routed 7 rows to late, all already in sil
   by the rule set before measuring (keep only if the median drops by more than the
   before-run spread). Revisit in Phase 10. The test it added (a non-keyed copy with a lower
   offset does not hide the keyed copy) stays.
+
+### D2.5 Oracle rules R4-R6, their gates, and `make smoke-late` (slice 5)
+
+**What it is.** Verify (`streaming/verify_manifest.py`, pure parts in `streaming/oracle.py`)
+now judges the late split, not only counts it. C = the manifest's delivered ids, S/L = silver
+and late ids from C.
+- **R4** `L ⊆ may_drop` (only very-late events may be routed). **R5** every keep id (on time
+  or slight) is in S. R5 follows from R2 + R4; it is reported because it is the easiest to read.
+- **R6** the job against its own control table, for every batch written since slice 4:
+  R6a a late row has `event_time <= watermark_used` and that wm equals its batch's control
+  wm; R6b a silver row has `event_time >` its batch's wm; R6c the recorded wm equals
+  `max(m_k, k < N) - W` (NULL in the snapshot or with no m_k) and never goes down;
+  R6d the recorded `m_k` is >= the clamped time of every row batch k inserted.
+- Batches written before slice 4 (`watermark_delay_s` NULL; live: batches 0-7 of the
+  first query) are counted and skipped, never judged.
+- **Independence.** Verify writes the clamp and the wm formula again (about 40 lines) instead
+  of importing the job's code, so a bug in the job cannot hide in its own check. Every rule
+  has a tamper test that makes it FAIL (`tests/spark/test_verify_oracle.py`, 21 tests; the
+  exact set of failing rules is asserted).
+- **Honest limits.** R4/R5 come from the manifest, so they do not depend on the job. R6
+  checks the job against what it recorded: R6d catches a recorded max that is too LOW for
+  the rows a batch inserted, but not one that is too low for a duplicate copy the batch
+  dropped, and nothing catches a max that is too HIGH except R6c's effect on the next wm.
+
+**Two gates for R4/R5. Either one fails -> "not checkable: reason", never PASS, never FAIL.**
+- **W check.** The manifest's `assumed_watermark_s` must equal the one W recorded in the
+  control rows of every batch that inserted a run row. A v1/v2 manifest, an omitted
+  `late_events` list, a pre-slice-4 batch, or two different Ws -> not checkable.
+- **Isolation.** wm(N) is a max over ALL earlier batches, from every producer, so another
+  run's rows can route this run's events (slice 4: smoke-dupes routed 7 rows of its second
+  send). Exact condition, from the tables: `foreign_max < min_t + W`, where `min_t` = the
+  earliest event_time of the run's keyed bronze rows and `foreign_max` = the largest clamped
+  time of any other keyed bronze row. If it holds, a routed run event can only have been
+  routed by the run's own rows, which is what R4/R5 judge. The clamp is EXACTLY the job's
+  (`streaming/silver.py` `key_ok` and `clamped_event_time`): keyed rows only, and a row with
+  a NULL Kafka time never counts, however far in the future its event_time is. Tamper tests
+  pin both (a NULL-Kafka-time future row stays isolated; a future row counts only up to its
+  Kafka time; equal to `min_t + W` is not isolated, 1 ms less is).
+- **Isolation reads ALL foreign bronze rows, including rows written AFTER the run.** It is
+  conservative: it can say "not checkable" when it did not need to, never a false PASS. So
+  **re-verifying an old run after newer runs exist can say "not checkable"** (measured:
+  smoke-late run 1 re-verified after five later runs, margin -2,773 s). The verdict that
+  counts is the one from the run's own verify, and every e2e SUMMARY now records the R4-R6
+  verdicts and both gates as of that verify.
+- `make verify` exits 0 with "not checkable" printed; `make smoke-late` exits 2 (result
+  "NOT CHECKABLE"). Back-to-back backfill smokes are often not checkable (their timelines end
+  at "now"); that is printed, not judged.
+
+**`make smoke-late`** (`e2e/smoke_late.py`, `simulator/config.late.yaml`: realtime x10,
+4 matches, 30 % late, 20 % of those very late): one real run, then exact assertions from
+`late_counts`, no fractions. Asserted (exit 1): `|S| = delivered - |L|`; every late event
+found once; on time and slight: none in L, all in S; very: `L ⊆ very`, `|S ∩ very| +
+|L ∩ very| = late_counts.very`; every run row inserted after the silver baseline batch.
+Reported only: |L| as "x of y very events", per very event `event_time - wm`, G
+(`processed_at - kafka_timestamp`), the slight margin, batch times. Warnings: no very event
+routed, max G > 30 s, slight margin < 15 s.
+
+**Measured (2026-11-20; 3 runs, Spark restarted only before run 1 by the image rebuild):**
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| events (on time / slight / very) | 245 (176 / 53 / 16) | 260 (177 / 69 / 14) | 251 (195 / 39 / 17) |
+| very routed (\|L\|) | 13 of 16 | 14 of 14 | 13 of 17 |
+| slight routed | 0 | 0 | 0 |
+| slight margin (min event_time - wm) | 34.2 s | 36.0 s | 34.6 s |
+| G median / max | 16.2 / **40.6 s** | 14.1 / 25.1 s | 15.1 / 20.1 s |
+| isolation margin | 2.4 h | 22 min | 4.9 min |
+| silver batches, addBatch median / max | 27, 5.9 / 9.9 s | 25, 8.4 / 15.3 s | 32, 6.1 / 12.4 s |
+| batches over the 10 s trigger | 0 | 9 | 2 |
+| batches ending mid bronze version | 0 | 0 | 0 |
+| total time | 7.6 min | 7.4 min | 9.0 min |
+| container peak (limit below) | 2.593 GiB | 2.673 GiB (+0.080) | 2.661 GiB (-0.012) |
+| `make timing-check`: events ahead | 0 of 245 | 0 of 260 | 0 of 251 |
+
+- R4, R5, R6a-d PASS in all three; both gates checkable in all three. The late MERGE ran
+  live in 10, 9 and 9 batches. Run 1's G max of 40.6 s is probably the first batch after the
+  restart waiting for JVM start-up (UNVERIFIED: G is not reported per batch; runs 2-3,
+  without a restart, stayed under 26 s). The D2.4 revisit trigger (median addBatch over 10 s across a run) did not fire.
+- JVM peaks since the JVM started (Spark REST `/executors` `peakMemoryMetrics`): heap
+  1.236 GiB, off-heap 0.447 GiB, GC 0.6-0.9 % of uptime. Inside the container the JVM's own
+  memory was 2.37 GiB; page cache 11 MB.
+
+**Memory stop line for smoke-late.** The slice 4 line, 2.26 GiB, was slice 3's peak plus
+10 %, measured on short smokes. Run 1 crossed it (2.593 GiB) with the heap at 1.19 GiB and GC
+under 1 %: a longer run lets the JVM (driver heap up to 2 GiB, `SPARK_DRIVER_MEMORY`) keep
+more committed memory, which a peak from short runs does not predict. It was replaced by a
+line tied to the container limit, **set before runs 2-3 and not changed after**: container
+peak > 2.8 GiB (200 MB under the 3 GiB limit), or the peak growing > 0.1 GiB from one run to
+the next with Spark not restarted (a leak signal), or heap > 1.6 GiB, GC > 10 %, OOM. Runs 2-3
+crossed none of them. Lowering the driver memory is left for the Phase 10 benchmarks.
