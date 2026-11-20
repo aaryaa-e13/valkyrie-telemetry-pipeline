@@ -204,6 +204,11 @@ are unchanged.*
 - **Fixed in Phase 2 slice 3 (D2.3):** silver keeps one row per `event_id`. Seed 501: bronze
   still has 26 rows (by design), silver has 13, each the first send; verify `--layer all`
   PASS. `make smoke-dupes` repeats the test with a fresh seed on every run.
+- *Updated in Phase 2 slice 7:* the "Phase 2 fix" above is not what was built. Phase 2 uses
+  no Spark streaming dedupe (`dropDuplicates*` drop rows behind the watermark silently, see the
+  D1.17 note). It dedupes inside each micro-batch and across batches with an insert-only
+  `MERGE` (insert if absent, not an upsert, D2.3), and routes rows behind its own watermark to
+  a late table instead of dropping them (D2.4).
 
 ### D1.15 End-to-end checks: how we know Spark has processed a run (slice d)
 Built in steps: d1 = manifest offsets + status file (this entry); d2/d3 add the orchestrator.
@@ -255,10 +260,10 @@ the Phase 2 motivation (D1.14) and must stay visible. demo and smoke will pass
 
 **Flow** (`e2e/orchestrator.py`, laptop side, stdlib + `common/` only): seed in Python (epoch ms)
 -> check Kafka, start Spark (idempotent `up -d`) -> **baseline** status snapshot -> simulator
-run -> find the one manifest for that seed (must be v2) -> **contiguity check** -> **pre-run
-guard** -> wait for catch-up -> verify in `spark-tools` with `--fail-on-duplicates`.
-The pure logic lives in `e2e/catchup.py` and is unit-tested (34 tests). Docker calls are thin
-wrappers in `e2e/docker_ops.py`, each with a timeout.
+run -> find the one manifest for that seed (v2 or later: it needs the Kafka offsets) ->
+**contiguity check** -> **pre-run guard** -> wait for catch-up -> verify in `spark-tools` with
+`--fail-on-duplicates`. The pure logic lives in `e2e/catchup.py` and is unit-tested (34 tests
+in slice d2). Docker calls are thin wrappers in `e2e/docker_ops.py`, each with a timeout.
 
 **Exit codes:** 0 pass, 1 verify failed, 2 setup problem, 3 Spark did not catch up (timeout *or*
 container stopped; we don't wait out the timeout if the container is gone), 4 contiguity
@@ -322,6 +327,7 @@ and `./manifests` mounted read-only**. Spark's scratch space is `SPARK_LOCAL_DIR
 inside the container's own filesystem, not a host mount. Proven live: verify PASSes, `touch
 /data/x` fails with "Read-only file system", and `mount` shows `/data ... (ro,...)`. Reading
 the sink's `_spark_metadata` needs no writes. `make verify` now uses it too.
+*Updated in Phase 2:* verify reads the Delta tables now (D2.2), still with `./data` read-only.
 
 **demo vs smoke:** same code. smoke = tiny config, 90 s timeout, short output. demo = 20 matches
 (~1250 events), 180 s timeout, verbose (lag table, full verify report, where to look). Both
@@ -370,10 +376,14 @@ build images quietly first (`make e2e-images`). Live numbers on this laptop: smo
   with exit 4 (shown live with a second simulator: "p5: run starts at 966 but E0 is 888").
 - *Out of scope until Phase 4:* `kill -9`, killing a batch midway, Kafka restarts, topic
   recreation.
-- *Update (Phase 2 slice 6, D2.6):* both statements above are now narrowly out of date. Test-only
-  hooks exist at the silver write boundaries (`streaming/faults.py`, inert unless
-  `docker-compose.faults.yml` sets them), and `make smoke-faults` SIGKILLs the job at each of
-  them plus once inside bronze. Kafka restarts and topic recreation are still not tested.
+- *Update (Phase 2 slice 6, D2.6):* two statements above are now narrowly out of date: "no
+  fault-injection hooks in the live code" (*Evidence file*) and "`kill -9`, killing a batch
+  midway" (*Out of scope*). Test-only hooks exist at the silver write boundaries
+  (`streaming/faults.py`, inert unless `docker-compose.faults.yml` sets them), and
+  `make smoke-faults` SIGKILLs the job at each of them plus once inside bronze. Kafka restarts
+  and topic recreation are still not tested.
+- *Phase 2 run times* (bronze + silver, verify of both layers; `docs/evidence/phase2/`):
+  `make smoke` 139.5 s and 225.1 s, `make smoke-restart` 189.6 s (Phase 1: ~31 s and ~48 s).
 
 ### D1.13 Plan: simulator pacing modes + deliberate lateness (BUILT in slice e, see D1.17)
 > **Status: built on 2026-11-15.** This is the original plan, kept for the record. D1.17
@@ -503,15 +513,28 @@ delay_ms = round((lo + u3 * (hi - lo)) * assumed_watermark_s * 1000)
   order but without waiting, so a whole run lands in one or two micro-batches and the watermark
   hardly moves while they are processed. Backfill lateness only tests out-of-order handling.
   **Phase 2 late-drop tests must use `pace: realtime`.**
+  *Updated in Phase 2:* realtime alone was not enough: the tiny realtime timeline (~15 s) is
+  shorter than W, so `make smoke-late` uses a longer config (`simulator/config.late.yaml`,
+  D2.5). `make smoke-faults` also routes a whole backfill run to late, by sending it with a
+  timeline 30 minutes in the past after newer data was processed (D2.6). That is routing
+  across runs, not lateness inside one run, so the sentence above still holds.
 - **UNVERIFIED claim, to re-check against Spark 4.1.4 at the start of Phase 2:** "Structured
   Streaming has no side output for too-late rows; stateful operators drop them silently." This
   comes from general knowledge of Spark, not from a test in this repo. If it is true, Phase 2
   must route too-late events to a table itself, because silent drops would break the oracle.
+  *Checked at the start of Phase 2* by reading the Spark `v4.1.4` source (commit
+  `45b9b176e6e2`, `sql/core/.../execution/streaming/operators/stateful/statefulOperators.scala`):
+  rows behind the watermark are removed with `filterNot` and only counted in
+  `numRowsDroppedByWatermark` (`:504-512`); the late test is `event_time <= watermark`
+  (`:642-648`); streaming dedupe (`dropDuplicates`, `dropDuplicatesWithinWatermark`) applies
+  that filter before dedupe (`:1308-1311`). No side output exists, so Phase 2 routes late rows
+  to its own table (D2.4).
 - **Oracle (Phase 4) with lateness.** Late events are Kafka-confirmed, so they stay in the
   manifest's delivered ids, totals and checksum; v3 only annotates them. The raw layer must
   contain every one of them (`make verify`, unchanged). For a watermark-gated layer the rule
   becomes: `accepted + late table == confirmed`, no overlap, and anything missing from
   `accepted` must be a `may_drop` event.
+  *Built in Phase 2:* R1-R3 (D2.4) and R4/R5 (D2.5) are this rule, with silver as `accepted`.
 
 **Manifest v3** (v1 and v2 stay readable; unknown versions are rejected)
 - `pacing`: mode, `time_scale`, `assumed_watermark_s`, `late_fraction`, `late_too_late_share`,
@@ -552,6 +575,8 @@ and has no record of them.
 - A very large realtime run starts slightly behind, because the plan is built after "now" is
   taken. `max_behind_ms` shows it.
 - Out of scope, Phase 4: injected duplicates and shuffled order (they will reuse the schedule).
+  *Phase 2 note:* `make smoke-dupes` re-sends a whole seed (D2.3); duplicates of single events
+  and shuffled order are still Phase 4.
 
 ---
 
@@ -683,7 +708,8 @@ of the fetched jar's classes with Spark's jar (one-off check). 10 skips but 9 pa
   "the version this batch produced" must handle "no new version".
 - **Insert-only MERGE has no file-skipping metrics** (`numTargetFilesBeforeSkipping/
   AfterSkipping` absent in C5). Pruning evidence for D2 must come from somewhere else in slice
-  3, e.g. the query plan or scan metrics. UNVERIFIED which.
+  3, e.g. the query plan or scan metrics. UNVERIFIED which. *Resolved in slice 3 (D2.3):*
+  Spark's SQL execution metrics of the MERGE's target scan.
 - Checkpoints are classic `<v>.checkpoint.parquet` every 10 commits, plus `_last_checkpoint`.
 - `DELETE` rewrote files (2 removes) and made no deletion vectors: they are off by default
   here. The Delta-log count in slice 2 still subtracts `deletionVector.cardinality`, in case
@@ -778,8 +804,9 @@ created or touched, the job compares the checkpoint with the table. On a mismatc
 
 **R0: `(kafka_topic, kafka_partition, kafka_offset)` is unique in bronze** (parent plan D6).
 `verify_manifest` reports `duplicate_kafka_offsets` over the whole table, and any value > 0 is
-FAIL (duplicate event ids are only reported, as before). It proves "one row per Kafka message"
-at table level, including across restarts.
+FAIL (duplicate event ids are only reported, as before). It checks that no Kafka message is
+stored twice, over the whole table and across restarts. That every message of a run is there
+is a separate check, per run, against its manifest.
 - A row with a NULL `kafka_topic`, `kafka_partition` or `kafka_offset` also fails R0
   (`null_kafka_offset_rows`). Every Kafka message has all three, so such a row cannot be tied
   to one message. It is counted separately because SQL `DISTINCT` treats NULLs as equal and
@@ -821,6 +848,9 @@ batch, no re-read, no skip) are unchanged. Replaced and new:
   with them (2026-11-19, 245.5 s, all 14 checks). `e2e/parquet_count.py` was removed, and in
   the follow-up `pyarrow` was dropped from `requirements/dev.txt` (nothing imports it; unit
   tests pass in a fresh venv without it).
+  *Updated in Phase 2 slice 7:* "nothing imports it" stopped being true in slice 6
+  (`e2e/faults_check.py` and its unit test import pyarrow), and the pin was not re-added, so a
+  fresh clone failed `make test-unit`. `pyarrow==26.0.1` is pinned again (WHAT_BROKE).
 
 **Measured (2026-11-19, laptop, WSL2; single runs, not benchmarks)**
 
@@ -908,10 +938,12 @@ number of live files whose `event_date` is in `[lo, hi]`, counted from the Delta
 
 **Silver start-up guard: the same rule as bronze, with the control table as `txn`.** C = the
 silver checkpoint's newest `commits/N`, T = the control table's newest txn version for the
-checkpoint's query id. Start only if T == C, or T == C + 1. Order per batch: `offsets/N` ->
+checkpoint's query id. Start only if T == C, or T == C + 1 with P >= C + 1 (the same
+`decide()` as bronze). Order per batch: `offsets/N` ->
 MERGE -> control row with `txn(Q, N)` -> `commits/N`. A crash after the control row, before
 `commits/N`, leaves T == C + 1: the replay's MERGE finds every id and the control write is
-skipped (tested by deleting `commits/C`, then re-running: no new silver or control version).
+skipped (tested by deleting `commits/C`, then re-running: no new silver or control version;
+live with a SIGKILL in D2.6, `after_control`).
 **T == C - 1 is never a normal state**: `commits/N` is written only after the control row, and
 every batch writes one (condition: also zero-row and all-keyless batches, tested; the
 streaming test asserts control batch ids == committed batch ids, including a batch after an
@@ -955,6 +987,9 @@ version V, so bronze is read at V - 1, and silver rows from batches > C of the c
 ignored. Then silver rows == distinct keyed bronze ids (only if no copies are > H days apart),
 `sum(control.excluded_total)` == bronze keyless rows (R7), and control batch ids == 0..C. If the
 preconditions do not hold it says "not checkable", never "pass".
+*Updated in slice 4 (D2.4):* the late table exists now. Missing ids and duplicates are checked
+over silver ∪ late (R1-R3), and the whole-table count is silver rows + late rows == distinct
+keyed bronze ids.
 
 **Measured (2026-11-19, laptop, `local[4]`, heap 2 GiB, container limit 3 GiB):**
 
@@ -977,7 +1012,8 @@ of ~12 rows costs 7.5-9.9 s in total**, mostly fixed Delta overhead (several sna
 per batch, the aggregation, the control write). Silver keeps up at this rate, but it has almost
 no headroom at a 10 s trigger. Not tuned in this slice. The likely lever is
 `spark.databricks.delta.snapshotPartitions` (50 by default; 2 in the test session cut the Spark
-suite from 14 to under 7 minutes). Changing it in the job is a decision for the next slice.
+suite from 14 to under 7 minutes). Changing it in the job is a decision for the next slice
+(made in the follow-up below: 4).
 
 **Slice 3 follow-up (2026-11-19): where a small silver batch spends its time, and
 `DELTA_SNAPSHOT_PARTITIONS=4`.**
@@ -1040,7 +1076,9 @@ session, so bronze and silver both use it. `spark-tools` (verify) keeps Delta's 
 
 The slowest "after" batch (7.6 s) was the first one after the restart. Silver now has headroom
 at a 10 s trigger. **Caveat for Phase 10:** a lower value means fewer, larger tasks when a big
-table with a long log is rebuilt. Today's logs are under 15 commits. Re-measure at 1-50M rows.
+table with a long log is rebuilt. On 2026-11-19 the logs were under 15 commits; after the last
+silver fault run of slice 6 they were at versions 133 (bronze), 114 (silver) and 128 (control).
+Re-measure at 1-50M rows.
 
 ### D2.4 Watermark W = 60 s, late table, snapshot rule (slice 4)
 
@@ -1083,14 +1121,16 @@ defaulted: start-up refuses (exit 2), and inside a batch the batch fails and the
 2. **Cost, written down:** a truly late row inside a re-read, or a tail row that shares a batch
 with the last snapshot files, stays in silver.
 
-**Write order per batch and why every crash point is safe.** Plan (no writes: snapshot status,
-wm, counts, dedupe, split, check `late + on-time == keyed_unique`), then late, then silver,
-then the control row (txn), then Spark's `commits/N`. On a re-run, batch N gets the same input
-(`offsets/N`), the same snapshot status (`offsets/N-1` never changes), the same wm (control
-rows k < N never change, W is fixed) and so the same split; both data writes are
-insert-if-absent and the control append is skipped by txn. Tested at each crash point: the
-tables and the control row equal a crash-free run on every field except `*_this_attempt`,
-`*_ms` and `processed_at` (the attempt's wall-clock time), with exactly one control row.
+**Write order per batch and why a crash between two writes is safe.** Plan (no writes:
+snapshot status, wm, counts, dedupe, split, check `late + on-time == keyed_unique`), then late,
+then silver, then the control row (txn), then Spark's `commits/N`. On a re-run, batch N gets the
+same input (`offsets/N`), the same snapshot status (`offsets/N-1` never changes), the same wm
+(control rows k < N never change, W is fixed) and so the same split; both data writes are
+insert-if-absent and the control append is skipped by txn. Tested with a crash at each of the 4
+boundaries (after the plan, after late, after silver, after the control row): the tables and
+the control row equal a crash-free run on every field except `*_this_attempt`, `*_ms` and
+`processed_at` (the attempt's wall-clock time), with exactly one control row. The same four
+points were later hit live with a SIGKILL of the whole container (D2.6).
 
 **Silver and late stay disjoint.** One class per id inside a batch (dedupe before split). A
 late row whose id is already in silver is not inserted (`late_dup_of_silver`); the silver lookup
@@ -1102,8 +1142,11 @@ in D2.3: a silver copy more than H days from its late copy is not seen; verify's
 
 **Checkpoint reset.** The wm restarts at -infinity and stays there for the whole snapshot.
 Rows already in late stay in late (tables are appendOnly; nothing moves); their on-time copies
-count as `dup_of_late`. Guaranteed after a reset: S ∩ L = ∅, S ∪ L == all keyed bronze ids, no
-id twice. Not guaranteed: the same split as before. A clean re-split needs silver, late,
+count as `dup_of_late`. After a reset, S ∩ L = ∅, S ∪ L == all keyed bronze ids and no id
+twice still hold, because every write is insert-if-absent and both tables are append-only.
+Tested on a small stream (4 ids, one late, one keyless row:
+`test_late_rows_replay_restart_recompute_and_checkpoint_reset`): after the reset both tables
+are unchanged. Not kept: the same split as before. A clean re-split needs silver, late,
 control and checkpoint reset together, which deletes data: never automatic.
 
 **One-time upgrade of the live tables (Q1 (a)).** At start-up: missing control columns are
@@ -1211,7 +1254,9 @@ and late ids from C.
   pin both (a NULL-Kafka-time future row stays isolated; a future row counts only up to its
   Kafka time; equal to `min_t + W` is not isolated, 1 ms less is).
 - **Isolation reads ALL foreign bronze rows, including rows written AFTER the run.** It is
-  conservative: it can say "not checkable" when it did not need to, never a false PASS. So
+  conservative by construction: if `foreign_max < min_t + W`, no foreign row can lift a wm to
+  `min_t` or beyond, so a routed run event was routed by the run's own rows. It can say "not
+  checkable" when it did not need to; it does not let another run's routing pass. So
   **re-verifying an old run after newer runs exist can say "not checkable"** (measured:
   smoke-late run 1 re-verified after five later runs, margin -2,773 s). The verdict that
   counts is the one from the run's own verify, and every e2e SUMMARY now records the R4-R6
@@ -1296,7 +1341,7 @@ ago, so every event is late by >= ~26 min), C (ends now, sent >= 125 + 15 - 60 s
 that it is on time by >= 15 s), A' (A's seed again: re-stamped duplicates). Spark starts with the
 fault file; the first silver batch N holds late = |B| and on time = |C| + |A'|.
 
-**Proof that it fired (F4), read while the job is down, else exit 6:** the marker (point, batch,
+**Evidence that it fired (F4), read while the job is down, else exit 6:** the marker (point, batch,
 both kinds of rows); exactly one `FAULT REACHED point=X batch=N` line and no `FAULT FALLBACK` in the
 killed container's logs; exit code 137 with OOMKilled false; `offsets/N` present and `commits/N`
 absent; and the tables in the state the point claims (B in late from batch N or not, C in silver
@@ -1304,15 +1349,15 @@ from batch N or not, 0 or 1 control row for N), read from the Delta log on the l
 (`e2e/faults_check.py`, a reader independent of Spark).
 
 **Judged after the restart (F3), without the fault file (container env checked: no
-`VALKYRIE_FAULT*`):** verify A, B and C (every id exactly once in silver ∪ late; B all in late, C
-and A all in silver; A's kept rows are from its first send; R6a-d not FAIL; R4/R5 are "not
-checkable" here, see below); the silver guard's exact (mode, T, C, P), (resume, N-1, N-1, N) and
-for `after_control` (resume, N, N-1, N); batch N re-run once; exactly one control row per batch
-and its fields, including which attempt wrote it (`late_inserted_this_attempt`,
-`inserted_this_attempt`); `watermark_used` = max(m_k, k < N) - W; row deltas bronze
-2|A| + |B| + |C|, silver |A| + |C|, late |B|.
+`VALKYRIE_FAULT*`):** verify A, B and C (every id in silver ∪ late, none missing, none
+twice; B all in late, C and A all in silver; A's kept rows are from its first send; R6a-d not
+FAIL; R4/R5 are "not checkable" here, see below); the silver guard's exact (mode, T, C, P),
+(resume, N-1, N-1, N) and for `after_control` (resume, N, N-1, N); batch N re-run once; exactly
+one control row per batch and its fields, including which attempt wrote it
+(`late_inserted_this_attempt`, `inserted_this_attempt`); `watermark_used` = max(m_k, k < N) - W;
+row deltas bronze 2|A| + |B| + |C|, silver |A| + |C|, late |B|.
 
-**Results (2026-11-20, VERIFIED, logs in the slice 6 report):**
+**Results (2026-11-20, VERIFIED; SUMMARY lines in `docs/evidence/phase2/slice6/`):**
 
 | point | batch N | (T, C, P) at restart | control row N written by | late / on-time inserts in it | non-empty orphan files |
 |---|---|---|---|---|---|
@@ -1336,10 +1381,10 @@ reached, so "in Delta but not in the checkpoint" for bronze is covered only by t
 **Orphan files (K3).** Data files on disk that no `add` in any Delta commit references. None of
 the kills left an orphan with rows. Empty (0-row) orphans exist in late and control from before
 slice 6 (23 and 117 at the start). Observed: control gained exactly one per committed control
-row (129 rows, 129 empty orphans after the last run); late gained one in each replay whose late MERGE
-inserted nothing (after_late, after_silver, after_control) and none when it inserted rows. Why
-Delta leaves these 0-row files is UNVERIFIED. They
-are counted separately and never deleted.
+row (129 rows, 129 empty orphans after slice 6's last run); late gained one in each replay
+whose late MERGE inserted nothing (after_late, after_silver, after_control) and none when it
+inserted rows. Why Delta leaves these 0-row files is UNVERIFIED. They are counted separately
+and never deleted.
 
 **R4/R5 are "not checkable" in fault runs, by design.** Isolation needs no foreign bronze row
 within W of the run; A, B and C are sent within ~3 minutes of each other, so each is foreign to the
@@ -1351,4 +1396,5 @@ replication), clock jumps, kills at random instants inside one Parquet or Delta 
 pressure from other tenants. Kafka restarts and topic recreation are not covered in Phase 2.
 
 **Memory:** the same M1 stop lines as smoke-late (D2.5), set before the runs. Container peaks
-1.50-1.94 GiB, heap peak <= 0.66 GiB; none crossed.
+1.50-1.94 GiB, heap peaks 0.57-0.78 GiB; none crossed. (Corrected in slice 7: this line first
+said "heap peak <= 0.66 GiB", but after_silver's heap peak was 0.781 GiB.)
