@@ -384,6 +384,7 @@ build images quietly first (`make e2e-images`). Live numbers on this laptop: smo
   and topic recreation are still not tested.
 - *Phase 2 run times* (bronze + silver, verify of both layers; `docs/evidence/phase2/`):
   `make smoke` 139.5 s and 225.1 s, `make smoke-restart` 189.6 s (Phase 1: ~31 s and ~48 s).
+  In the final Phase 2 gate (after `make down && make up`): smoke 340.9 s, smoke-restart 400.6 s.
 
 ### D1.13 Plan: simulator pacing modes + deliberate lateness (BUILT in slice e, see D1.17)
 > **Status: built on 2026-11-15.** This is the original plan, kept for the record. D1.17
@@ -1193,6 +1194,14 @@ timing follow-up below measured no growth up to 500 rows, and the cache fallback
 running max in the driver, re-read once at start-up) was decided against for now.
 In smoke-dupes the second send's batch routed 7 rows to late, all already in silver
 (`late_dup_of_silver = 7`, nothing inserted): cross-run overlap, as predicted (plan section 1).
+
+*Updated in Phase 2 slice 7 (final gate, 2026-11-20; `docs/evidence/phase2/gate/`):* the
+first silver batch after a Spark start took 22.0 s in `make smoke` and 22.7 s in
+`make smoke-restart` (`addBatch`), against 11.4 and 15.6 s in the table above. The cause was
+not measured. Each gate run had only that one silver batch, so the "Revisit when" line below
+has no steady batch to judge; read literally (median `addBatch` over 10 s), it is crossed. The
+smoke's wm read was 2,937 ms, under that line's 3 s. The revisit is left to the Phase 10
+benchmark, which the line already names.
 
 **Timing follow-up (2026-11-19, measured with `bench/silver_steps.py` and
 `bench/wm_probe.py`; method in the probes' docstrings).**

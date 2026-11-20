@@ -143,19 +143,22 @@ One Spark process runs two streaming queries, each with a 10 s trigger.
 
 | Command | What it does | Writes to Kafka | Time (this laptop) |
 |---|---|---|---|
-| `make smoke` | Tiny run; verifies bronze and silver ∪ late; one `SUMMARY` JSON line | 10-16 events | 2.3-3.8 min |
+| `make smoke` | Tiny run; verifies bronze and silver ∪ late; one `SUMMARY` JSON line | 10-16 events | 2.3-5.7 min |
 | `make smoke-dupes` | Sends the same seed twice: bronze keeps 2 rows per id, silver 1 (the first send's) | 2 x 10-16 events | 2.6 min |
-| `make smoke-restart` | Graceful stop, a run sent while Spark is down, restart: nothing re-read, skipped or stored twice | 10-16 events | 3.2 min |
+| `make smoke-restart` | Graceful stop, a run sent while Spark is down, restart: nothing re-read, skipped or stored twice | 10-16 events | 3.2-6.7 min |
 | `make smoke-late` | Realtime run (4 matches, 30% of events late), judged by R1-R6 | about 250 events | 7.4-9.0 min |
 | `make smoke-faults` | SIGKILL at each silver write boundary and once inside bronze, then restart and judge; `E2E_ARGS="--point after_late"` runs one point | about 50 events per silver point, 14 per bronze attempt | about 10 min per silver point, 5 min for bronze |
 | `make verify MANIFEST=... [LAYER=bronze\|silver\|all]` | Read-only check of one run against its manifest | nothing | not measured separately |
 | `make timing-check MANIFEST=...` | Reads a run back from Kafka: was any event sent before its `event_time`? | nothing | seconds |
 | `make faults-config-check` | Counts mentions of the fault hooks in the default Compose config (must print 0) | nothing | seconds |
 | `make delta-compat` | Delta compatibility gate, checks C1-C14 | nothing | about 4 min |
-| `make test-unit`, `make test-spark`, `make lint` | 519 unit tests; 111 Spark tests in the Spark image; ruff | nothing | seconds; about 28 min; seconds |
+| `make test-unit`, `make test-spark`, `make lint` | 519 unit tests; 111 Spark tests in the Spark image; ruff | nothing | seconds; 28-47 min; seconds |
 
 Every e2e target ends with a `SUMMARY {json}` line and exits 0 on PASS (exit codes: D1.16,
-D2.5, D2.6). Times are from single runs on the WSL2 laptop, not benchmarks.
+D2.5, D2.6). Times are from single runs on the WSL2 laptop, not benchmarks. They vary between
+runs: for `make smoke`, `make smoke-restart` and `make test-spark` the upper end is from the
+final Phase 2 gate, run after `make down && make up` (so smoke also waited for Spark to start);
+about 4 of its 5.7 smoke minutes were the final verify (`docs/evidence/phase2/gate/`).
 
 ### What is tested, and how
 
@@ -195,8 +198,8 @@ boundaries and once inside bronze), not for every possible failure.
 - **A silver failure also stops bronze.** Both queries run in one process; Kafka's 7-day
   retention is the buffer until the job is restarted (D2.3).
 - **Batches can take longer than the 10 s trigger.** In smoke-late run 2, 9 of 25 silver
-  batches took longer (the slowest 15.3 s). The next batch then starts later; nothing is lost
-  (D2.4, D2.5).
+  batches took longer (the slowest 15.3 s). The first silver batch after a Spark start took
+  22-23 s in the final gate. The next batch then starts later; nothing is lost (D2.4, D2.5).
 - **Memory is close to the limit.** The Spark container peaked at 2.59-2.67 GiB in the
   smoke-late runs, with a 3 GiB limit. Above 2.8 GiB, smoke-late prints a `STOP (memory)`
   line and smoke-faults fails the run (D2.5, D2.6).

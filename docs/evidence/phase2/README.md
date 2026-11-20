@@ -13,8 +13,7 @@ scanned for absolute paths, user names, e-mail addresses, secrets and raw event 
 contents.
 
 **Not here:** runs from slices 1-3 and most of slice 4 (their numbers are only in the slice
-reports, which stayed outside the repo), and the final Phase 2 gate (its result is in the
-`phase-2` tag message).
+reports, which stayed outside the repo).
 
 ## slice4/ (D2.4 "Timing follow-up")
 
@@ -42,3 +41,17 @@ reports, which stayed outside the repo), and the final Phase 2 gate (its result 
 | `k5-checks.txt` | after all fault runs: `VALKYRIE_FAULT*` entries in the running container (0) and `make faults-config-check` (0) |
 | `k5-smoke.summary.json` | the normal `make smoke` run after the fault runs |
 | `test-spark-k6.txt` | the last line of the full Spark suite run with the hooks in place and inert (111 passed) |
+
+## gate/ (the final Phase 2 gate at `c8baf0e`; README run times, D1.16, D2.4)
+
+Run after `make down && make up`. Each file is copied as printed: the JSON of a `SUMMARY` or
+`MEMORY` line, or whole log lines. `steps.txt` keeps only the step and result lines, under a
+one-line header. Scanned like the files above before the commit: 0 hits.
+
+| File | What it is |
+|---|---|
+| `steps.txt` | the gate script's lines: start time, exit code and seconds of each step (`make down`, `make up`, lint, test-unit, test-spark, smoke, smoke-restart), and the result line of lint, test-unit and test-spark |
+| `smoke.summary.json` | the `make smoke` run: `total_s`, catch-up waits, verify result and counts, R4-R6d verdicts, MERGE and wm-read timing |
+| `smoke-restart.summary.json` | the `make smoke-restart` run: `total_s` and its 11 checks |
+| `smoke.memory.json`, `smoke-restart.memory.json` | the memory sampler's `MEMORY` line for each run: container and JVM peaks, GC share, `over_thresholds` |
+| `batch-progress.jsonl` | the Spark job's 4 `batch progress` log lines during the two runs (one bronze and one silver batch each): `trigger_ms`, `add_batch_ms`, offsets |

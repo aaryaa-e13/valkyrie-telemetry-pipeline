@@ -171,7 +171,7 @@ smoke: dirs up e2e-images ## Quick end-to-end check (tiny run), one JSON SUMMARY
 smoke-dupes: dirs up e2e-images ## Same seed sent twice: bronze 2 rows/id, silver 1 (first send)
 	$(PY) -m e2e.smoke_dupes $(E2E_ARGS)
 
-smoke-restart: dirs up e2e-images ## Graceful stop/restart: no re-read, no skip (~3 min)
+smoke-restart: dirs up e2e-images ## Graceful stop/restart: no re-read, no skip (~3-7 min)
 	$(PY) -m e2e.smoke_restart $(E2E_ARGS)
 
 smoke-late: dirs up e2e-images ## Realtime run with late events, judged by R1-R6 (~7-9 min)
