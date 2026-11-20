@@ -33,6 +33,7 @@ from types import FrameType
 from pyspark.sql.streaming import StreamingQuery
 
 from common.logging_setup import setup_logging
+from streaming import faults
 from streaming.bronze import (
     EXIT_REFUSED,
     kafka_source,
@@ -150,6 +151,11 @@ def main() -> int:
     logging.getLogger("py4j").setLevel(logging.WARNING)
     master = os.environ.get("SPARK_MASTER", "local[4]")
     driver_memory = os.environ.get("SPARK_DRIVER_MEMORY", "2g")
+    try:
+        faults.configure()      # test-only hooks: inert unless both env vars are set (D2.6)
+    except faults.FaultSetupError as exc:
+        log.error("start-up refused", extra={"fields": {"error": str(exc)}})
+        return EXIT_REFUSED
     return run(bcfg, scfg, master, driver_memory)
 
 

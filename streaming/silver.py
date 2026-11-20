@@ -62,6 +62,7 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
+from streaming import faults
 from streaming.bronze import table_has_data, table_txn_version
 from streaming.config import SilverJobConfig
 from streaming.schemas import EVENT_JSON_SCHEMA
@@ -658,13 +659,18 @@ def process_batch(df: DataFrame, batch_id: int, cfg: SilverJobConfig,
     df = df.persist()
     try:
         plan = plan_batch(df, batch_id, cfg, query_id, started)
+        n_late, n_ontime = plan.split.late, plan.split.ontime
         try:
+            faults.hit("after_read", batch_id, n_late, n_ontime)   # test-only hooks (D2.6)
             late = write_late(spark, cfg, plan)
+            faults.hit("after_late", batch_id, n_late, n_ontime)
             silver = write_silver(spark, cfg, plan)
+            faults.hit("after_silver", batch_id, n_late, n_ontime)
         finally:
             plan.release()
         row = control_row(cfg, plan, late, silver)
         write_control_row(spark, cfg.control_path, row)
+        faults.hit("after_control", batch_id, n_late, n_ontime)
         log.info("silver batch", extra={"fields": {
             "query": cfg.query_name, **{k: (v.isoformat() if isinstance(v, date) else v)
                                         for k, v in row.items()}}})
