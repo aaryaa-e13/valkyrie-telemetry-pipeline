@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from e2e.smoke_late import EXIT_NOT_CHECKABLE, judge
+from e2e.smoke_late import EXIT_NOT_CHECKABLE, judge, memory_stops
 
 PASS = dict.fromkeys(("R4", "R5", "R6a", "R6b", "R6c", "R6d"), "PASS")
 REPORT: dict[str, Any] = {
@@ -99,3 +99,13 @@ def test_warnings_never_fail() -> None:
     assert (code, problems) == (0, [])
     assert [w.split(" ")[0:2] for w in warnings] == [["no", "very"], ["max", "G"],
                                                      ["slight", "margin"]]
+
+
+def test_memory_stop_lines_m1() -> None:
+    ok = {"samples": 100, "container_peak_gib": 2.65, "over_thresholds": []}
+    assert memory_stops(ok, 2.593) == []                          # +0.057 GiB
+    assert memory_stops(ok, None) == []
+    assert "grew 0.101 GiB" in memory_stops({**ok, "container_peak_gib": 2.694}, 2.593)[0]
+    assert memory_stops({**ok, "over_thresholds": ["container peak 2.9 GiB > 2.8"]},
+                        None) == ["container peak 2.9 GiB > 2.8"]
+    assert memory_stops({"samples": 0}, None) == ["container memory not measured"]

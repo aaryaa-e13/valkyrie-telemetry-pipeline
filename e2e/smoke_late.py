@@ -56,7 +56,11 @@ from e2e.orchestrator import (
 from streaming.status import read_status
 
 EXIT_NOT_CHECKABLE = 2
-CONTAINER_PEAK_GIB = 2.26        # slice 4 limit (2.05 + 10 %), condition V2
+# Stop lines (condition M1, set before runs 2-3): container peak > 2.8 GiB (200 MB under
+# the 3 GiB container limit), peak growth > 0.1 GiB from the previous run (leak signal),
+# heap > 1.6 GiB, GC > 10 %, OOM. Run 1 used 2.26 GiB (slice 4: 2.05 + 10 %) and crossed it.
+CONTAINER_PEAK_GIB = 2.8
+PEAK_GROWTH_GIB = 0.1
 G_WARN_MS = 30_000               # W / 2: very routing loses its margin (S6)
 SLIGHT_WARN_MS = 15_000          # 0.25 W: half the expected slight margin (S6)
 
@@ -128,6 +132,26 @@ def judge(report: dict[str, Any], baseline: tuple[str, int] | None
     return (EXIT_VERIFY if problems else EXIT_PASS), problems, warnings
 
 
+def memory_stops(memory: dict[str, Any], prev_peak_gib: float | None) -> list[str]:
+    """M1 stop lines crossed in this run (pure, unit-tested)."""
+    stops = list(memory.get("over_thresholds") or [])
+    peak = memory.get("container_peak_gib")
+    if not memory.get("samples"):
+        stops.append("container memory not measured")
+    elif prev_peak_gib is not None and peak is not None \
+            and peak - prev_peak_gib > PEAK_GROWTH_GIB:
+        stops.append(f"container peak grew {peak - prev_peak_gib:.3f} GiB from the previous "
+                     f"run ({prev_peak_gib} -> {peak}) > {PEAK_GROWTH_GIB}")
+    return stops
+
+
+def spark_started_at() -> str | None:
+    """The Spark container's start time (to show no restart between runs)."""
+    res = subprocess.run(["docker", "inspect", "--format", "{{.State.StartedAt}}",
+                          SPARK_CONTAINER], capture_output=True, text=True)
+    return res.stdout.strip() or None
+
+
 def _sec(us: int | None) -> str:
     return "-inf" if us is None else time.strftime("%H:%M:%S", time.gmtime(us / 1e6))
 
@@ -184,7 +208,12 @@ def run_late(run: Run, args: argparse.Namespace) -> int:
     t0, t0_wall = time.monotonic(), time.time()
     say(f"[1/8] seed {run.seed} (fresh), config simulator/config.late.yaml (realtime)")
     say("[2/8] checking services and starting Spark")
+    started_before = spark_started_at()
     ensure_services(start_spark=not args.no_start_spark)
+    run.summary["spark_started_at"] = started = spark_started_at()
+    run.summary["spark_restarted_by_this_run"] = started != started_before
+    say(f"      spark container started at {started}"
+        f"{' (restarted by this run)' if started != started_before else ' (not restarted)'}")
     snap = catchup.delta_snapshot_from_status(read_status(args.silver_status_path))
     baseline = (snap.query_id, snap.batch_id) if snap else None
     run.summary["silver_baseline"] = list(baseline) if baseline else None
@@ -198,6 +227,16 @@ def run_late(run: Run, args: argparse.Namespace) -> int:
     finally:
         memory = sampler.stop()
     run.summary["memory"] = memory
+    jvm = memory.get("jvm") or {}
+    gib = 1024 ** 3
+    say("      MEMORY container peak "
+        f"{memory.get('container_peak_gib')} GiB (end {memory.get('container_end_gib')}, "
+        f"previous run {args.prev_container_peak_gib}); JVM since its start (REST /executors "
+        "peakMemoryMetrics): " + (
+            f"heap {(jvm.get('heap_peak_bytes') or 0) / gib:.3f} GiB, off-heap "
+            f"{(jvm.get('offheap_peak_bytes') or 0) / gib:.3f} GiB, GC {memory.get('gc_share')}"
+            if jvm.get("measured") else f"not available ({jvm.get('reason')})"))
+    run.summary["memory_stops"] = stops = memory_stops(memory, args.prev_container_peak_gib)
     logs = container_logs(SPARK_CONTAINER, since=t0_wall)
     run.summary["silver_evidence"] = {
         "batch_timing": silver_checks.batch_timing(logs, args.trigger_interval_s),
@@ -222,8 +261,10 @@ def run_late(run: Run, args: argparse.Namespace) -> int:
     jcode, problems, warnings = judge(report, baseline)
     if code not in (0, 1) and jcode == EXIT_PASS:
         jcode, problems = EXIT_VERIFY, [f"verify exited {code}"]
-    for w in warnings + [f"memory: {x}" for x in memory.get("over_thresholds") or []]:
+    for w in warnings:
         say(f"WARNING: {w}")
+    for x in stops:
+        say(f"STOP (memory, M1): {x}")
     run.summary["warnings"] = warnings
     run.summary["total_s"] = round(time.monotonic() - t0, 1)
     if jcode != EXIT_PASS:
@@ -243,6 +284,8 @@ def run_late(run: Run, args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="VALKYRIE smoke-late (realtime, deliberate lateness)")
     add_common_args(p)
+    p.add_argument("--prev-container-peak-gib", type=float,
+                   help="previous smoke-late's container peak (M1 growth stop line)")
     args = p.parse_args(argv)
     seed = args.seed if args.seed is not None else time.time_ns() // 1_000_000
     run = Run(mode="late", seed=seed, summary={"mode": "smoke-late", "seed": seed})
