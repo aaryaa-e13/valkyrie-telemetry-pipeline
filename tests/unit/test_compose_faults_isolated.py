@@ -53,7 +53,8 @@ def test_only_smoke_faults_loads_the_faults_file() -> None:
     files = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True,
                            check=True).stdout.split()
     users = {f for f in files
-             if not f.startswith("docs/") and f != "tests/unit/test_compose_faults_isolated.py"
+             if not f.startswith("docs/") and f not in (
+                 "tests/unit/test_compose_faults_isolated.py", "docker-compose.faults.yml")
              and (ROOT / f).is_file() and USE.search((ROOT / f).read_text(errors="ignore"))}
     assert users <= {"e2e/smoke_faults.py"}, users
     assert USE.search('FAULTS_FILE = "docker-compose.faults.yml"')       # the pattern works
