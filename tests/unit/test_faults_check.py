@@ -152,3 +152,14 @@ def test_table_state_refuses_without_commit_0(tmp_path: Path) -> None:
     (t / "_delta_log" / f"{0:020d}.json").unlink()
     with pytest.raises(ValueError, match="commit 0"):
         fc.table_state(t)
+
+
+def test_live_rows_fills_columns_an_older_file_lacks(tmp_path: Path) -> None:
+    t = _fake_table(tmp_path)
+    pq.write_table(pa.table({"event_id": ["d"], "extra": [7]}), t / "p3.parquet")
+    add = {"add": {"path": "p3.parquet", "dataChange": True,
+                   "stats": json.dumps({"numRecords": 1})}}
+    (t / "_delta_log" / f"{2:020d}.json").write_text(json.dumps(add) + "\n")
+    got = sorted(fc.live_rows(t, ["event_id", "extra"]), key=lambda r: r["event_id"])
+    assert got == [{"event_id": "a", "extra": None}, {"event_id": "b", "extra": None},
+                   {"event_id": "c", "extra": None}, {"event_id": "d", "extra": 7}]

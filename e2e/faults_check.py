@@ -90,7 +90,10 @@ def live_rows(path: Path, columns: Iterable[str]) -> list[dict[str, Any]]:
     cols = list(columns)
     out: list[dict[str, Any]] = []
     for a in live_adds(read_commits(path)):
-        out += pq.read_table(path / unquote(a["path"]), columns=cols).to_pylist()
+        f = path / unquote(a["path"])
+        have = [c for c in cols if c in pq.read_schema(f).names]   # older files: fewer columns
+        for r in pq.read_table(f, columns=have).to_pylist():
+            out.append({c: r.get(c) for c in cols})                # missing -> None, as Delta
     return out
 
 

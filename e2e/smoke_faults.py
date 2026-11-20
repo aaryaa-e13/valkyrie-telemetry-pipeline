@@ -152,6 +152,13 @@ def wait_for_bronze_rows(v_before: int | None, n: int, timeout: float = 180.0) -
         time.sleep(1.0)
 
 
+def save_evidence(args: argparse.Namespace, name: str, text: str) -> None:
+    """Write evidence next to --json-summary at once (a later crash cannot lose it)."""
+    if args.json_summary:
+        args.json_summary.parent.mkdir(parents=True, exist_ok=True)
+        (args.json_summary.parent / name).write_text(text + "\n", encoding="utf-8")
+
+
 def wait_stopped(timeout: float = 60.0) -> catchup.ContainerState:
     deadline = time.monotonic() + timeout
     while True:
@@ -257,6 +264,11 @@ def run_silver_point(point: str, args: argparse.Namespace, out: dict[str, Any]) 
         st = wait_stopped()
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
         killed_logs = container_logs(SPARK_CONTAINER)          # before the container is replaced
+        save_evidence(args, f"{tag}.killed-container.log", "\n".join(killed_logs))
+        save_evidence(args, f"{tag}.state.json", json.dumps(
+            {"exit_code": st.exit_code, "oom_killed": st.oom_killed, "marker": marker,
+             "lake": fc.lake_state(PATHS), "files": fc.checkpoint_batch(
+                 SILVER_CP, int(marker["batch_id"]))}, default=str))
         n = int(marker["batch_id"])
         q = read_checkpoint_state(SILVER_CP).query_id or ""
         say(f"      marker: batch {n}, late {marker['late_rows']}, on time "
@@ -482,6 +494,12 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         code = 130
         summary["error"] = "interrupted"
+    except Exception as exc:  # noqa: BLE001 - a bug in this script: report, restart Spark
+        import traceback
+
+        code = EXIT_VERIFY
+        say(f"\nFAIL (exit {code}): smoke-faults crashed:\n{traceback.format_exc()}")
+        summary["error"] = f"crash: {exc!r}"
     finally:
         if not container_state(SPARK_CONTAINER).running or fault_env_in_container():
             try:
