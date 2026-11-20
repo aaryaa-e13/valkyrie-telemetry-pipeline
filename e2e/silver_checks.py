@@ -78,6 +78,46 @@ def late_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def batch_timing(lines: Iterable[str], trigger_s: float, query: str = "silver"
+                 ) -> dict[str, Any]:
+    """addBatch time per batch with input rows vs the trigger, from "batch progress" lines.
+
+    Also lists batches whose end offset is in the MIDDLE of a bronze version
+    (index != -1): only then can part of one bronze version be an "earlier" batch
+    for the rest of it (slice 5 plan S6 1a). Report only.
+    """
+    recs = []
+    for line in lines:
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("msg") == "batch progress" and rec.get("query") == query \
+                and isinstance(rec.get("batch_id"), int):
+            recs.append(rec)
+    add = [int(r["add_batch_ms"]) for r in recs if r.get("add_batch_ms") is not None]
+    trigger_ms = int(trigger_s * 1000)
+    return {
+        "batches": len(recs),
+        "median_add_batch_ms": _median(add), "max_add_batch_ms": max(add) if add else None,
+        "trigger_ms": trigger_ms, "over_trigger": sum(1 for a in add if a > trigger_ms),
+        "ended_mid_version": [r["batch_id"] for r in recs
+                              if int((r.get("end_offset") or {}).get("index", -1)) != -1],
+    }
+
+
+def delta_checkpoints_since(table: Path, since_wall: float) -> list[int]:
+    """Versions of `table` that got a Delta checkpoint file at or after `since_wall`."""
+    log_dir = table / "_delta_log"
+    if not log_dir.is_dir():
+        return []
+    return sorted(int(f.name.split(".")[0]) for f in log_dir.glob("*.checkpoint.parquet")
+                  if f.stat().st_mtime >= since_wall)
+
+
 def merge_scan_evidence(ui_url: str, silver_path: Path,
                         records: list[dict[str, Any]]) -> dict[str, Any]:
     """Files read by the newest MERGE (Spark scan metrics) vs files in its window (Delta log).

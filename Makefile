@@ -24,7 +24,7 @@ dirs: ## Create bind-mount folders owned by you (Docker would create them as roo
 
 .PHONY: help env up down ps logs topics describe-topic venv sim-dry sim-local sim-tiny sim \
 	sim-realtime sim-late timing-check consume test-unit lint spark-build spark-image spark-up \
-	spark-stop spark-logs verify test-spark test-spark-fast demo smoke smoke-dupes e2e-images smoke-restart \
+	spark-stop spark-logs verify test-spark test-spark-fast demo smoke smoke-dupes e2e-images smoke-restart smoke-late \
 	delta-compat jars-lock
 
 help: ## List available targets
@@ -173,3 +173,6 @@ smoke-dupes: dirs up e2e-images ## Same seed sent twice: bronze 2 rows/id, silve
 
 smoke-restart: dirs up e2e-images ## Graceful stop/restart: no re-read, no skip (~1-2 min)
 	$(PY) -m e2e.smoke_restart $(E2E_ARGS)
+
+smoke-late: dirs up e2e-images ## Realtime run with late events, judged by R1-R6 (~6-8 min)
+	$(PY) -m e2e.smoke_late $(E2E_ARGS)

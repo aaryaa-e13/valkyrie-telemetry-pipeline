@@ -8,6 +8,8 @@ Two sources, reported side by side:
 
 Stop-and-ask thresholds (plan S3.10): container peak > 2.5 GiB, heap peak
 > 1.6 GiB, GC time > 10 % of uptime, or the container OOM-killed / exit 137.
+--container-peak-gib overrides the first one (smoke-late uses 2.26 GiB, the
+slice 4 limit: slice 3's 2.05 GiB peak + 10 %).
 The sampler only REPORTS them (`over_thresholds`); it changes nothing.
 
 Usage:
@@ -64,7 +66,8 @@ def jvm_metrics(ui: str) -> dict[str, Any]:
             "gc_ms": ex.get("totalGCTime"), "uptime_ms": uptime_ms}
 
 
-def summarize(samples: list[int], jvm: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+def summarize(samples: list[int], jvm: dict[str, Any], state: dict[str, Any],
+              container_peak_gib: float = THRESHOLDS["container_peak_gib"]) -> dict[str, Any]:
     """Peaks, end value and which thresholds were crossed (pure, unit-tested)."""
     out: dict[str, Any] = {
         "samples": len(samples),
@@ -73,8 +76,8 @@ def summarize(samples: list[int], jvm: dict[str, Any], state: dict[str, Any]) ->
         "jvm": jvm, "container_state": state}
     over = []
     if out["container_peak_gib"] is not None and \
-            out["container_peak_gib"] > THRESHOLDS["container_peak_gib"]:
-        over.append(f"container peak {out['container_peak_gib']} GiB > 2.5")
+            out["container_peak_gib"] > container_peak_gib:
+        over.append(f"container peak {out['container_peak_gib']} GiB > {container_peak_gib}")
     if jvm.get("measured"):
         heap = (jvm.get("heap_peak_bytes") or 0) / GIB
         out["heap_peak_gib"] = round(heap, 3)
@@ -110,6 +113,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--until-file", type=Path, help="stop early when this file exists")
     p.add_argument("--interval", type=float, default=2.0)
     p.add_argument("--label", default="")
+    p.add_argument("--container-peak-gib", type=float,
+                   default=THRESHOLDS["container_peak_gib"])
     p.add_argument("--out", type=Path, help="also append the JSON line to this file")
     args = p.parse_args(argv)
     samples: list[int] = []
@@ -120,8 +125,9 @@ def main(argv: list[str] | None = None) -> int:
         if (b := sample(args.container)) is not None:
             samples.append(b)
         time.sleep(args.interval)
-    result = {"label": args.label, **summarize(samples, jvm_metrics(args.ui),
-                                               container_state(args.container))}
+    result = {"label": args.label, "container_peak_limit_gib": args.container_peak_gib,
+              **summarize(samples, jvm_metrics(args.ui), container_state(args.container),
+                          args.container_peak_gib)}
     line = json.dumps(result, separators=(",", ":"))
     print(f"MEMORY {line}", flush=True)
     if args.out:

@@ -59,6 +59,9 @@ MODES: dict[str, dict[str, Any]] = {
     "demo": {"config": "simulator/config.yaml", "timeout": 180.0, "matches": 20},
     # Used by e2e.smoke_restart; the timeout includes JVM start-up after the restart.
     "restart": {"config": "simulator/config.tiny.yaml", "timeout": 120.0, "matches": None},
+    # Used by e2e.smoke_late (realtime, ~5-7 min of sending); the timeout counts from
+    # the end of the send, so 180 s is generous.
+    "late": {"config": "simulator/config.late.yaml", "timeout": 180.0, "matches": None},
 }
 
 
