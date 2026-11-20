@@ -70,7 +70,7 @@ class SimulatorConfig:
     # Deliberate lateness (see simulator/schedule.py for the exact formula)
     late_fraction: float = 0.0          # share of events sent late; 0 = off
     late_too_late_share: float = 0.2    # share of the late events in the "very" band
-    assumed_watermark_s: float = 30.0   # placeholder for the Phase 2 watermark
+    assumed_watermark_s: float = 60.0   # = the silver job's WATERMARK_DELAY_S (D2.4)
 
     # Output
     manifest_dir: str = "manifests"

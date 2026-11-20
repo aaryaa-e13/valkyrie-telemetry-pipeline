@@ -1,0 +1,20 @@
+# smoke-late (Phase 2 slice 5, DECISIONS D2.5): a REAL realtime run with deliberate
+# lateness, judged by the oracle rules R4-R6. ~233-265 events, ~92-104 KB, the send
+# phase takes ~4.6-6.6 min (12-seed dry run, plan F3). Everything not listed here
+# uses the SimulatorConfig defaults (= config.yaml).
+seed: 42                     # e2e.smoke_late always passes a fresh --seed
+num_matches: 4
+players_per_team: 5
+kills_per_match_min: 5
+kills_per_match_max: 15
+items_per_player_min: 2
+items_per_player_max: 6
+match_duration_s_min: 1200   # / time_scale 10 = 2-4 min of wall clock per match
+match_duration_s_max: 2400
+match_interval_s: 30
+
+pace: realtime               # timeline starts 1 s after now: an isolated timeline (S2)
+time_scale: 10
+late_fraction: 0.3
+late_too_late_share: 0.2
+assumed_watermark_s: 60      # = the silver job's WATERMARK_DELAY_S (D2.4)

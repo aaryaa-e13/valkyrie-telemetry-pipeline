@@ -143,7 +143,8 @@ def test_lateness_uniforms_follow_the_documented_formula() -> None:
 def test_lateness_golden_values_are_stable() -> None:
     """Pinned outputs: fails if the formula (or its byte layout) ever changes."""
     ids = [e.event_id for e in _events(seed=42, num_matches=2)[:5]]
-    assert [plan_delay(42, i, LatenessConfig(late_fraction=1.0)) for i in ids] == GOLDEN_DELAYS
+    assert [plan_delay(42, i, LatenessConfig(late_fraction=1.0, assumed_watermark_s=30.0))
+            for i in ids] == GOLDEN_DELAYS  # pinned at W = 30 (slice e)
 
 
 def test_lateness_is_the_same_in_a_fresh_process_with_another_hash_seed() -> None:

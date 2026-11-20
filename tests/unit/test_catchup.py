@@ -252,3 +252,59 @@ def test_missing_container_error_any_case(stderr: str) -> None:
     from e2e.docker_ops import is_missing_container_error
     assert is_missing_container_error(stderr)
     assert not is_missing_container_error("permission denied while trying to connect")
+
+
+# --- silver (Delta source) catch-up ----------------------------------------------
+
+
+def _silver_status(version: int, index: int = -1, starting: bool = False,
+                   reservoir: str = "bronze-id") -> dict:
+    return {"status_version": 2, "source": "delta", "query_id": "S",
+            "updated_at": "2026-11-19T10:00:00.000Z",
+            "last_batch": {"batch_id": 4, "end_offset": {
+                "reservoir_id": reservoir, "reservoir_version": version, "index": index,
+                "is_starting_version": starting}}}
+
+
+def test_kafka_snapshot_ignores_delta_status_and_vice_versa() -> None:
+    assert catchup.snapshot_from_status(_silver_status(5)) is None
+    assert catchup.delta_snapshot_from_status({"status_version": 2, "source": "kafka",
+                                               "query_id": "q", "last_batch": {}}) is None
+    snap = catchup.delta_snapshot_from_status(_silver_status(5))
+    assert snap is not None and snap.reservoir_version == 5 and snap.batch_id == 4
+
+
+@pytest.mark.parametrize(("version", "index", "starting", "expected"), [
+    (8, -1, False, True),    # versions < 8 consumed; 7 is the target
+    (7, -1, False, False),   # only versions < 7 consumed
+    (7, 3, False, False),    # in the middle of version 7: wait (conservative)
+    (9, 2, False, True),     # in the middle of 9: 7 is fully consumed
+    (8, -1, True, False),    # still reading the initial snapshot
+])
+def test_silver_caught_up_rule(version: int, index: int, starting: bool, expected: bool) -> None:
+    snap = catchup.delta_snapshot_from_status(_silver_status(version, index, starting))
+    assert catchup.check_silver_caught_up(snap, "bronze-id", 7).caught_up is expected
+
+
+def test_silver_wrong_table_or_missing_status_is_not_caught_up() -> None:
+    other = catchup.delta_snapshot_from_status(_silver_status(9, reservoir="other"))
+    res = catchup.check_silver_caught_up(other, "bronze-id", 7)
+    assert not res.caught_up and "recreated" in res.reasons[0]
+    assert not catchup.check_silver_caught_up(None, "bronze-id", 7).caught_up
+    unknown = catchup.check_silver_caught_up(
+        catchup.delta_snapshot_from_status(_silver_status(9)), None, 7)
+    assert unknown.caught_up and "not checked" in unknown.reasons[0]
+
+
+def test_log_facts_are_per_query() -> None:
+    lines = [
+        '{"msg": "query started", "query": "bronze", "run_id": "rb"}',
+        '{"msg": "query started", "query": "silver", "run_id": "rs"}',
+        '{"msg": "batch progress", "query": "bronze", "batch_id": 3}',
+        '{"msg": "batch progress", "query": "silver", "batch_id": 9}',
+        '{"msg": "batch progress", "batch_id": 2}',
+    ]
+    bronze = catchup.parse_log_lines(lines)
+    silver = catchup.parse_log_lines(lines, query="silver")
+    assert bronze.batch_ids == (3, 2) and bronze.started_run_ids == ("rb",)
+    assert silver.batch_ids == (9,) and silver.started_run_ids == ("rs",)

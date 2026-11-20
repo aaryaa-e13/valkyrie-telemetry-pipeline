@@ -62,7 +62,7 @@ def test_shipped_yaml_files_load() -> None:
 def test_pacing_and_lateness_defaults_keep_the_features_off() -> None:
     cfg = load_config(env={})
     assert (cfg.pace, cfg.time_scale, cfg.late_fraction) == ("backfill", 1.0, 0.0)
-    assert (cfg.late_too_late_share, cfg.assumed_watermark_s) == (0.2, 30.0)
+    assert (cfg.late_too_late_share, cfg.assumed_watermark_s) == (0.2, 60.0)
 
 
 def test_pacing_and_lateness_settings_load_from_env_and_reach_lateness_config() -> None:

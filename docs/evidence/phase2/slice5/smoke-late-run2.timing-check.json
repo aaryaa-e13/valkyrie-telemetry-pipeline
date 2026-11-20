@@ -1,0 +1,1 @@
+{"check":"timing","manifest":"manifests/run_20261120T141432Z_seed1795184070343.json","manifest_version":3,"seed":1795184070343,"pace":"realtime","late_listed":83,"events_expected":260,"events_read":260,"repeated_in_range":0,"tolerance_ms":1,"ahead":0,"max_ahead_ms":0,"max_behind_ms":178133,"out_of_order":77,"reasons":[],"result":"PASS","exit_code":0}

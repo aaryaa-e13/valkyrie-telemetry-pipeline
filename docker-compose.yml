@@ -114,7 +114,7 @@ services:
     restart: "no"
 
   # ---------------------------------------------------------------------------
-  # Spark Structured Streaming: Kafka -> raw Parquet (profile: spark).
+  # Spark Structured Streaming: Kafka -> bronze Delta table (profile: spark).
   # Local mode inside one container: driver + executors share one JVM.
   # Memory: 2g JVM heap + ~1g headroom (off-heap, metaspace, Python) = 3g limit.
   # ---------------------------------------------------------------------------
@@ -135,12 +135,32 @@ services:
       TOPIC_NAME: ${TOPIC_NAME:-game-events}
       TRIGGER_INTERVAL: ${TRIGGER_INTERVAL:-10 seconds}
       MAX_OFFSETS_PER_TRIGGER: ${MAX_OFFSETS_PER_TRIGGER:-50000}
-      RAW_OUTPUT_PATH: /data/lake/raw/game_events
-      RAW_CHECKPOINT_PATH: /data/checkpoints/raw_to_parquet
-      STATUS_PATH: /data/status/raw_to_parquet.json   # last committed batch (for tests)
+      BRONZE_PATH: /data/lake/bronze/game_events
+      BRONZE_CHECKPOINT_PATH: /data/checkpoints/bronze
+      STATUS_PATH: /data/status/bronze.json           # last committed batch (for tests)
+      # 1 = start even if the table has data but the checkpoint is gone (re-appends
+      # everything still in Kafka). Off by default; see DECISIONS D2.2.
+      BRONZE_ALLOW_REBUILD: ${BRONZE_ALLOW_REBUILD:-0}
+      # Silver (bronze Delta -> one row per event_id), same process. DECISIONS D2.3.
+      SILVER_PATH: /data/lake/silver/game_events
+      SILVER_CONTROL_PATH: /data/lake/_control/silver_batches
+      SILVER_LATE_PATH: /data/lake/silver/late_events
+      SILVER_CHECKPOINT_PATH: /data/checkpoints/silver
+      SILVER_STATUS_PATH: /data/status/silver.json
+      DEDUPE_HORIZON_DAYS: ${DEDUPE_HORIZON_DAYS:-7}
+      # Watermark W in seconds (D2.4). Fixed per silver query id: start-up refuses a
+      # different W; changing it needs a silver checkpoint reset.
+      WATERMARK_DELAY_S: ${WATERMARK_DELAY_S:-60}
+      # Bronze files per silver batch (Delta's own default, made explicit; D2.4).
+      SILVER_MAX_FILES_PER_TRIGGER: ${SILVER_MAX_FILES_PER_TRIGGER:-1000}
+      # Tasks per Delta snapshot rebuild (Delta default 50). 4 halved a small silver
+      # batch on this laptop (DECISIONS D2.3, slice 3 follow-up). Empty = Delta default.
+      DELTA_SNAPSHOT_PARTITIONS: ${DELTA_SNAPSHOT_PARTITIONS-4}
+      # 1 = start although the silver checkpoint and silver/control tables disagree.
+      SILVER_ALLOW_REBUILD: ${SILVER_ALLOW_REBUILD:-0}
       LOG_LEVEL: ${SPARK_JOB_LOG_LEVEL:-INFO}
     volumes:
-      # Parquet output + checkpoints (git-ignored). See simulator for why long syntax.
+      # Delta tables + checkpoints (git-ignored). See simulator for why long syntax.
       - type: bind
         source: ./data
         target: /data
@@ -164,7 +184,7 @@ services:
   # One-shot Spark tools, e.g. verify_manifest (profile: tools). Same image as
   # `spark`, but separate so it can run NEXT TO the streaming job:
   #   - no container_name / ports  -> no clash with valkyrie-spark or :4040
-  #   - no depends_on kafka         -> reads Parquet only
+  #   - no depends_on kafka         -> reads the lake only
   #   - ./data is READ-ONLY         -> a verify bug cannot damage the lake or
   #                                    the checkpoint (proved in D1.16)
   #   - Spark scratch space lives in the container's own /tmp, not on the host

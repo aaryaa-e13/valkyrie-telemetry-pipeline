@@ -1,0 +1,11 @@
+# TEST ONLY (Phase 2 slice 6, DECISIONS D2.6): turns on the silver fault hooks
+# (streaming/faults.py). Used ONLY by e2e/smoke_faults.py, which passes
+#   docker compose -f docker-compose.yml -f docker-compose.faults.yml ...
+# and restarts Spark without this file afterwards. Deliberately NOT named
+# docker-compose.override.yml: compose loads that one automatically.
+services:
+  spark:
+    environment:
+      VALKYRIE_FAULTS_ENABLED: "1"
+      VALKYRIE_FAULT_POINT: ${VALKYRIE_FAULT_POINT:?set by e2e.smoke_faults}
+      VALKYRIE_FAULT_TAG: ${VALKYRIE_FAULT_TAG:?set by e2e.smoke_faults}

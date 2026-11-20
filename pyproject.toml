@@ -10,6 +10,7 @@ testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 markers = [
     "integration: needs running Docker services (Kafka); run with `make test-integration`",
+    "spark_fast: quick Spark test for the dev loop; run with `make test-spark-fast`",
 ]
 
 [tool.ruff]

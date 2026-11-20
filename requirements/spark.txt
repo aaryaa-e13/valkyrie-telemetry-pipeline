@@ -1,6 +1,14 @@
-# Spark container dependencies (pinned). pyspark must match the Kafka connector version.
+# Spark container dependencies (pinned, including transitive deps).
+# pyspark must match the Kafka connector and the Delta jar (built for Spark 4.1).
+# The image build fails if `pip freeze` differs from this file (docker/spark/pip_gate.py).
 pyspark==4.1.4
 py4j==0.10.9.9
+# Delta Lake Python API (delta.tables). Requires pyspark>=4.0.1,<=4.2.0 and
+# importlib_metadata; versions below are pip's resolution in the image on 2026-11-18.
+# The Delta JARs are baked in by docker/spark/fetch_jars.sh, not downloaded at runtime.
+delta-spark==4.4.1
+importlib_metadata==8.7.1
+zipp==4.1.2
 # Test runner for tests/spark (runs inside this image).
 pytest==9.2.0
 iniconfig==2.3.1

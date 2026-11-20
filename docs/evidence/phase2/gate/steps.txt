@@ -1,0 +1,20 @@
+Final Phase 2 gate at c8baf0e: the gate script's step lines (start, exit code, seconds) and the result line of lint, test-unit and test-spark.
+=== HEAD c8baf0e; status lines: 0
+=== down start 2026-11-20T18:31:55Z
+=== down exit 0 after 16 s
+=== up start 2026-11-20T18:32:11Z
+=== up exit 0 after 56 s
+=== lint start 2026-11-20T18:33:07Z
+=== lint exit 0 after 0 s
+All checks passed!
+=== test-unit start 2026-11-20T18:33:07Z
+=== test-unit exit 0 after 6 s
+519 passed in 5.72s
+=== test-spark start 2026-11-20T18:33:13Z
+=== test-spark exit 0 after 2807 s
+111 passed in 2799.75s (0:46:39)
+=== smoke start 2026-11-20T19:20:01Z
+=== smoke exit 0 after 362 s
+=== smoke-restart start 2026-11-20T19:26:04Z
+=== smoke-restart exit 0 after 419 s
+=== GATE PASS at c8baf0e 2026-11-20T19:33:10Z

@@ -9,13 +9,15 @@ from pathlib import Path
 
 import pytest
 
-from streaming.config import RawJobConfig
+from streaming.config import BronzeJobConfig
 from streaming.status import (
     HISTORY_LIMIT,
     STATUS_VERSION,
     batch_record,
+    parse_delta_offset,
     parse_offsets,
     read_status,
+    source_kind,
     update_status,
     write_status,
 )
@@ -143,6 +145,68 @@ def test_missing_status_reads_as_none(tmp_path: Path) -> None:
 # --- config --------------------------------------------------------------------------
 
 def test_status_path_default_and_explicit_disable() -> None:
-    assert RawJobConfig.from_env({}).status_path == "/data/status/raw_to_parquet.json"
-    assert RawJobConfig.from_env({"STATUS_PATH": ""}).status_path == ""
-    assert RawJobConfig.from_env({"STATUS_PATH": "/x/s.json"}).status_path == "/x/s.json"
+    assert BronzeJobConfig.from_env({}).status_path == "/data/status/bronze.json"
+    assert BronzeJobConfig.from_env({"STATUS_PATH": ""}).status_path == ""
+    assert BronzeJobConfig.from_env({"STATUS_PATH": "/x/s.json"}).status_path == "/x/s.json"
+
+
+# --- status v2: Delta source offsets (silver) -------------------------------------
+
+DELTA_END = ('{"sourceVersion":1,"reservoirId":"d41e","reservoirVersion":5,"index":-1,'
+             '"isStartingVersion":false}')
+
+
+def test_delta_offset_is_normalised() -> None:
+    assert parse_delta_offset(DELTA_END) == {
+        "reservoir_id": "d41e", "reservoir_version": 5, "index": -1,
+        "is_starting_version": False}
+    assert parse_delta_offset("None") is None
+
+
+@pytest.mark.parametrize("bad", ['{"game-events": {"0": 3}}', "[1]"])
+def test_non_delta_offset_is_refused(bad: str) -> None:
+    with pytest.raises(ValueError):
+        parse_delta_offset(bad)
+
+
+def test_source_kind_detects_delta_and_kafka() -> None:
+    assert source_kind(DELTA_END) == "delta"
+    assert source_kind('{"game-events": {"0": 3}}') == "kafka"
+    assert source_kind(None) is None
+
+
+def test_delta_record_and_status_carry_source() -> None:
+    rec = batch_record(batch_id=0, run_id="r", num_input_rows=7, timestamp="t", trigger_ms=1,
+                       start_offset=None, end_offset=DELTA_END, source="delta")
+    s = update_status(None, rec, query_name="silver", query_id="S", source="delta", now=NOW)
+    assert s["source"] == "delta" and s["status_version"] == 2
+    assert s["last_batch"]["end_offset"]["reservoir_version"] == 5
+    with pytest.raises(ValueError):
+        batch_record(batch_id=0, run_id="r", num_input_rows=7, timestamp="t", trigger_ms=1,
+                     start_offset=None, end_offset=DELTA_END, source="kafka")
+    with pytest.raises(ValueError, match="source"):
+        batch_record(batch_id=0, run_id="r", num_input_rows=7, timestamp="t", trigger_ms=1,
+                     start_offset=None, end_offset=DELTA_END, source="parquet")
+
+
+def test_source_change_starts_history_fresh() -> None:
+    kafka = update_status(None, _record(0, {"0": 3}), query_name="q", query_id="Q", now=NOW)
+    rec = batch_record(batch_id=1, run_id="r", num_input_rows=7, timestamp="t", trigger_ms=1,
+                       start_offset=None, end_offset=DELTA_END, source="delta")
+    s = update_status(kafka, rec, query_name="q", query_id="Q", source="delta", now=NOW)
+    assert [h["batch_id"] for h in s["history"]] == [1]
+
+
+def test_version_1_file_still_reads_as_kafka(tmp_path: Path) -> None:
+    path = tmp_path / "bronze.json"
+    path.write_text(json.dumps({"status_version": 1, "query_id": "Q",
+                                "last_batch": {"batch_id": 3}, "history": []}))
+    s = read_status(path)
+    assert s is not None and s["source"] == "kafka"
+
+
+def test_unknown_source_reads_as_none(tmp_path: Path) -> None:
+    path = tmp_path / "x.json"
+    path.write_text(json.dumps({"status_version": 2, "source": "parquet",
+                                "last_batch": {"batch_id": 3}}))
+    assert read_status(path) is None

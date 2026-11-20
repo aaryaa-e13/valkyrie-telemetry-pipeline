@@ -190,3 +190,188 @@ Template:
   what Phase 2 dedupe needs for testing, but the tool must say so. To tell "sent twice" from
   "written twice", compare the Kafka offsets of the runs. And a shell glob in a command is only
   safe while exactly one file matches.
+
+## Phase 2
+
+### Delta brought two jars that duplicate Spark's classes (Phase 2 slice 1)
+- **Symptom:** The first Delta build passed, and the planned C2 check (no artifact in two
+  versions, by file name) would have passed too. But the build log added
+  `commons-logging-1.3.0.jar` and `shims-0.9.25.jar`. A class-level scan of all jars showed
+  that `commons-logging` shares 5 classes (`org/apache/commons/logging/Log`, `LogFactory`, ...)
+  with Spark's `jcl-over-slf4j-2.0.17.jar`, and `shims` shares `org/roaringbitmap/ArraysShim`
+  with Spark's `RoaringBitmap-1.3.0.jar`.
+- **Root cause:** `fetch_jars.sh` skips a jar whose artifact Spark already ships, but it still
+  adds that jar's own dependencies. Spark leaves those out on purpose: it replaces JCL with
+  `jcl-over-slf4j`, and RoaringBitmap 1.x no longer needs `shims`. Skipping
+  `hadoop-client-runtime` and `RoaringBitmap-0.9.25` was right; adding their dependencies was
+  not.
+- **Why it matters:** With the same class in two jars, the JVM loads whichever jar comes first
+  on the classpath, and the order of `jars/*` is not specified. Today Spark's copies won. A
+  different build or filesystem could flip that silently.
+- **Fix:** `--exclude-packages commons-logging:commons-logging,org.roaringbitmap:shims` for the
+  Delta fetch (after proving that nothing references the 22 JCL-only classes). C2 now fails if
+  any class in a jar we add also exists in another jar. The only ignored class is Spark's
+  `UnusedStubClass`.
+- **Lesson:** "Skip what is already there" is a rule about jar names, but conflicts happen
+  between classes. Check classes, and check what a skipped jar drags in.
+
+### My first strict C2 would have failed on stock Spark (Phase 2 slice 1, my own mistake)
+- **Symptom:** I proposed "fail on any class that is in two jars" and later ran the planned
+  rule "no artifact in two versions". Both fail on Spark 4.1.4 itself, before Delta: 1,364
+  duplicate classes in 7 groups of Spark's own jars, and two same-name pairs
+  (`hive-shims-0.23` / `hive-shims`, `jline` 2.x / 3.x).
+- **Root cause:** I wrote the rule before measuring the stock baseline.
+- **Fix:** C2 fails only on problems involving jars we add. Stock findings are printed and
+  compared with a recorded baseline, and only WARN on drift (D2.1).
+- **Lesson:** Before writing a "must be zero" check, measure what the unchanged system gives.
+  Otherwise the check is either wrong on day one or gets weakened in a hurry.
+
+### Jackson fetch failed: "expected 1 cache entry ... found 0" (Phase 2 slice 1)
+- **Symptom:** The third `fetch_jars.sh` run (`jackson-datatype-jdk8:2.21.2`) stopped the build:
+  `ERROR: expected 1 cache entry for com.fasterxml.jackson.datatype_jackson-datatype-jdk8-2.21.2.jar,
+  found 0`.
+- **Root cause:** To record the exact coordinate, the script looks the jar up in Ivy's cache
+  under `<group>/<module>/jars/`. Jackson publishes with Maven packaging `bundle` (OSGi), and
+  Ivy stores those under `<module>/bundles/`.
+- **Fix:** Look in both `jars/` and `bundles/`. The guard that failed (exactly one cache entry,
+  else stop) stays. It turned a wrong assumption into a clear build error instead of a
+  missing coordinate.
+
+### The jar-name rule misreads names like `spark-sql-kafka-0-10_2.13` (Phase 2 slice 1, latent since Phase 1)
+- **Symptom:** A new C2 audit compares the artifact name parsed from each file name with the
+  real coordinate. It found 2 of 45 mismatches: `spark-sql-kafka-0-10_2.13-4.1.4.jar` parses as
+  `spark-sql-kafka-0` (and the token provider the same way).
+- **Root cause:** The rule "artifact = file name before the first `-<digit>`" treats `-0-10`
+  as a version. `hive-shims-0.23-2.3.10.jar` has the same problem.
+- **Impact:** None in this build. With the real name, both jars would still be added, because
+  Spark ships no connector. But a wrongly parsed name can wrongly skip a jar in a future fetch.
+- **Fix:** No parser change. C2 checks every add/skip decision against the real coordinate and
+  fails if a misparse would change one. The limitation is recorded in D2.1.
+
+### My check script reported the wrong MERGE metrics for a no-op MERGE (Phase 2 slice 1, test tooling)
+- **Symptom:** C4 printed `numTargetRowsInserted: 2` for the *second* (replayed) MERGE, which
+  inserts nothing.
+- **Root cause:** An insert-only MERGE that inserts nothing writes no Delta commit. So
+  `history(1)` still showed the first MERGE.
+- **Fix:** C4 and C11 compare versions before and after, and report "no commit" when nothing
+  was written.
+- **Lesson:** "The latest history entry" means "the latest commit", not "my operation". This
+  matters for slice 3, which will read per-batch MERGE metrics.
+- *Updated in slice 7:* slice 3 takes the inserted-row count from the MERGE's own result row
+  (`num_inserted_rows`, `streaming/silver.py:574` and `:616`), not from `history()`, so this
+  trap does not apply there.
+
+### Deleting `commits/N` without its `.crc` made Spark report "concurrent queries" (Phase 2 slice 3, my test)
+- **Symptom:** `test_silver_guard_refusals_and_crash_state` failed with `[STREAM_FAILED] ...
+  Multiple streaming queries are concurrently using .../cp_silver/commits`. Only one query was
+  running.
+- **Root cause:** The test simulated "crash after the control row, before `commits/N`" by
+  deleting `commits/N`, but left the checksum file `.N.crc` behind. Hadoop's local file system
+  writes `commits/N` by rename and also creates `.N.crc`. The leftover checksum made the
+  rename fail, and Spark reports any failure to create a commit file as a concurrent writer.
+  The bronze version of this test already removed both files; I did not copy that line.
+- **Fix:** delete `.N.crc` too. The guard decision itself was right (`resume`) before the
+  failure.
+- **Lesson:** a "simulated crash" must leave exactly what a real crash leaves. A real crash
+  before `commits/N` leaves neither file.
+
+### The Spark test suite was slow because Delta rebuilds snapshots with 50 tasks (Phase 2 slice 3)
+- **Symptom:** the first full `make test-spark` of slice 3 took 25 minutes. One test with 11
+  small MERGEs took 239 s.
+- **Root cause:** every Delta operation rebuilds the table snapshot with
+  `spark.databricks.delta.snapshotPartitions` = 50 tasks. The test session runs `local[1]`, so
+  that is about 5 s per operation, even on tiny tables (seen in the REST API: "Compute
+  snapshot" executions of ~5 s; GC only 1.6 % of uptime).
+- **Fix:** the test session sets it to 2 (`tests/spark/conftest.py`). Full suite 62 tests in
+  6 min 45 s (was 14 min for 46 tests); the MERGE test 239 s -> 52 s. The job still uses
+  the default; see D2.3 for why that matters for silver's batch time.
+- *Updated in slice 7:* since the slice 3 follow-up the job uses 4 too
+  (`DELTA_SNAPSHOT_PARTITIONS`, D2.3).
+
+### "A reset's first batch reads all of bronze" was false: Delta caps a batch at 1000 files (Phase 2 slice 4, my plan)
+- **Symptom:** none in production yet. Found while answering the mentor's condition C3 before
+  any slice 4 code: a Spark test put 1005 one-row files into bronze and ran the real silver
+  query from an empty checkpoint. It printed `batches=[(0, 1000), (1, 5)]`.
+- **Root cause:** silver read bronze with no `maxFilesPerTrigger` / `maxBytesPerTrigger`, and
+  my plan assumed that meant "no limit". Delta then uses a default of 1000 files per batch,
+  also for the initial snapshot. With the watermark, batch 1 of a re-read would have routed
+  older history to late.
+- **Fix (mentor's choice A):** the cap is explicit (`SILVER_MAX_FILES_PER_TRIGGER`, 1000), and
+  `wm = -infinity` for every batch that starts inside the initial snapshot (D2.4). Tests use a
+  cap of 2 and run in seconds.
+- **Lesson:** an unset option is not "unlimited"; check the library's default.
+
+### The last snapshot batch ends with `isStartingVersion: false` (Phase 2 slice 4, found by a probe)
+- **Symptom:** none (found before writing the rule, condition A1). With 5 snapshot files and a
+  cap of 2, `offsets/2` (the END of the batch that read the last snapshot file) was
+  `{"reservoirVersion":2,"index":-1,"isStartingVersion":false}`.
+- **Root cause:** Delta moves the offset past the snapshot as soon as the snapshot is used up.
+  A rule based on the batch's own `offsets/N` would have given that snapshot batch a normal
+  watermark.
+- **Fix:** the rule reads where the batch STARTS, `offsets/N-1` (batch 0 always starts in the
+  snapshot). Tests cover 5 files / cap 2, the snapshot ending mid-batch with a tail file, and
+  ending exactly at a batch boundary.
+
+### Crash-point tests failed on `bronze_ingest_time` (Phase 2 slice 4, my test)
+- **Symptom:** all four `test_any_crash_point_then_replay_equals_a_crash_free_run` cases failed:
+  the tables differed only in `bronze_ingest_time`.
+- **Root cause:** the test built each batch with `to_raw_rows(...)`, which stamps
+  `current_timestamp()` every time the DataFrame is evaluated. The reference run and the
+  crashed run therefore had different "bronze" rows. A real replay re-reads the same bronze
+  rows.
+- **Fix:** the test writes each batch to a small Delta table once and reads it back for every
+  attempt. Then all four crash points matched the crash-free run.
+- **Lesson:** same as slice 3's `.crc` mistake: a simulated replay must replay the same input.
+
+### A new test broke an old one through the shared Spark session (Phase 2 slice 4, my test)
+- **Symptom:** in the full `make test-spark`, `test_stream_dedupes_and_writes_a_control_row_for_every_batch`
+  failed with `SnapshotStatusError: offsets/4 is gone`, an error that only my new test raises.
+  It passed when the silver tests ran alone.
+- **Root cause:** `test_snapshot_status_error_makes_the_pipeline_exit_2` leaves a failed streaming
+  query in the session-wide `spark.streams`. The old test calls `awaitAnyTermination(1)`, which
+  re-raises the exception of any query that terminated with an error since the last
+  `resetTerminated()`.
+- **Fix:** the new test calls `spark.streams.resetTerminated()` in a `finally`.
+- **Lesson:** the Spark test session is shared state; a test that makes a query fail must clean
+  up after itself.
+
+### smoke-faults lost its own evidence on the first run (Phase 2 slice 6, my script)
+- **Symptom:** the first `after_read` fault run fired (marker for batch 118, container SIGKILLed),
+  then smoke-faults crashed with `pyarrow ArrowInvalid: No match for FieldRef.Name(late_rows)`
+  while reading the control table with the job down. Its `finally` restarted Spark, so the
+  down-state tables and the killed container's logs were gone.
+- **Root cause:** the control table's schema grew in slice 4; Delta reads older files with the
+  new columns as NULL, but my pyarrow reader asked every file for every column.
+- **Fix:** read each file's own schema and fill missing columns with None (unit test); write
+  the killed container's logs and the down state to files right after the kill; catch any
+  crash so the SUMMARY is still written. One extra, approved Kafka write re-ran `after_read`.
+- **Lesson:** evidence that only exists while the system is down must be saved first, before
+  any code that can fail runs.
+
+### A failing test was committed because a pipe hid pytest's exit code (Phase 2 slice 6)
+- **Symptom:** commit `3329f8b` contained a failing isolation test; the command chain had
+  looked green.
+- **Root cause:** `pytest ... | tail` returns `tail`'s exit code, so `&& git commit` ran anyway.
+- **Fix:** `96c4adf` fixed the test; command chains now start with `set -o pipefail`.
+- **Lesson:** in a shell pipeline the exit code is the last command's unless `pipefail` is
+  set. Read the test result line itself before committing.
+
+### A fresh clone failed `make test-unit`: pyarrow imported but not pinned (Phase 2 slice 7, my mistake in slice 6)
+- **Symptom:** the slice 7 fresh-clone check (`git clone` into an empty folder, `make venv`,
+  `make lint`, `make test-unit`) stopped at collection: `ModuleNotFoundError: No module named
+  'pyarrow'` in `tests/unit/test_faults_check.py`. Lint and the other 503 unit tests passed.
+  In my working copy all 519 passed.
+- **Root cause:** slice 2 dropped `pyarrow==26.0.1` from `requirements/dev.txt`, because
+  nothing imported it then (D2.2). Slice 6 added `e2e/faults_check.py`, which reads Parquet
+  files with pyarrow, and its unit test, but did not add the pin back. My `.venv` still had
+  pyarrow from before: removing a line from a requirements file does not uninstall anything.
+- **Fix:** `pyarrow==26.0.1` is pinned again (it has no dependencies of its own). A scan of
+  every third-party import in tracked `.py` files, per environment (laptop venv, simulator
+  image, Spark image), found no other missing pin. Its other hits are `pyspark`/`delta`
+  imports inside functions that only run in the Spark image. The Spark image's pip gate still
+  passes (`requirements/spark.txt` unchanged). A new clone then passed lint and all 519 unit
+  tests, and the tests left `git status` clean.
+- **Lesson:** a long-lived venv hides a missing pin; only a fresh environment shows it.
+  **For Phase 10:** CI starts from a fresh checkout every time, so running `make venv lint
+  test-unit` there would have caught this on the commit that introduced it.
+
