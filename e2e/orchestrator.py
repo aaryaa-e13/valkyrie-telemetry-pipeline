@@ -327,6 +327,12 @@ def summarize_verify(report: dict[str, Any]) -> dict[str, Any]:
         "result", "found_unique_ids", "silver_found_ids", "late_found_ids", "in_both_ids",
         "duplicate_rows", "duplicate_event_ids", "late_duplicate_event_ids",
         "ids_in_both_tables", "total_rows", "late_total_rows")}
+    o = sv.get("oracle") or {}
+    out["silver"]["oracle"] = {   # R4-R6 verdicts and both gates, as of this verify (D2.5)
+        "verdicts": o.get("verdicts"),
+        "w_check": (o.get("w_check") or {}).get("reason") or (o.get("w_check") or {}).get("w_s"),
+        "isolation_margin_ms": (o.get("isolation") or {}).get("margin_ms"),
+        "isolation": ((o.get("isolation") or {}).get("reason") or "isolated") if o else None}
     cons = sv.get("consistency") or {}
     out["silver"]["consistency"] = {k: cons.get(k) for k in (
         "checkable", "silver_rows_upto_batch", "late_rows_upto_batch",
