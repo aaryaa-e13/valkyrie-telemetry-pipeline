@@ -428,3 +428,32 @@ None of this touches the pipeline.
   after each fetch (grep for the key in the repo and the logs folder) printed no files.
 - **Lesson:** type the key only at the hidden prompt; run the key scan after every fetch.
   The terminal log and shell history are outside the repo and were left to the operator.
+
+## Phase 3
+
+### My VACUUM probe "showed" VACUUM deleting a referenced file (Phase 3 slice 0, my probe)
+- **Symptom:** the first VACUUM probe on a toy table reported `referenced_old_file_kept:
+  false`, so VACUUM seemed to have deleted a file the table still used.
+- **Root cause:** the probe picked "a referenced file" by its name prefix (`part-0`). Delta
+  gives the 0-row orphan files the same kind of name, and the one it picked was an orphan.
+- **Fix:** take the path from the Delta log's live `add` actions. The re-run kept the file,
+  and the pin test does it this way (`tests/spark/test_phase3_pins.py`).
+- **Lesson:** identify Delta files through the log, never by their names. A surprising
+  result is checked again before it is believed.
+
+### VACUUM took 6 minutes on a 6-file test table (Phase 3 slice 0)
+- **Symptom:** the VACUUM pin test took 371 s; the Spark progress bar showed a stage of
+  10,000 tasks.
+- **Root cause:** VACUUM lists files with `spark.sql.sources.parallelPartitionDiscovery.
+  parallelism` tasks (10,000 by default). On `local[1]` each tiny task costs time.
+- **Fix:** a test fixture sets it to 2 and restores it afterwards: 25 s. `make vacuum`
+  (slice 6) sets it too.
+- **Lesson:** when something small is slow, look at the stage's task count first.
+
+### Delta's own output broke my probe's JSON on stdout (Phase 3 slice 0, my probe)
+- **Symptom:** reading the probe's JSON failed with "Expecting value: line 1 column 1".
+- **Root cause:** VACUUM prints `Deleted N files and directories ...` to stdout from the JVM
+  side, before the probe printed its JSON.
+- **Fix:** the probe output was read from its first `{` line. `make vacuum` (slice 6) will
+  write its report to a file, not rely on stdout.
+- **Lesson:** stdout is not only yours when a library runs in the same process.

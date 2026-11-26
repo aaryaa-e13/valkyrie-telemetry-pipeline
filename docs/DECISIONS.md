@@ -1486,3 +1486,36 @@ said "heap peak <= 0.66 GiB", but after_silver's heap peak was 0.781 GiB.)
   the gap is provable now.
 - **Tradeoff:** until Phase 4, such a case fails verification loudly instead of being
   repaired. It cannot occur with Phase 3's simulator modes.
+
+### D3.2 Slice 0: what Spark 4.1.4 and Delta 4.4.1 do, pinned before building (2026-11-26)
+Throwaway probes ran in `spark-tools` (`./data` read-only) and wrote only to the container's
+`/tmp`. The answers are pinned in `tests/spark/test_phase3_pins.py` (14 tests). No Kafka
+writes; the live late and control tables were byte-identical before and after (sha256 of
+every file).
+
+| # | Question | Answer (VERIFIED) | Consequence for Phase 3 |
+|---|---|---|---|
+| P1 | absent vs null field | both parse to NULL; the difference survives only in `raw_value` | "absent = null" (FINDINGS F1) holds by construction |
+| P1 | `''` or blank `event_id` | parse to `''` / `'   '` with `parse_ok` true | the C3 gap is real: today they would become silver keys |
+| P1 | one field of the wrong JSON type | only that field becomes NULL, the rest is kept; no string -> int coercion (`"7"` -> NULL) | wrong-typed envelope field -> `parse_ok` false -> keyless; wrong-typed per-type field (e.g. `gold: "100"`) -> NULL -> H7. A `wrong_type` fault kind has an exact expected reason |
+| P1 | `event_time` without ms, or a number | NULL | H3 |
+| P1 | unknown JSON keys | dropped | S4 only sees schema fields set on the wrong type |
+| P1 | "not a JSON object" | `from_json` gives a struct of NULLs, not a NULL struct; `json_object_keys(raw_value) IS NULL` exactly for malformed, array, number, `''`, truncated (false for `{}`) | H1 uses `json_object_keys` |
+| P2 | ALTER ADD `array`/`map` on an append-only table | works; old rows NULL; writers without the columns still work; still append-only | `quality_flags`, `reject_counts`, `flag_counts` can be added in place |
+| P2 | insert-only MERGE that inserts nothing | no commit | supports the recorded cut (plan addendum B); slice 1 tests it on the DLQ code |
+| P3 | P vs C after `query.stop()` | idle: P == C. During a batch: `stop()` waits for the running `foreachBatch` function, then does not write `commits/N`, so P == C + 1 | the rules-version guard is needed; replay's "P == C" check can refuse after an ordinary `make spark-stop` |
+| P4 | batch overwrite with `txnAppId`/`txnVersion` already present | skipped: no new version, old rows kept | gold's crash re-run works as planned; no fallback needed |
+| P5 | `VACUUM ... RETAIN 168 HOURS DRY RUN` | lists only unreferenced files older than the retention; a referenced file is kept whatever its mtime; a dry run writes nothing | the dry run can be compared with our own orphan list |
+| P5 | what VACUUM writes | two commitInfo-only commits, `VACUUM START` and `VACUUM END` (no txn) | `delta_log.reconcile` is unaffected; smoke-restart's "every commit in (V0, V1] has one txn" check would fail if VACUUM ran mid-run, so VACUUM runs only with the stream stopped |
+| P5 | retention below the default | refused (`DELTA_VACUUM_RETENTION_PERIOD_TOO_SHORT`) | the safety check stays on; it is never disabled |
+| P5 | time travel after VACUUM | every version still reads, count == the log's count | on append-only tables VACUUM removes only never-committed files |
+| P5 | VACUUM speed | file listing uses `spark.sql.sources.parallelPartitionDiscovery.parallelism` (10,000 tasks by default): 371 s on a 6-file table on `local[1]`, 25 s at 2 | `make vacuum` and the tests set it low |
+| P6 | dry run on copies of live late (v33) and control (v132) | 26 and 131 orphans, none older than 7 days on 2026-11-26 07:45 UTC, so the dry run listed 0, matching our list; a real VACUUM on the copies kept every version readable (34 and 133 checked) | the first live orphans become eligible on 2026-11-26 09:25 (control) and 2026-11-27 13:53 (late) |
+| P7 | where the 0-row orphans come from (D2.6 left it UNVERIFIED) | reproduced on toy tables: an append of 1 row split over 2 partitions writes one empty file that the commit does not list (`coalesce(1)`: none); an insert-only MERGE that inserts nothing writes one empty file and no commit | matches the D2.6 pattern (one per control row; late in no-op re-runs). That each live file came from exactly these paths is UNVERIFIED. `coalesce(1)` in `write_control_row` is a one-line fix, measured in slice 6; no-op MERGEs still need VACUUM |
+
+**Corrections to the plan from P1:**
+- A row's key kind follows `key_ok`, not its rule number. A row with an absent or wrong-typed
+  envelope field (`event_type`, `schema_version`, `match_id`, `match_seq`) has `parse_ok`
+  false, so it is keyless (keyed by offset) although its reason is H7.
+- Each rule fires only on its own condition: H5 on a non-null unknown type (a NULL type is
+  H7), and H1 on `json_object_keys(raw_value) IS NULL`.
