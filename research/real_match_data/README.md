@@ -11,6 +11,10 @@ the Riot Games API (Match-V5: match + timeline) so that their fields, nulls, odd
 timestamp encoding can be compared with the simulator's events. The results feed the Phase 3
 quality-gate design.
 
+**The sample:** recent ranked solo games of top-ladder players on one server (the challenger
+ladder of platform `sg2`), so the same players appear in many matches. Small n. It is not
+representative of all games.
+
 No Kafka, Spark or Delta is used. Standard library Python only.
 
 ## What is committed, and what is not
@@ -29,15 +33,17 @@ the `X-Riot-Token` header over HTTPS; it is never printed, logged, written or pu
 
 ```bash
 read -rsp "Riot API key: " RIOT_API_KEY && export RIOT_API_KEY; echo
-read -rp "Riot ID (name#tag): " RIOT_ID && export RIOT_ID
-.venv/bin/python -I research/real_match_data/fetch_matches.py --region europe
-unset RIOT_API_KEY RIOT_ID
+.venv/bin/python -I research/real_match_data/fetch_matches.py --platform sg2 --region sea
+unset RIOT_API_KEY
 ```
 
-- `--region`: `americas`, `asia`, `europe` or `sea`, the regional host of your server.
-- Budget: at most 110 calls (about 104 expected), one every 1.25 s, so about 2.5-3 minutes.
-- Ranked solo queue only (queue 420). If the account has no ranked solo matches, the
-  script stops (exit 4).
+- Call 1 reads the challenger ladder (`--platform` host). Then, in the order returned, one
+  page of each player's newest 20 ranked solo ids (queue 420, `--region` host), at most 5
+  players, and match + timeline per id until 50 pairs. A snowball over match participants
+  (at most 3 pages) is used only if that is not enough.
+- Budget: at most 110 calls (104-106 expected), one every 1.25 s, so about 2.5-3 minutes.
+- Exit 5 if no ladder entry has a `puuid` field; exit 4 if the players used have no ranked
+  solo ids. Neither switches to another seed method.
 - A re-run only fetches files that are missing.
 - The last line is `SUMMARY {json}` with counts only. Exit codes are in the script's
   docstring.

@@ -3,9 +3,13 @@
 Real-data exploration for VALKYRIE. Not part of the pipeline: no Kafka, no Spark, no Delta.
 Standard library only and self-contained, so it runs with ``python -I`` (isolated mode).
 
+Seed: the challenger ladder of one platform (League-V4, RANKED_SOLO_5x5). Players are taken
+in the order returned, one page of their newest 20 ranked solo ids (queue 420) each, at most
+5 players, then a snowball over match participants (at most 3 pages) if still short.
+
 Raw responses are written unchanged to a gitignored folder (default ``realdata/raw``):
-``account.json``, ``ids.json``, ``matches/<id>.json``, ``timelines/<id>.json`` and
-``fetch_log.json`` (counts only: no key, no ids, no names).
+``ladder.json``, ``ids.json``, ``matches/<id>.json``, ``timelines/<id>.json`` and
+``fetch_log.json`` (counts only: no key, no ids, no names, no ladder positions).
 
 API key rules:
 - read only from the ``RIOT_API_KEY`` environment variable;
@@ -21,11 +25,11 @@ not fetched again, so a re-run after a stop only makes the missing calls.
 
 Usage (from the repo root):
     read -rsp "Riot API key: " RIOT_API_KEY && export RIOT_API_KEY; echo
-    read -rp "Riot ID (name#tag): " RIOT_ID && export RIOT_ID
-    .venv/bin/python -I research/real_match_data/fetch_matches.py --region europe
+    .venv/bin/python -I research/real_match_data/fetch_matches.py --platform sg2 --region sea
 
-Exit codes: 0 done, 1 stopped early (failures, rate limit, call cap), 2 setup problem,
-3 key rejected (HTTP 401/403), 4 the account has 0 ranked solo match ids, 130 interrupted.
+Exit codes: 0 done, 1 stopped early (failures, rate limit, call cap, short), 2 setup problem,
+3 key rejected (HTTP 401/403), 4 0 ranked solo ids from the ladder players used,
+5 no ladder entry has a puuid field, 130 interrupted.
 """
 
 from __future__ import annotations
@@ -51,12 +55,17 @@ from typing import Any, TextIO
 
 # --- API facts (UNVERIFIED in the docs pages read on 2026-11-26; confirmed by the probe) ---
 KEY_ENV = "RIOT_API_KEY"
-ACCOUNT_ENV = "RIOT_ID"
 TOKEN_HEADER = "X-Riot-Token"
 HOST_TEMPLATE = "https://{region}.api.riotgames.com"
 REGIONS: tuple[str, ...] = ("americas", "asia", "europe", "sea")
-ACCOUNT_REGIONS: tuple[str, ...] = ("americas", "asia", "europe")
-ACCOUNT_PATH = "/riot/account/v1/accounts/by-riot-id/{name}/{tag}"
+# Platform hosts. Only na1, euw1, kr and the regional four are in the docs page read; the
+# rest (sg2 included) are from memory: UNVERIFIED. An allowlist, so no other host is built.
+PLATFORMS: tuple[str, ...] = (
+    "br1", "eun1", "euw1", "jp1", "kr", "la1", "la2", "me1", "na1", "oc1", "ru", "sg2",
+    "tr1", "tw2", "vn2",
+)
+LADDER_PATH = "/lol/league/v4/challengerleagues/by-queue/{queue}"
+LADDER_QUEUE = "RANKED_SOLO_5x5"
 IDS_PATH = "/lol/match/v5/matches/by-puuid/{puuid}/ids"
 MATCH_PATH = "/lol/match/v5/matches/{match_id}"
 TIMELINE_PATH = "/lol/match/v5/matches/{match_id}/timeline"
@@ -69,7 +78,7 @@ RATE_HEADERS: tuple[str, ...] = (
 
 # --- Budget and pacing ---
 PAGE_SIZE = 20
-MAX_SEED_PAGES = 3
+MAX_LADDER_PLAYERS = 5
 MAX_SNOWBALL_PAGES = 3
 DEFAULT_MATCHES = 50
 MIN_INTERVAL_S = 1.25
@@ -88,13 +97,15 @@ EXIT_STOPPED = 1
 EXIT_SETUP = 2
 EXIT_KEY_REJECTED = 3
 EXIT_NO_RANKED_IDS = 4
+EXIT_NO_PUUID = 5
 EXIT_INTERRUPTED = 130
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ALLOWED_OUT_IN_REPO = REPO_ROOT / "realdata"
 
 NO_RANKED_IDS_MSG = (
-    f"0 ranked solo match ids (queue {QUEUE_RANKED_SOLO}) for this account; stopping "
+    f"0 ranked solo match ids (queue {QUEUE_RANKED_SOLO}) from the ladder players used; "
+    "stopping "
     "(no other seed method without approval)"
 )
 KEY_REJECTED_MSG = (
@@ -201,18 +212,6 @@ def _log(logger: logging.Logger, level: int, msg: str, **fields: Any) -> None:
 # --- Small parsers -----------------------------------------------------------------------
 
 
-def parse_account_name(value: str) -> tuple[str, str]:
-    """Split ``name#tag`` into (name, tag).
-
-    Raises:
-        ValueError: no ``#``, or an empty name or tag. The value is not in the message.
-    """
-    name, sep, tag = value.strip().rpartition("#")
-    if not sep or not name.strip() or not tag.strip():
-        raise ValueError("expected the form name#tag")
-    return name.strip(), tag.strip()
-
-
 def parse_retry_after(value: str | None) -> float | None:
     """Return ``Retry-After`` in seconds, or None if missing or not a number of seconds."""
     if value is None:
@@ -251,11 +250,14 @@ def max_calls_in_window(window_s: float, interval_s: float) -> int:
     return math.floor(window_s / interval_s) + 1
 
 
-def build_url(region: str, path: str, query: Mapping[str, Any] | None = None) -> str:
-    """Build an HTTPS API URL. Path parts must already be quoted by the caller."""
-    if region not in REGIONS:
-        raise ValueError(f"unknown region {region!r}")
-    url = HOST_TEMPLATE.format(region=region) + path
+def build_url(host: str, path: str, query: Mapping[str, Any] | None = None) -> str:
+    """Build an HTTPS API URL for a region or platform host from the allowlists.
+
+    Path parts must already be quoted by the caller.
+    """
+    if host not in REGIONS and host not in PLATFORMS:
+        raise ValueError(f"unknown host {host!r}")
+    url = HOST_TEMPLATE.format(region=host) + path
     if query:
         url += "?" + urllib.parse.urlencode(query)
     if not url.startswith("https://"):
@@ -448,7 +450,7 @@ class RawStore:
 
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.account = root / "account.json"
+        self.ladder = root / "ladder.json"
         self.ids = root / "ids.json"
         self.log = root / "fetch_log.json"
         self._dirs = {"match": root / "matches", "timeline": root / "timelines"}
@@ -481,12 +483,14 @@ class RawStore:
 
 @dataclass
 class Counts:
-    """What the summary reports (no ids, no names)."""
+    """What the summary reports: counts only (no ids, no names, no ladder positions)."""
 
     target: int
     pairs_complete: int = 0
+    ladder_entries: int = 0
+    entries_with_puuid: int = 0
+    ladder_players_used: int = 0
     seed_ids_found: int = 0
-    seed_pages: int = 0
     snowball_pages: int = 0
     snowball_ids_found: int = 0
     matches_skipped: int = 0
@@ -503,59 +507,105 @@ def _valid_ids(raw: Any, counts: Counts) -> list[str]:
     return good
 
 
+def _entry_puuid(entry: Any) -> str | None:
+    puuid = entry.get("puuid") if isinstance(entry, dict) else None
+    return puuid if isinstance(puuid, str) and puuid else None
+
+
 class Fetcher:
-    """Account -> match ids -> match + timeline pairs, then snowball if still short."""
+    """Ladder -> one id page per top player -> match + timeline pairs -> snowball if short."""
 
     def __init__(self, client: ApiClient, store: RawStore, logger: logging.Logger, *,
-                 region: str, account_region: str, account: tuple[str, str],
-                 target: int) -> None:
+                 platform: str, region: str, target: int) -> None:
         self.client = client
         self.store = store
         self.log = logger
+        self.platform = platform
         self.region = region
-        self.account_region = account_region
-        self.account = account
         self.counts = Counts(target=target)
         self.known_ids: list[str] = []
         self._known: set[str] = set()
 
+    def _meta(self) -> dict[str, Any]:
+        return {"platform": self.platform, "region": self.region,
+                "ladder_queue": LADDER_QUEUE, "queue": QUEUE_RANKED_SOLO}
+
+    # -- resume --
+
+    def load_ids(self) -> None:
+        """Load ``ids.json`` from an earlier run; refuse one for another platform/queue."""
+        if not self.store.ids.is_file():
+            if self.store.ladder.is_file():
+                raise StopFetch("seed_mismatch", EXIT_SETUP,
+                                "ladder.json without ids.json on disk; use another --out")
+            return
+        saved = self.store.read_json(self.store.ids)
+        if not isinstance(saved, dict) or any(saved.get(k) != v
+                                              for k, v in self._meta().items()):
+            raise StopFetch("seed_mismatch", EXIT_SETUP,
+                            "ids.json on disk is for another platform, region or queue; "
+                            "use another --out")
+        self._add_ids(_valid_ids(saved.get("seed_ids", []), self.counts))
+        self.counts.seed_ids_found = len(self.known_ids)
+        self.counts.snowball_ids_found = self._add_ids(
+            _valid_ids(saved.get("snowball_ids", []), self.counts))
+        self.counts.ladder_players_used = int(saved.get("ladder_players_used", 0))
+        self.counts.snowball_pages = int(saved.get("snowball_pages", 0))
+        _log(self.log, logging.INFO, "match ids loaded from disk", ids=len(self.known_ids))
+
+    def _save_ids(self) -> None:
+        seed = self.known_ids[: self.counts.seed_ids_found]
+        snow = self.known_ids[self.counts.seed_ids_found:]
+        payload = {**self._meta(), "seed_ids": seed, "snowball_ids": snow,
+                   "ladder_players_used": self.counts.ladder_players_used,
+                   "snowball_pages": self.counts.snowball_pages}
+        self.store.write(self.store.ids, json.dumps(payload, indent=1).encode("utf-8"))
+
     # -- steps --
 
-    def seed_puuid(self) -> str:
-        name, tag = self.account
-        if self.store.account.is_file():
-            stored = self.store.read_json(self.store.account)
-            same = (str(stored.get("gameName", "")).casefold() == name.casefold()
-                    and str(stored.get("tagLine", "")).casefold() == tag.casefold())
-            if not same or not isinstance(stored.get("puuid"), str):
-                raise StopFetch("account_mismatch", EXIT_SETUP,
-                                "account.json on disk is for another account; use another --out")
-            self.counts.probe = "skipped (account.json on disk)"
+    def ladder_puuids(self) -> list[str]:
+        """Read the ladder (call #1, the probe) and return its PUUIDs in returned order."""
+        if self.store.ladder.is_file():
+            data = self.store.read_json(self.store.ladder)
+            self.counts.probe = "skipped (ladder.json on disk)"
             _log(self.log, logging.INFO,
-                 "probe skipped: account.json on disk; the next call checks the key")
-            return stored["puuid"]
-        url = build_url(self.account_region,
-                        ACCOUNT_PATH.format(name=_quote(name), tag=_quote(tag)))
-        try:
-            result = self.client.get_json(url, "account")
-        except StopFetch as stop:
-            self.counts.probe = "rejected" if stop.reason == "key_rejected" else "failed"
-            raise
-        if result is None and self.client.last_status == 404:
-            raise StopFetch("account_not_found", EXIT_SETUP,
-                            "account not found (HTTP 404): check RIOT_ID and --account-region")
-        if result is None:
-            raise StopFetch("account_failed", EXIT_STOPPED,
-                            f"account lookup failed (last status: {self.client.last_status})")
-        data, body = result
-        if not isinstance(data, dict) or not isinstance(data.get("puuid"), str):
-            raise StopFetch("account_unreadable", EXIT_SETUP,
-                            "account response has no puuid field")
-        self.store.write(self.store.account, body)
-        self.counts.probe = "ok"
-        _log(self.log, logging.INFO, "probe ok: key accepted (HTTP 200)", endpoint="account",
-             call=self.client.calls, rate_headers=self.client.rate_headers)
-        return data["puuid"]
+                 "probe skipped: ladder.json on disk; the next call checks the key")
+        else:
+            url = build_url(self.platform, LADDER_PATH.format(queue=LADDER_QUEUE))
+            try:
+                result = self.client.get_json(url, "ladder")
+            except StopFetch as stop:
+                self.counts.probe = "rejected" if stop.reason == "key_rejected" else "failed"
+                raise
+            if result is None and self.client.last_status == 404:
+                raise StopFetch("ladder_not_found", EXIT_SETUP,
+                                "ladder not found (HTTP 404): check --platform")
+            if result is None:
+                raise StopFetch("ladder_failed", EXIT_STOPPED,
+                                f"ladder call failed (last status: {self.client.last_status})")
+            data, body = result
+            self.counts.probe = "ok"
+            _log(self.log, logging.INFO, "probe ok: key accepted (HTTP 200)",
+                 endpoint="ladder", call=self.client.calls,
+                 rate_headers=self.client.rate_headers)
+            self._save_ids()  # meta first: a ladder.json on disk always has its ids.json
+            self.store.write(self.store.ladder, body)
+        entries = data.get("entries") if isinstance(data, dict) else None
+        entries = entries if isinstance(entries, list) else []
+        puuids: list[str] = []
+        for entry in entries:
+            puuid = _entry_puuid(entry)
+            if puuid is not None and puuid not in puuids:
+                puuids.append(puuid)
+        self.counts.ladder_entries = len(entries)
+        self.counts.entries_with_puuid = sum(_entry_puuid(e) is not None for e in entries)
+        _log(self.log, logging.INFO, "ladder read", entries=self.counts.ladder_entries,
+             entries_with_puuid=self.counts.entries_with_puuid)
+        if not puuids:
+            raise StopFetch("no_puuid", EXIT_NO_PUUID,
+                            f"ladder has {self.counts.ladder_entries} entries and 0 with a "
+                            "puuid field; stopping (a fallback needs approval)")
+        return puuids
 
     def _id_page(self, puuid: str, start: int) -> list[str] | None:
         url = build_url(self.region, IDS_PATH.format(puuid=_quote(puuid)),
@@ -570,47 +620,6 @@ class Fetcher:
         self._known.update(new)
         self.known_ids.extend(new)
         return len(new)
-
-    def seed_ids(self, puuid: str) -> None:
-        if self.store.ids.is_file():
-            saved = self.store.read_json(self.store.ids)
-            self._add_ids(_valid_ids(saved.get("seed_ids", []), self.counts))
-            self._add_ids(_valid_ids(saved.get("snowball_ids", []), self.counts))
-            self.counts.seed_ids_found = len(saved.get("seed_ids", []))
-            self.counts.seed_pages = int(saved.get("seed_pages", 0))
-            self.counts.snowball_pages = int(saved.get("snowball_pages", 0))
-            self.counts.snowball_ids_found = len(saved.get("snowball_ids", []))
-            _log(self.log, logging.INFO, "match ids loaded from disk",
-                 ids=len(self.known_ids))
-            if self.counts.seed_ids_found == 0:
-                raise StopFetch("no_ranked_ids", EXIT_NO_RANKED_IDS, NO_RANKED_IDS_MSG)
-            return
-        target = self.counts.target
-        while self.counts.seed_pages < MAX_SEED_PAGES and len(self.known_ids) < target:
-            page = self._id_page(puuid, self.counts.seed_pages * PAGE_SIZE)
-            self.counts.seed_pages += 1
-            if page is None:
-                if not self.known_ids:
-                    raise StopFetch("ids_unreadable", EXIT_STOPPED,
-                                    "the first match-id page could not be read; stopping")
-                break
-            self._add_ids(page)
-            if len(page) < PAGE_SIZE:
-                break
-        self.counts.seed_ids_found = len(self.known_ids)
-        self._save_ids()
-        if not self.known_ids:
-            raise StopFetch("no_ranked_ids", EXIT_NO_RANKED_IDS, NO_RANKED_IDS_MSG)
-        _log(self.log, logging.INFO, "seed match ids", ids=self.counts.seed_ids_found,
-             pages=self.counts.seed_pages)
-
-    def _save_ids(self) -> None:
-        seed = self.known_ids[: self.counts.seed_ids_found]
-        snow = self.known_ids[self.counts.seed_ids_found:]
-        payload = {"queue": QUEUE_RANKED_SOLO, "seed_ids": seed, "snowball_ids": snow,
-                   "seed_pages": self.counts.seed_pages,
-                   "snowball_pages": self.counts.snowball_pages}
-        self.store.write(self.store.ids, json.dumps(payload, indent=1).encode("utf-8"))
 
     def _fetch_one(self, kind: str, match_id: str) -> bool:
         """Fetch one file unless it is on disk. True if it exists afterwards."""
@@ -640,8 +649,26 @@ class Fetcher:
                      pairs=f"{self.counts.pairs_complete}/{self.counts.target}",
                      calls=self.client.calls)
 
-    def _snowball_candidates(self, seed: str) -> list[str]:
-        seen: set[str] = {seed}
+    def ladder_players(self, puuids: list[str]) -> None:
+        """One id page (newest 20) per ladder player, in order, until the target is met."""
+        for puuid in puuids[self.counts.ladder_players_used:MAX_LADDER_PLAYERS]:
+            if self.counts.pairs_complete >= self.counts.target:
+                break
+            page = self._id_page(puuid, 0)
+            self.counts.ladder_players_used += 1
+            before = len(self.known_ids)
+            if page is not None:
+                self._add_ids(page)
+            self.counts.seed_ids_found = len(self.known_ids) - self.counts.snowball_ids_found
+            self._save_ids()
+            self.fetch_pairs(self.known_ids[before:])
+        if self.counts.seed_ids_found == 0:
+            raise StopFetch("no_ranked_ids", EXIT_NO_RANKED_IDS, NO_RANKED_IDS_MSG)
+        _log(self.log, logging.INFO, "ladder match ids", ids=self.counts.seed_ids_found,
+             players=self.counts.ladder_players_used)
+
+    def _snowball_candidates(self, exclude: set[str]) -> list[str]:
+        seen = set(exclude)
         out: list[str] = []
         for match_id in self.known_ids:
             if not self.store.has("match", match_id):
@@ -653,11 +680,11 @@ class Fetcher:
                     out.append(puuid)
         return out
 
-    def snowball(self, seed: str) -> None:
+    def snowball(self, used: set[str]) -> None:
         if self.counts.pairs_complete >= self.counts.target:
             return
-        candidates = self._snowball_candidates(seed)
-        _log(self.log, logging.INFO, "snowball: seed account is short of the target",
+        candidates = self._snowball_candidates(used)
+        _log(self.log, logging.INFO, "snowball: ladder players are short of the target",
              pairs=self.counts.pairs_complete, target=self.counts.target,
              candidate_players=len(candidates))
         skip = self.counts.snowball_pages  # pages already used in an earlier run
@@ -676,10 +703,11 @@ class Fetcher:
 
     def run(self) -> None:
         self.store.ensure()
-        seed = self.seed_puuid()
-        self.seed_ids(seed)
+        self.load_ids()
+        puuids = self.ladder_puuids()
         self.fetch_pairs(list(self.known_ids))
-        self.snowball(seed)
+        self.ladder_players(puuids)
+        self.snowball(set(puuids[: self.counts.ladder_players_used]))
 
 
 # --- CLI ---------------------------------------------------------------------------------
@@ -687,11 +715,10 @@ class Fetcher:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fetch ranked solo matches + timelines (raw).")
+    p.add_argument("--platform", required=True, choices=PLATFORMS,
+                   help="platform host of the ladder call, e.g. sg2 (UNVERIFIED host list)")
     p.add_argument("--region", required=True, choices=REGIONS,
-                   help="regional host for match calls (UNVERIFIED mapping: NA/BR/LAN/LAS "
-                        "-> americas, EUW/EUNE/TR/RU -> europe, KR/JP -> asia, OCE/SEA -> sea)")
-    p.add_argument("--account-region", choices=ACCOUNT_REGIONS,
-                   help="host for the account lookup (default: --region; required for sea)")
+                   help="regional host for match calls, e.g. sea for sg2 (UNVERIFIED mapping)")
     p.add_argument("--out", default="realdata/raw", help="raw folder (default realdata/raw)")
     p.add_argument("--matches", type=int, default=DEFAULT_MATCHES,
                    help=f"match + timeline pairs to fetch, 1..{DEFAULT_MATCHES}")
@@ -754,14 +781,6 @@ def run(argv: list[str], *, env: Mapping[str, str], transport: Transport,
         return EXIT_SETUP if exc.code else EXIT_OK
     if not key:
         return finish("SETUP", EXIT_SETUP, "no_key", f"{KEY_ENV} is not set")
-    try:
-        account = parse_account_name(env.get(ACCOUNT_ENV, ""))
-    except ValueError as exc:
-        return finish("SETUP", EXIT_SETUP, "bad_account", f"{ACCOUNT_ENV}: {exc}")
-    account_region = args.account_region or args.region
-    if account_region not in ACCOUNT_REGIONS:
-        return finish("SETUP", EXIT_SETUP, "bad_account_region",
-                      "--region sea needs --account-region (americas, asia or europe)")
     if not 1 <= args.matches <= DEFAULT_MATCHES or not 1 <= args.max_calls <= MAX_CALLS:
         return finish("SETUP", EXIT_SETUP, "bad_limits",
                       f"--matches must be 1..{DEFAULT_MATCHES}, --max-calls 1..{MAX_CALLS}")
@@ -774,10 +793,10 @@ def run(argv: list[str], *, env: Mapping[str, str], transport: Transport,
     client = ApiClient(key, transport=transport, clock=clock, sleep=sleep, logger=logger,
                        max_calls=args.max_calls)
     store = RawStore(out)
-    fetcher = Fetcher(client, store, logger, region=args.region,
-                      account_region=account_region, account=account, target=args.matches)
-    _log(logger, logging.INFO, "start", matches_target=args.matches, region=args.region,
-         account_region=account_region, queue=QUEUE_RANKED_SOLO, max_calls=args.max_calls,
+    fetcher = Fetcher(client, store, logger, platform=args.platform, region=args.region,
+                      target=args.matches)
+    _log(logger, logging.INFO, "start", matches_target=args.matches, platform=args.platform,
+         region=args.region, queue=QUEUE_RANKED_SOLO, max_calls=args.max_calls,
          interval_s=MIN_INTERVAL_S,
          max_run_s_without_waits=round(args.max_calls * MIN_INTERVAL_S))
     try:
