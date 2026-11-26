@@ -203,8 +203,15 @@ Inputs only; the Phase 3 plan decides the rules.
 | Participant 0 on player events | participantId outside 1-10: 0_on_ITEM_PURCHASED (100), 0_on_SKILL_LEVEL_UP (27) | a purchase or skill event with participant 0 cannot be joined to a player: flag it (quarantine or keep with a null player), do not drop it |
 | Non-champion actors | 7 of 2829 kills (0.2%) have killerId 0 | killer 0 is valid (not a player); a player join must allow it |
 | Corrections in the stream | ITEM_UNDO: 567 vs 11599 purchases | a purchase is not final; downstream counts need undo handling |
-| Natural keys collide | identical events beyond the first: 1981 (by type: WARD_PLACED: 1305, ITEM_DESTROYED: 410, ITEM_PURCHASED: 193, TURRET_PLATE_DESTROYED: 55, SKILL_LEVEL_UP: 18); (type, time, actor) collisions: 6114; with target: 2006 | event_id = match id + frame index + event index (stable position), not a content hash |
+| Natural keys collide | identical events beyond the first: 1981 (by type: WARD_PLACED: 1305, ITEM_DESTROYED: 410, ITEM_PURCHASED: 193, TURRET_PLATE_DESTROYED: 55, SKILL_LEVEL_UP: 18); (type, time, actor) collisions: 6114; with target: 2006 | event_id = match id + frame index + event index, not a content hash; only if the order is stable across fetches (see Open questions) |
 | More than one patch | patches in the sample: 16.22 (30), 16.23 (20) | patch comes from each match (gameVersion cut to major.minor); the SCD2 patch dimension must expect several in one day |
+
+## Open questions
+
+| Question | Why it matters | Status | Where it is answered |
+|---|---|---|---|
+| Is the event order of a timeline stable across two fetches of the same match? | a position-based event id (match id + frame index + event index) is only stable if the order is; identical events rule out a content hash | UNVERIFIED: one fetch per match only | the real-data backfill adapter step (timeline step 7) |
+| Can post-game data go through the W = 60 s watermark at all? | a match arrives only after it ends, so every event is late by about the match duration (see the Sample table) | UNVERIFIED design note: it likely needs a backfill path | the real-data backfill adapter step (timeline step 7) |
 
 ## Checks
 

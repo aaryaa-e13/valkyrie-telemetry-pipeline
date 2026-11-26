@@ -57,6 +57,21 @@ DISCLAIMER = (
     "Games, Inc."
 )
 
+# Open questions this sample cannot answer (no more API calls in this step).
+OPEN_QUESTIONS: tuple[dict[str, str], ...] = (
+    {"question": "Is the event order of a timeline stable across two fetches of the same "
+                 "match?",
+     "why_it_matters": "a position-based event id (match id + frame index + event index) is "
+                       "only stable if the order is; identical events rule out a content hash",
+     "status": "UNVERIFIED: one fetch per match only",
+     "where": "the real-data backfill adapter step (timeline step 7)"},
+    {"question": "Can post-game data go through the W = 60 s watermark at all?",
+     "why_it_matters": "a match arrives only after it ends, so every event is late by about "
+                       "the match duration (see the Sample table)",
+     "status": "UNVERIFIED design note: it likely needs a backfill path",
+     "where": "the real-data backfill adapter step (timeline step 7)"},
+)
+
 # Real timeline type -> simulator event type (None: no simulator equivalent).
 SIM_TYPE_FOR: dict[str, str] = {
     "CHAMPION_KILL": "kill",
@@ -885,8 +900,8 @@ def phase3_inputs(f: dict[str, Any]) -> list[dict[str, str]]:
                      f"; (type, time, actor) collisions: "
                      f"{dup['collisions_type_timestamp_actor']}; with target: "
                      f"{dup['collisions_type_timestamp_actor_target']}",
-         "gate": "event_id = match id + frame index + event index (stable position), not a "
-                 "content hash"},
+         "gate": "event_id = match id + frame index + event index, not a content hash; "
+                 "only if the order is stable across fetches (see Open questions)"},
         {"input": "More than one patch",
          "evidence": "patches in the sample: " + ", ".join(
              f"{k} ({n})" for k, n in f["sample"]["patch"].items()),
@@ -955,6 +970,7 @@ def build_findings(raw: Raw, sim: Sim) -> dict[str, Any]:
     sim_part.pop("_per_match")
     f["simulator"] = sim_part
     f["phase3_inputs"] = phase3_inputs(f)
+    f["open_questions"] = [dict(q) for q in OPEN_QUESTIONS]
     return f
 
 
@@ -1157,6 +1173,15 @@ def render_markdown(f: dict[str, Any]) -> str:
         "|---|---|---|",
     ]
     lines += [f"| {p['input']} | {p['evidence']} | {p['gate']} |" for p in f["phase3_inputs"]]
+    lines += [
+        "",
+        "## Open questions",
+        "",
+        "| Question | Why it matters | Status | Where it is answered |",
+        "|---|---|---|---|",
+    ]
+    lines += [f"| {q['question']} | {q['why_it_matters']} | {q['status']} | {q['where']} |"
+              for q in f["open_questions"]]
     chk = f.get("checks", {})
     lines += [
         "",

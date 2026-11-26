@@ -1787,12 +1787,26 @@
   {
    "input": "Natural keys collide",
    "evidence": "identical events beyond the first: 1981 (by type: WARD_PLACED: 1305, ITEM_DESTROYED: 410, ITEM_PURCHASED: 193, TURRET_PLATE_DESTROYED: 55, SKILL_LEVEL_UP: 18); (type, time, actor) collisions: 6114; with target: 2006",
-   "gate": "event_id = match id + frame index + event index (stable position), not a content hash"
+   "gate": "event_id = match id + frame index + event index, not a content hash; only if the order is stable across fetches (see Open questions)"
   },
   {
    "input": "More than one patch",
    "evidence": "patches in the sample: 16.22 (30), 16.23 (20)",
    "gate": "patch comes from each match (gameVersion cut to major.minor); the SCD2 patch dimension must expect several in one day"
+  }
+ ],
+ "open_questions": [
+  {
+   "question": "Is the event order of a timeline stable across two fetches of the same match?",
+   "why_it_matters": "a position-based event id (match id + frame index + event index) is only stable if the order is; identical events rule out a content hash",
+   "status": "UNVERIFIED: one fetch per match only",
+   "where": "the real-data backfill adapter step (timeline step 7)"
+  },
+  {
+   "question": "Can post-game data go through the W = 60 s watermark at all?",
+   "why_it_matters": "a match arrives only after it ends, so every event is late by about the match duration (see the Sample table)",
+   "status": "UNVERIFIED design note: it likely needs a backfill path",
+   "where": "the real-data backfill adapter step (timeline step 7)"
   }
  ],
  "checks": {

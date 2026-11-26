@@ -307,3 +307,14 @@ def test_short_names_match_whole_words_only() -> None:
 def test_self_test_catches_each_kind() -> None:
     idents = {"puuid": {"puuid-long-value"}, "player_name": {"Bo"}}
     assert cs.privacy_self_test({"t": "nothing here"}, idents) == []
+
+
+def test_open_questions_are_in_both_outputs(fixture_paths) -> None:
+    raw, sim, out = fixture_paths
+    run_cs(raw, sim, out)
+    data = json.loads((out / "findings.json").read_text())
+    md = (out / "FINDINGS.md").read_text()
+    assert [q["question"] for q in data["open_questions"]] == [
+        q["question"] for q in cs.OPEN_QUESTIONS]
+    assert "## Open questions" in md
+    assert "stable across two fetches" in md and "timeline step 7" in md
