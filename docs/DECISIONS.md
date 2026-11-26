@@ -1407,3 +1407,46 @@ pressure from other tenants. Kafka restarts and topic recreation are not covered
 **Memory:** the same M1 stop lines as smoke-late (D2.5), set before the runs. Container peaks
 1.50-1.94 GiB, heap peaks 0.57-0.78 GiB; none crossed. (Corrected in slice 7: this line first
 said "heap peak <= 0.66 GiB", but after_silver's heap peak was 0.781 GiB.)
+
+---
+
+## Real-data exploration (between Phase 2 and Phase 3)
+
+### DR.1 Real match data as a fenced, counts-only research step
+- **Context:** before the Phase 3 quality gates, check the simulator's event schema against
+  real data: 50 ranked matches (summary + timeline) from the public match API of a real 5v5
+  MOBA game. Plain Python, 104 calls with a dev key, no pipeline change (empty diff on the
+  pipeline paths). Code and findings: `research/real_match_data/`.
+- **Where it lives (option B):** one folder with both scripts, tests, the findings and the
+  API's legal disclaimer; the main README has one disclaimer line and a link. The wording
+  audit becomes: 0 studio names outside that folder and that line. *Rejected:* (A) all
+  local, which keeps the audit at 0 but is not reproducible, untested and invisible;
+  (C) committed with names hidden in config, which is obfuscation and makes the disclaimer
+  impossible. *Tradeoff:* the audit has one documented exception; VALKYRIE's game,
+  champions and simulator stay fictional.
+- **Seed: the challenger ladder of one platform.** Players are taken in the order returned,
+  one page of 20 ranked solo ids each, at most 5, then a snowball. The operator's own
+  account had no games in this title (exit 4, by design). 3 ladder players gave 60 ids.
+  Every unexpected case stops with its own exit code instead of falling back silently.
+  *Tradeoff:* a biased sample (top players, one server, overlapping): 338 distinct players
+  in 500 slots, and every match shares a player. The findings describe the schema and data
+  quality, not representative gameplay.
+- **Counts only:** raw responses stay in gitignored `realdata/`. Committed findings hold
+  counts, field paths and an allowlist of schema enums. They are written only if the totals
+  reconcile and a privacy check finds none of the 1713 ids and names read from the raw files
+  (with a self-test that plants one of each kind). *Why:* the repo is public, and the API's
+  docs list "aggregate player stats (no specific players)" as an approved use. *Tradeoff:*
+  no examples in the findings.
+- **Open: the event id for real data.** 1981 events are byte-identical to an earlier one in
+  the same match, and 25.1% of events tie on timestamp, so a content hash or a (type, time,
+  actor) key collides. Candidate: match id + frame index + event index. That only works if
+  the order is stable across fetches: **UNVERIFIED** (one fetch per match). It is to be
+  tested in the real-data backfill adapter (timeline step 7); no more calls now.
+- **Design note (UNVERIFIED): post-game data needs a backfill path.** A match arrives only
+  after it ends, so by event time every event is late by about the match duration (median
+  1652 s here), far beyond W = 60 s (D2.4). Through the realtime path it would all go to the
+  late table. Step 7 decides the path.
+- **Volume:** real matches have about 20x the simulator's events (median 1220 vs 62 per
+  match). This is relevant to the Phase 4 memory headroom: the Spark container already peaks
+  at 2.59-2.67 GiB of its 3 GiB limit on runs of about 250 events (D2.5). How memory scales
+  with events per batch is UNVERIFIED.
