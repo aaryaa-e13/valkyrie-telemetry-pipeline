@@ -375,3 +375,56 @@ Template:
   **For Phase 10:** CI starts from a fresh checkout every time, so running `make venv lint
   test-unit` there would have caught this on the commit that introduced it.
 
+
+## Real-data exploration (between Phase 2 and Phase 3)
+
+Code in `research/real_match_data/` (its README names the API and carries the disclaimer).
+None of this touches the pipeline.
+
+### A network error on the first call was reported as "account not found" (fetch script, my code)
+- **Symptom:** in a unit test, two network errors on the account lookup ended the run with
+  exit 2, "account lookup failed (not found or unreadable)", as a setup error.
+- **Root cause:** the client returns "skip this item" both for a 404 and for a second
+  network/5xx error, and the caller read every skip as "not found".
+- **Fix:** the client records the last status; only a real 404 means "not found", anything
+  else stops with exit 1. Caught by the tests before the first commit (`76ffc7e`). The
+  account lookup was later replaced by the ladder seed, which kept the same rule.
+- **Lesson:** "no result" has more than one cause; keep the cause next to the result.
+
+### A test fixture field name broke the wording audit (fetch script tests, my mistake)
+- **Symptom:** the slice 7 wording audit (0 studio names outside the research folder) found
+  one hit in `tests/unit/test_realdata_fetch.py`.
+- **Root cause:** a fake ladder entry used the API's real field name for a player's display
+  name, which contains the studio name.
+- **Fix:** renamed to a neutral `playerName` before the commit (`3e227b0`); test files take
+  such names from the module's constants.
+- **Lesson:** run the audit before each commit, not only at the end of a phase.
+
+### The network edge blocked urllib's default User-Agent (live fetch)
+- **Symptom:** every live run got HTTP 403 in 0.1 s, body `error code: 1010`. The same key
+  worked in the browser API explorer.
+- **Root cause:** found by the operator with curl, one change at a time: curl's default
+  User-Agent got 200; `-A "Python-urllib/3.11"` got 403. The edge in front of the API
+  blocks urllib's default User-Agent.
+- **Fix:** every call sends an explicit, honest User-Agent
+  (`valkyrie-research/0.1.0 (...)`, no browser string) (`4a88b14`). A test checks the header
+  on every call, also over real HTTP to 127.0.0.1. The next run: 104 calls, all 200.
+- **Lesson:** change one variable at a time. The block came from the edge, not from the API.
+
+### A 403 from the edge was reported as "key rejected" (fetch script, my code)
+- **Symptom:** the script told the operator to check the API key, and the key was fine.
+- **Root cause:** every 401/403 was treated as a key problem, and the error body was not
+  logged, so the `1010` in it was not seen.
+- **Fix:** only a 401/403 whose body is the API's JSON status object means "key rejected"
+  (exit 3). Any other body stops as `edge_blocked` (exit 6, "blocked by the network edge
+  (User-Agent?)"). Every error logs the first 100 characters of its body, with the key
+  masked in the whole body before the cut (`4a88b14`).
+- **Lesson:** log the error body (safely). It had the answer from the first run.
+
+### Operator incident: the API key was pasted at the shell prompt
+- **What happened:** the key was once pasted at the shell prompt instead of the hidden
+  `read -rsp` prompt. It landed in a local terminal log and in shell history.
+- **Fix:** the key was rotated (a new dev key). No key value is in the repo: the key scan
+  after each fetch (grep for the key in the repo and the logs folder) printed no files.
+- **Lesson:** type the key only at the hidden prompt; run the key scan after every fetch.
+  The terminal log and shell history are outside the repo and were left to the operator.
