@@ -1519,3 +1519,29 @@ every file).
   false, so it is keyless (keyed by offset) although its reason is H7.
 - Each rule fires only on its own condition: H5 on a non-null unknown type (a NULL type is
   H7), and H1 on `json_object_keys(raw_value) IS NULL`.
+
+### D3.3 The memory growth line is judged after 3 warm-up runs (slice 1 baseline, 2026-11-26)
+- **What happened:** the baseline for slice 1 (unchanged Phase 2 code, `make smoke` × 5 back
+  to back after a Spark start, `bench/smoke_measure.py`) crossed the growth line of D2.5,
+  "container peak grows > 0.1 GiB from one run to the next without a Spark restart", on
+  runs 1 -> 2 and 2 -> 3. Per the plan that was a STOP.
+- **Decision rule, fixed before runs 4-5:** warm-up if both growths 3 -> 4 and 4 -> 5 are
+  < 0.1 GiB of container peak and the heap peak does not rise by > 0.1 GiB either;
+  otherwise a leak signal in the Phase 2 code (stop, no slice 1 code).
+- **Numbers (VERIFIED, `docs/plans/s1/baseline.jsonl`):**
+
+  | Run | Container peak | Growth | Heap peak | Heap growth |
+  |---|---|---|---|---|
+  | 1 (starts Spark) | 1.483 GiB | | 0.496 GiB | |
+  | 2 | 1.698 GiB | +0.215 | 0.568 GiB | +0.072 |
+  | 3 | 1.817 GiB | +0.119 | 0.652 GiB | +0.084 |
+  | 4 | 1.835 GiB | **+0.018** | 0.667 GiB | +0.015 |
+  | 5 | 1.839 GiB | **+0.004** | 0.667 GiB | +0.000 |
+
+- **Result: warm-up.** The JVM takes more memory in its first runs after a start and then
+  levels off. Not a leak.
+- **The line from now on:** "container peak grows > 0.1 GiB between consecutive runs
+  **after 3 warm-up runs since a Spark start**". The absolute lines (peak > 2.8 GiB,
+  heap > 1.6 GiB, GC > 10 %, OOM) apply to every run, warm-up included. The "after"
+  measurements of each slice use the same sequence (Spark stopped, then the same runs back
+  to back), so like is compared with like.
