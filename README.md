@@ -212,6 +212,19 @@ boundaries and once inside bronze), not for every possible failure.
 - **Small scale.** Runs are tens to about 260 events. No benchmark yet (Phase 10).
 - The Phase 1 limits on a single broker, a single writer and the status file still apply.
 
+## Real-data check (research, not part of the pipeline)
+
+Before the Phase 3 quality gates, the simulator's events were compared with 50 real ranked
+matches from a public game API (match summary + timeline per match): missing fields, nulls,
+odd values, timestamp encoding, event types with no simulator equivalent, and the reverse.
+The game, champions and simulator of VALKYRIE stay fictional. Code, method and the findings
+(counts and field paths only, no ids or names) are in
+[research/real_match_data/](research/real_match_data/), see its
+[FINDINGS.md](research/real_match_data/FINDINGS.md). Raw data is never committed. The sample
+is small and not representative: recent games of top-ladder players on one server.
+
+VALKYRIE isn't endorsed by Riot Games and doesn't reflect the views or opinions of Riot Games or anyone officially involved in producing or managing Riot Games properties. Riot Games, and all associated properties are trademarks or registered trademarks of Riot Games, Inc.
+
 ## Repository layout
 
 | Path | Contents |
@@ -222,6 +235,7 @@ boundaries and once inside bronze), not for every possible failure.
 | `e2e/` | Orchestrators for `demo`, `smoke`, `smoke-dupes`, `smoke-restart`, `smoke-late`, `smoke-faults`, and the timing check |
 | `bench/` | Timing probes used for D2.4 |
 | `tests/` | Unit tests, Spark tests, manifest fixtures |
+| `research/` | One-off research outside the pipeline: real match data vs the simulator (counts only) |
 | `docker/`, `docker-compose.yml` | Images and services (Compose profiles keep memory use low) |
 | `docker-compose.faults.yml` | Test only: turns the fault hooks on; used only by `make smoke-faults` |
 | `requirements/` | Pinned Python dependencies: laptop (`dev.txt`), simulator image, Spark image |

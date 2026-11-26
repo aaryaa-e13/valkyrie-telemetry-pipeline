@@ -13,3 +13,6 @@ data/
 checkpoints/
 /manifests/
 docs/plans/
+
+# Real-data exploration: raw API responses stay on this laptop only (never commit)
+/realdata/
