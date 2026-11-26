@@ -1450,3 +1450,39 @@ said "heap peak <= 0.66 GiB", but after_silver's heap peak was 0.781 GiB.)
   match). This is relevant to the Phase 4 memory headroom: the Spark container already peaks
   at 2.59-2.67 GiB of its 3 GiB limit on runs of about 250 events (D2.5). How memory scales
   with events per batch is UNVERIFIED.
+
+---
+
+## Phase 3: quality gates, dead-letter queue, replay, gold
+
+### D3.1 A valid copy after a bad copy: detected in Phase 3, fixed in Phase 4 (planned)
+- **Context:** Phase 3 sends rows that fail a hard gate to a dead-letter table (DLQ), and
+  the first decision for an `event_id` is final: a later copy of an id that is still open in
+  the DLQ is counted (`dup_of_dlq`, `late_dup_of_dlq`) and not inserted. If the first copy
+  was corrupt and a later copy is valid, the valid event ends up only in bronze. A replay
+  re-checks the DLQ's own corrupt copy, which still fails. **That is silent loss.**
+- **Phase 3 (built in slices 1-2): detect and FAIL.**
+  - The batch logs a WARNING and its control row keeps both counts.
+  - Oracle rule **R14** (verify, its own gate code) FAILs for every open DLQ id that has a
+    bronze copy passing every hard rule. It also FAILs if the stream's counts are > 0. It
+    says "not checkable", never PASS, when it cannot pin bronze.
+  - Tests: the real path (bad copy, then the valid copy in a later batch), a tamper test
+    (exactly {R14} fails) and a negative test. Live Phase 3 runs cannot produce the case,
+    since there is no duplicate injection before Phase 4 (D1.13).
+- **Phase 4 (planned, with duplicate injection): a valid copy resolves the open entry.**
+  - In the stream (still the single writer), the accepted copy goes to silver or late,
+    classified by its own batch's watermark (R6 unchanged). Then a resolution is appended:
+    `resolved_by = 'valid_copy'`, no replay id, the resolving query and batch.
+  - Write order per batch: DLQ -> late -> silver -> resolutions -> control -> `commits/N`.
+  - Deterministic on a re-run: "every accepted id of batch N that is still open after the
+    data writes gets a resolution, insert-if-absent on `dlq_key`". The same final state
+    holds whether the crash came before or after the resolution write.
+  - Order-independent: valid first (the bad copy is `rejected_dup_of_accepted`), both in one
+    batch (a valid copy is preferred), bad first in an earlier batch (resolved by this step).
+    Every order ends with the id accepted, which Phase 4's shuffle and duplicate tests
+    assert. R14 stays as the detector and must then PASS.
+- **Why not in Phase 3:** the fix is only provable with duplicate injection, which D1.13
+  places in Phase 4. Building it without a live test would be an unproven claim; detecting
+  the gap is provable now.
+- **Tradeoff:** until Phase 4, such a case fails verification loudly instead of being
+  repaired. It cannot occur with Phase 3's simulator modes.
