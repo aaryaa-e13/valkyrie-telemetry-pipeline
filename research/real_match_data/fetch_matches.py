@@ -28,8 +28,12 @@ Usage (from the repo root):
     .venv/bin/python -I research/real_match_data/fetch_matches.py --platform sg2 --region sea
 
 Exit codes: 0 done, 1 stopped early (failures, rate limit, call cap, short), 2 setup problem,
-3 key rejected (HTTP 401/403), 4 0 ranked solo ids from the ladder players used,
-5 no ladder entry has a puuid field, 130 interrupted.
+3 key rejected (HTTP 401/403 with the API's JSON status body), 4 0 ranked solo ids from
+the ladder players used, 5 no ladder entry has a puuid field, 6 blocked by the network edge
+(HTTP 401/403 whose body is not the API's JSON, e.g. "error code: 1010"), 130 interrupted.
+
+Every call sends an explicit, honest ``User-Agent`` (``USER_AGENT``): the edge in front of
+the API answers urllib's default ``Python-urllib/3.11`` with 403 "error code: 1010".
 """
 
 from __future__ import annotations
@@ -56,6 +60,8 @@ from typing import Any, TextIO
 # --- API facts (UNVERIFIED in the docs pages read on 2026-11-26; confirmed by the probe) ---
 KEY_ENV = "RIOT_API_KEY"
 TOKEN_HEADER = "X-Riot-Token"
+# Honest client name, no browser impersonation. No repo URL: it would put a user name in code.
+USER_AGENT = "valkyrie-research/0.1.0 (data engineering portfolio project; one-off fetch)"
 HOST_TEMPLATE = "https://{region}.api.riotgames.com"
 REGIONS: tuple[str, ...] = ("americas", "asia", "europe", "sea")
 # Platform hosts. Only na1, euw1, kr and the regional four are in the docs page read; the
@@ -88,6 +94,7 @@ MAX_FAILURES_IN_ROW = 3
 SERVER_ERROR_WAIT_S = 2.0
 HTTP_TIMEOUT_S = 15.0
 PROGRESS_EVERY = 10
+ERROR_BODY_LOG_CHARS = 100
 
 # Match ids come from the API (untrusted) and become file names: allow only this shape.
 MATCH_ID_RE = re.compile(r"^[A-Z0-9]{2,5}_[0-9]{1,20}$")
@@ -98,6 +105,7 @@ EXIT_SETUP = 2
 EXIT_KEY_REJECTED = 3
 EXIT_NO_RANKED_IDS = 4
 EXIT_NO_PUUID = 5
+EXIT_EDGE_BLOCKED = 6
 EXIT_INTERRUPTED = 130
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -110,6 +118,10 @@ NO_RANKED_IDS_MSG = (
 )
 KEY_REJECTED_MSG = (
     "key rejected (HTTP {status}): check RIOT_API_KEY; dev keys deactivate every 24 h"
+)
+EDGE_BLOCKED_MSG = (
+    "blocked by the network edge (User-Agent?): HTTP {status} without the API's JSON "
+    "status body; stopping"
 )
 
 
@@ -245,6 +257,30 @@ def parse_rate_limit(value: str) -> list[tuple[int, float]] | None:
     return pairs or None
 
 
+def body_head(body: bytes, secret: str, limit: int = ERROR_BODY_LOG_CHARS) -> str:
+    """Return the start of an error body that is safe to log.
+
+    The key is masked in the whole body *before* it is cut, so a key that crosses the cut
+    cannot leak in part. Control characters become spaces.
+    """
+    text = mask(body.decode("utf-8", errors="replace"), secret)
+    text = "".join(ch if ch.isprintable() else " " for ch in text)
+    return text[:limit]
+
+
+def is_api_status_body(body: bytes) -> bool:
+    """True if ``body`` is the API's own JSON error, e.g. ``{"status": {...}}``.
+
+    The exact shape is UNVERIFIED (from memory: ``message`` and ``status_code`` inside
+    ``status``). A plain-text or HTML body (an edge block) gives False.
+    """
+    try:
+        data = json.loads(body)
+    except ValueError:  # includes UnicodeDecodeError
+        return False
+    return isinstance(data, dict) and isinstance(data.get("status"), dict)
+
+
 def max_calls_in_window(window_s: float, interval_s: float) -> int:
     """Most calls that fixed spacing of ``interval_s`` can put into any ``window_s`` window."""
     return math.floor(window_s / interval_s) + 1
@@ -356,7 +392,8 @@ class ApiClient:
         self.calls += 1
         self.calls_by_endpoint[endpoint] += 1
         request = urllib.request.Request(
-            url, headers={TOKEN_HEADER: self._key, "Accept": "application/json"}, method="GET")
+            url, headers={TOKEN_HEADER: self._key, "Accept": "application/json",
+                          "User-Agent": USER_AGENT}, method="GET")
         try:
             response = self._transport(request, HTTP_TIMEOUT_S)
         except TransportError as exc:
@@ -406,6 +443,9 @@ class ApiClient:
                 self._sleep(SERVER_ERROR_WAIT_S)
                 continue
             status = response.status
+            if status != 200:
+                _log(self._log, logging.WARNING, "error response", endpoint=endpoint,
+                     status=status, body_head=body_head(response.body, self._key))
             if status == 200:
                 try:
                     data = json.loads(response.body)
@@ -415,8 +455,11 @@ class ApiClient:
                 self.failures_in_row = 0
                 return data, response.body
             if status in (401, 403):
-                raise StopFetch("key_rejected", EXIT_KEY_REJECTED,
-                                KEY_REJECTED_MSG.format(status=status))
+                if is_api_status_body(response.body):
+                    raise StopFetch("key_rejected", EXIT_KEY_REJECTED,
+                                    KEY_REJECTED_MSG.format(status=status))
+                raise StopFetch("edge_blocked", EXIT_EDGE_BLOCKED,
+                                EDGE_BLOCKED_MSG.format(status=status))
             if status == 429:
                 self._failure(f"{endpoint}: HTTP 429")
                 wait = parse_retry_after(response.headers.get("retry-after"))
@@ -575,7 +618,8 @@ class Fetcher:
             try:
                 result = self.client.get_json(url, "ladder")
             except StopFetch as stop:
-                self.counts.probe = "rejected" if stop.reason == "key_rejected" else "failed"
+                self.counts.probe = {"key_rejected": "rejected",
+                                     "edge_blocked": "blocked"}.get(stop.reason, "failed")
                 raise
             if result is None and self.client.last_status == 404:
                 raise StopFetch("ladder_not_found", EXIT_SETUP,

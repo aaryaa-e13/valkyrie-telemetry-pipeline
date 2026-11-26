@@ -24,7 +24,14 @@ def ok(payload: object, headers: dict[str, str] | None = None) -> fm.HttpRespons
 
 
 def status(code: int, headers: dict[str, str] | None = None) -> fm.HttpResponse:
-    return fm.HttpResponse(code, headers or {}, b'{"status": "fake"}')
+    """An error in the API's own JSON shape (status object)."""
+    body = {"status": {"message": "fake", "status_code": code}}
+    return fm.HttpResponse(code, headers or {}, json.dumps(body).encode("utf-8"))
+
+
+def edge_block(code: int = 403, body: bytes = b"error code: 1010") -> fm.HttpResponse:
+    """An error from the network edge: plain text, not the API's JSON."""
+    return fm.HttpResponse(code, {"content-type": "text/plain"}, body)
 
 
 def mids(start: int, n: int) -> list[str]:
@@ -241,6 +248,65 @@ def test_probe_rejected_key_stops_after_one_call(tmp_path: Path, code_: int) -> 
     assert summary["calls"] == 1 and len(api.requests) == 1
     assert f"key rejected (HTTP {code_})" in output
     assert summary["probe"] == "rejected"
+
+
+def test_user_agent_is_explicit_on_every_call(tmp_path: Path) -> None:
+    api = FakeApi()
+    go(tmp_path, api, "--matches", "3")
+    assert len(api.requests) == 8
+    for _, headers, _ in api.requests:
+        assert headers["user-agent"] == fm.USER_AGENT
+    assert "python-urllib" not in fm.USER_AGENT.lower()
+    assert "mozilla" not in fm.USER_AGENT.lower()  # no browser impersonation
+
+
+@pytest.mark.parametrize("code_", [401, 403])
+def test_edge_block_is_not_reported_as_a_bad_key(tmp_path: Path, code_: int) -> None:
+    api = FakeApi()
+    api.scripted = [edge_block(code_)]
+    code, summary, output, _ = go(tmp_path, api)
+    assert code == fm.EXIT_EDGE_BLOCKED and summary["stop_reason"] == "edge_blocked"
+    assert "blocked by the network edge (User-Agent?)" in summary["message"]
+    assert fm.KEY_ENV not in summary["message"]
+    assert summary["probe"] == "blocked" and summary["calls"] == 1
+    assert "error code: 1010" in output
+
+
+@pytest.mark.parametrize("body", [b"", b"<html>Forbidden</html>", b"\xff\xfe",
+                                  b'{"message": "no status object"}', b"[1, 2]"])
+def test_bodies_that_are_not_the_api_status_json_count_as_edge_blocks(
+        tmp_path: Path, body: bytes) -> None:
+    api = FakeApi()
+    api.scripted = [edge_block(403, body)]
+    code, _, _, _ = go(tmp_path, api)
+    assert code == fm.EXIT_EDGE_BLOCKED
+
+
+def test_edge_block_later_in_the_run_also_stops(tmp_path: Path) -> None:
+    api = FakeApi()
+    api.scripted = [LADDER_DEFAULT, ok(["XX1_1"]), edge_block()]
+    code, summary, _, _ = go(tmp_path, api, "--matches", "1")
+    assert code == fm.EXIT_EDGE_BLOCKED and summary["calls"] == 3
+
+
+def test_logged_error_body_is_masked_then_cut(tmp_path: Path) -> None:
+    body = ("x" * 90 + KEY + "y" * 400).encode("utf-8")  # the key crosses the 100-char cut
+    api = FakeApi()
+    api.scripted = [edge_block(403, body)]
+    _, _, output, _ = go(tmp_path, api)
+    heads = [json.loads(ln)["body_head"] for ln in output.splitlines()
+             if ln.startswith("{") and "body_head" in ln]
+    assert heads == ["x" * 90 + "***" + "y" * 7]
+    assert KEY not in output and KEY[:8] not in output
+
+
+def test_body_head_helper() -> None:
+    assert fm.body_head(b"a\nb\x00c", "") == "a b c"
+    assert len(fm.body_head(b"z" * 500, "")) == fm.ERROR_BODY_LOG_CHARS
+    assert fm.body_head(f"k={KEY}".encode(), KEY) == "k=***"
+    assert fm.is_api_status_body(b'{"status": {"status_code": 403}}')
+    for bad in (b"error code: 1010", b"", b"{}", b'{"status": 403}', b"\xff"):
+        assert not fm.is_api_status_body(bad)
 
 
 def test_rejected_key_later_in_the_run_also_stops(tmp_path: Path) -> None:
@@ -563,7 +629,10 @@ def local_server():
             seen.append({k.lower(): v for k, v in self.headers.items()})
             routes = {"/ok": (200, {}, b'{"a": 1}'),
                       "/limited": (429, {"Retry-After": "4", "X-App-Rate-Limit": "20:1"}, b"{}"),
-                      "/moved": (302, {"Location": "/ok"}, b"")}
+                      "/moved": (302, {"Location": "/ok"}, b""),
+                      "/edge": (403, {"Content-Type": "text/plain"}, b"error code: 1010"),
+                      "/json403": (403, {"Content-Type": "application/json"},
+                                   b'{"status": {"message": "Forbidden", "status_code": 403}}')}
             code, headers, body = routes[self.path]
             self.send_response(code)
             for k, v in headers.items():
@@ -614,3 +683,27 @@ def test_transport_network_error_has_no_header_values() -> None:
     with pytest.raises(fm.TransportError) as info:
         fm.urllib_transport(_req(f"http://127.0.0.1:{port}/x"), 2)
     assert KEY not in str(info.value)
+
+
+def _local_client() -> fm.ApiClient:
+    return fm.ApiClient(KEY, transport=fm.urllib_transport, clock=lambda: 0.0,
+                        sleep=lambda s: None, logger=fm.make_logger(io.StringIO(), KEY),
+                        min_interval_s=0.0)
+
+
+def test_client_sends_the_user_agent_over_real_http(local_server) -> None:
+    base, seen = local_server
+    client = _local_client()
+    assert client.get_json(base + "/ok", "ok") is not None
+    assert seen[-1]["user-agent"] == fm.USER_AGENT
+    assert seen[-1][fm.TOKEN_HEADER.lower()] == KEY
+
+
+def test_client_tells_edge_block_from_rejected_key_over_real_http(local_server) -> None:
+    base, _ = local_server
+    with pytest.raises(fm.StopFetch) as edge:
+        _local_client().get_json(base + "/edge", "ladder")
+    assert edge.value.reason == "edge_blocked" and edge.value.exit_code == fm.EXIT_EDGE_BLOCKED
+    with pytest.raises(fm.StopFetch) as rejected:
+        _local_client().get_json(base + "/json403", "ladder")
+    assert rejected.value.reason == "key_rejected"

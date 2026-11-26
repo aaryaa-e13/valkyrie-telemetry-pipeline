@@ -30,6 +30,10 @@ No Kafka, Spark or Delta is used. Standard library Python only.
 You need a development API key from the Riot developer portal. Dev keys deactivate every
 24 hours. The key is read from the `RIOT_API_KEY` environment variable only and sent only as
 the `X-Riot-Token` header over HTTPS; it is never printed, logged, written or put in a URL.
+Every call sends an explicit, honest User-Agent (`valkyrie-research/0.1.0 (...)`): the
+network edge in front of the API blocks urllib's default one with 403 "error code: 1010".
+A 401/403 counts as "key rejected" only if its body is the API's JSON status; any other
+401/403 stops as "blocked by the network edge" (exit 6).
 
 ```bash
 read -rsp "Riot API key: " RIOT_API_KEY && export RIOT_API_KEY; echo
