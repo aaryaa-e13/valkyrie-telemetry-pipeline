@@ -18,10 +18,12 @@ API key rules:
 - never printed, logged, written to a file or put in a URL. Every log line passes through a
   mask that replaces the key with ``***``.
 
-Rate limits: one call every 1.25 s (under 20/1 s, 100/2 min and 10/10 s), at most 110 calls
-per run including retries. HTTP 429 waits ``Retry-After`` (stops if it is missing or over
-120 s). 401/403 stop at once. Three failures in a row stop the run. Files already on disk are
-not fetched again, so a re-run after a stop only makes the missing calls.
+Rate limits: one call every 1.25 s, at most 110 calls per run including retries. The dev
+key's app limit is 20 per 1 s and 100 per 120 s (VERIFIED: live ``x-app-rate-limit``
+"100:120,20:1", 2026-11-26); the spacing also stays under the old 10 per 10 s.
+HTTP 429 waits ``Retry-After`` (stops if it is missing or over 120 s). 401/403 stop at
+once. Three failures in a row stop the run. Files already on disk are not fetched again,
+so a re-run after a stop only makes the missing calls.
 
 Usage (from the repo root):
     read -rsp "Riot API key: " RIOT_API_KEY && export RIOT_API_KEY; echo
@@ -57,15 +59,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO
 
-# --- API facts (UNVERIFIED in the docs pages read on 2026-11-26; confirmed by the probe) ---
+# --- API facts ---
+# VERIFIED by the live fetch of 2026-11-26 (104 calls, all HTTP 200): the token header, the
+# sg2 platform host, the sea regional host for sg2, a puuid in every challenger entry (300 of
+# 300), the queue=420 filter (50 of 50 matches had queueId 420), and the four paths below.
+# Not observed, still UNVERIFIED: other hosts and region mapping, the count maximum,
+# Retry-After on a real 429, the API's JSON body on a real 401/403.
 KEY_ENV = "RIOT_API_KEY"
 TOKEN_HEADER = "X-Riot-Token"
 # Honest client name, no browser impersonation. No repo URL: it would put a user name in code.
 USER_AGENT = "valkyrie-research/0.1.0 (data engineering portfolio project; one-off fetch)"
 HOST_TEMPLATE = "https://{region}.api.riotgames.com"
 REGIONS: tuple[str, ...] = ("americas", "asia", "europe", "sea")
-# Platform hosts. Only na1, euw1, kr and the regional four are in the docs page read; the
-# rest (sg2 included) are from memory: UNVERIFIED. An allowlist, so no other host is built.
+# Platform hosts. na1, euw1, kr and the regional four are in the docs page read; sg2 is
+# VERIFIED by the live fetch; the rest are from memory: UNVERIFIED. An allowlist, so no
+# other host is built.
 PLATFORMS: tuple[str, ...] = (
     "br1", "eun1", "euw1", "jp1", "kr", "la1", "la2", "me1", "na1", "oc1", "ru", "sg2",
     "tr1", "tw2", "vn2",
@@ -77,6 +85,10 @@ MATCH_PATH = "/lol/match/v5/matches/{match_id}"
 TIMELINE_PATH = "/lol/match/v5/matches/{match_id}/timeline"
 QUEUE_RANKED_SOLO = 420
 RATE_LIMIT_HEADERS: tuple[str, ...] = ("x-app-rate-limit", "x-method-rate-limit")
+# Header names VERIFIED live. Method limits differ per endpoint (seen: ladder "500:600,30:10",
+# match "2000:10"). Observation only, interpretation UNVERIFIED: the app count read "7:120"
+# after about 95 calls in 120 s, which suggests fixed windows rather than a sliding one.
+# Pacing is not changed because of it.
 RATE_HEADERS: tuple[str, ...] = (
     "x-app-rate-limit", "x-app-rate-limit-count",
     "x-method-rate-limit", "x-method-rate-limit-count",
@@ -97,6 +109,7 @@ PROGRESS_EVERY = 10
 ERROR_BODY_LOG_CHARS = 100
 
 # Match ids come from the API (untrusted) and become file names: allow only this shape.
+# VERIFIED for sg2: all 60 ids from the ladder players matched (0 invalid).
 MATCH_ID_RE = re.compile(r"^[A-Z0-9]{2,5}_[0-9]{1,20}$")
 
 EXIT_OK = 0
@@ -240,7 +253,8 @@ def parse_retry_after(value: str | None) -> float | None:
 def parse_rate_limit(value: str) -> list[tuple[int, float]] | None:
     """Parse a rate-limit header such as ``20:1,100:120`` into (limit, window_s) pairs.
 
-    The format is UNVERIFIED (from memory). Returns None if any part does not parse.
+    The format is VERIFIED by live headers (``100:120,20:1``, ``2000:10``). Returns None
+    if any part does not parse.
     """
     pairs: list[tuple[int, float]] = []
     for part in value.split(","):
@@ -760,9 +774,9 @@ class Fetcher:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fetch ranked solo matches + timelines (raw).")
     p.add_argument("--platform", required=True, choices=PLATFORMS,
-                   help="platform host of the ladder call, e.g. sg2 (UNVERIFIED host list)")
+                   help="platform host of the ladder call (sg2 VERIFIED; the rest UNVERIFIED)")
     p.add_argument("--region", required=True, choices=REGIONS,
-                   help="regional host for match calls, e.g. sea for sg2 (UNVERIFIED mapping)")
+                   help="regional host for match calls (sea for sg2 VERIFIED; others UNVERIFIED)")
     p.add_argument("--out", default="realdata/raw", help="raw folder (default realdata/raw)")
     p.add_argument("--matches", type=int, default=DEFAULT_MATCHES,
                    help=f"match + timeline pairs to fetch, 1..{DEFAULT_MATCHES}")
