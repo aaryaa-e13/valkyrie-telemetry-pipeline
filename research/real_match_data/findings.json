@@ -1,0 +1,1802 @@
+{
+ "findings_schema": 1,
+ "generated_on": "2026-11-26",
+ "disclaimer": "VALKYRIE isn't endorsed by Riot Games and doesn't reflect the views or opinions of Riot Games or anyone officially involved in producing or managing Riot Games properties. Riot Games, and all associated properties are trademarks or registered trademarks of Riot Games, Inc.",
+ "sample": {
+  "statement": "Recent ranked solo games (queue 420) of top-ladder players on one server (the challenger ladder of one platform), so the same players appear in several matches. Small n. Not representative of all games.",
+  "matches": 50,
+  "player_slots": 500,
+  "distinct_players": 338,
+  "players_by_matches_played": {
+   "1": 258,
+   "2": 51,
+   "3": 18,
+   "4": 5,
+   "5": 3,
+   "10": 1,
+   "20": 1,
+   "21": 1
+  },
+  "matches_sharing_a_player_with_another": 50,
+  "match_pairs_sharing_a_player": 520,
+  "match_pairs_total": 1225,
+  "ladder_players_used": 3,
+  "ladder_entries": 300,
+  "queue": {
+   "420": 50
+  },
+  "patch": {
+   "16.22": 30,
+   "16.23": 20
+  },
+  "platform": {
+   "SG2": 50
+  },
+  "game_mode": {
+   "CLASSIC": 50
+  },
+  "game_type": {
+   "MATCHED_GAME": 50
+  },
+  "map": {
+   "11": 50
+  },
+  "end_of_game_result": {
+   "GameComplete": 50
+  },
+  "data_version": {
+   "2": 50
+  },
+  "participants_per_match": {
+   "10": 50
+  },
+  "duration_s": {
+   "n": 50,
+   "min": 918,
+   "median": 1652.5,
+   "max": 2328
+  }
+ },
+ "files": {
+  "match_files": 50,
+  "timeline_files": 50,
+  "match_parse_failed": 0,
+  "timeline_parse_failed": 0,
+  "pairs": 50,
+  "matches_without_timeline": 0,
+  "timelines_without_match": 0,
+  "pairs_whose_ids_match_the_file_name": 50,
+  "pairs_with_same_participant_map_in_match_and_timeline": 50
+ },
+ "events": {
+  "total": 58540,
+  "total_in_frames": 58540,
+  "distinct_types": 19,
+  "per_match": {
+   "n": 50,
+   "min": 581,
+   "median": 1220,
+   "max": 1941
+  },
+  "types": [
+   {
+    "type": "ITEM_DESTROYED",
+    "count": 12228,
+    "matches": 50,
+    "simulator_type": null,
+    "fields": [
+     {
+      "field": "itemId",
+      "present": 12228,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "participantId",
+      "present": 12228,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 12228,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 12228,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     }
+    ]
+   },
+   {
+    "type": "ITEM_PURCHASED",
+    "count": 11599,
+    "matches": 50,
+    "simulator_type": "item_purchase",
+    "fields": [
+     {
+      "field": "itemId",
+      "present": 11599,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "participantId",
+      "present": 11599,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 11599,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 11599,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     }
+    ]
+   },
+   {
+    "type": "WARD_PLACED",
+    "count": 10499,
+    "matches": 50,
+    "simulator_type": null,
+    "fields": [
+     {
+      "field": "creatorId",
+      "present": 10499,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 10499,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 10499,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     },
+     {
+      "field": "wardType",
+      "present": 10499,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     }
+    ]
+   },
+   {
+    "type": "SKILL_LEVEL_UP",
+    "count": 7227,
+    "matches": 50,
+    "simulator_type": null,
+    "fields": [
+     {
+      "field": "levelUpType",
+      "present": 7227,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     },
+     {
+      "field": "participantId",
+      "present": 7227,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "skillSlot",
+      "present": 7227,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 7227,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 7227,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     }
+    ]
+   },
+   {
+    "type": "LEVEL_UP",
+    "count": 6633,
+    "matches": 50,
+    "simulator_type": null,
+    "fields": [
+     {
+      "field": "level",
+      "present": 6633,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "participantId",
+      "present": 6633,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 6633,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 6633,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     }
+    ]
+   },
+   {
+    "type": "CHAMPION_KILL",
+    "count": 2829,
+    "matches": 50,
+    "simulator_type": "kill",
+    "fields": [
+     {
+      "field": "assistingParticipantIds",
+      "present": 2255,
+      "missing": 574,
+      "null": 0,
+      "types": [
+       "list"
+      ]
+     },
+     {
+      "field": "bounty",
+      "present": 2829,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "killStreakLength",
+      "present": 2829,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "killerId",
+      "present": 2829,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "position",
+      "present": 2829,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "dict"
+      ]
+     },
+     {
+      "field": "shutdownBounty",
+      "present": 2829,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 2829,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 2829,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     },
+     {
+      "field": "victimDamageDealt",
+      "present": 2599,
+      "missing": 230,
+      "null": 0,
+      "types": [
+       "list"
+      ]
+     },
+     {
+      "field": "victimDamageReceived",
+      "present": 2829,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "list"
+      ]
+     },
+     {
+      "field": "victimId",
+      "present": 2829,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "victimTeamfightDamageDealt",
+      "present": 2669,
+      "missing": 160,
+      "null": 0,
+      "types": [
+       "list"
+      ]
+     },
+     {
+      "field": "victimTeamfightDamageReceived",
+      "present": 2829,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "list"
+      ]
+     }
+    ]
+   },
+   {
+    "type": "TURRET_PLATE_DESTROYED",
+    "count": 2572,
+    "matches": 50,
+    "simulator_type": null,
+    "fields": [
+     {
+      "field": "killerId",
+      "present": 2572,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "laneType",
+      "present": 2572,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     },
+     {
+      "field": "position",
+      "present": 2572,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "dict"
+      ]
+     },
+     {
+      "field": "teamId",
+      "present": 2572,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 2572,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 2572,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     }
+    ]
+   },
+   {
+    "type": "WARD_KILL",
+    "count": 2264,
+    "matches": 50,
+    "simulator_type": null,
+    "fields": [
+     {
+      "field": "killerId",
+      "present": 2264,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 2264,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 2264,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     },
+     {
+      "field": "wardType",
+      "present": 2264,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     }
+    ]
+   },
+   {
+    "type": "BUILDING_KILL",
+    "count": 583,
+    "matches": 50,
+    "simulator_type": null,
+    "fields": [
+     {
+      "field": "assistingParticipantIds",
+      "present": 289,
+      "missing": 294,
+      "null": 0,
+      "types": [
+       "list"
+      ]
+     },
+     {
+      "field": "bounty",
+      "present": 583,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "buildingType",
+      "present": 583,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     },
+     {
+      "field": "killerId",
+      "present": 583,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "laneType",
+      "present": 583,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     },
+     {
+      "field": "position",
+      "present": 583,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "dict"
+      ]
+     },
+     {
+      "field": "teamId",
+      "present": 583,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 583,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "towerType",
+      "present": 515,
+      "missing": 68,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 583,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     }
+    ]
+   },
+   {
+    "type": "ITEM_UNDO",
+    "count": 567,
+    "matches": 50,
+    "simulator_type": null,
+    "fields": [
+     {
+      "field": "afterId",
+      "present": 567,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "beforeId",
+      "present": 567,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "goldGain",
+      "present": 567,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "participantId",
+      "present": 567,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 567,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 567,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     }
+    ]
+   },
+   {
+    "type": "CHAMPION_SPECIAL_KILL",
+    "count": 442,
+    "matches": 50,
+    "simulator_type": null,
+    "fields": [
+     {
+      "field": "killType",
+      "present": 442,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     },
+     {
+      "field": "killerId",
+      "present": 442,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "multiKillLength",
+      "present": 328,
+      "missing": 114,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "position",
+      "present": 442,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "dict"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 442,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 442,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     }
+    ]
+   },
+   {
+    "type": "ITEM_SOLD",
+    "count": 430,
+    "matches": 48,
+    "simulator_type": null,
+    "fields": [
+     {
+      "field": "itemId",
+      "present": 430,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "participantId",
+      "present": 430,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 430,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 430,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     }
+    ]
+   },
+   {
+    "type": "ELITE_MONSTER_KILL",
+    "count": 426,
+    "matches": 50,
+    "simulator_type": null,
+    "fields": [
+     {
+      "field": "assistingParticipantIds",
+      "present": 316,
+      "missing": 110,
+      "null": 0,
+      "types": [
+       "list"
+      ]
+     },
+     {
+      "field": "bounty",
+      "present": 426,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "killerId",
+      "present": 426,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "killerTeamId",
+      "present": 426,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "monsterSubType",
+      "present": 185,
+      "missing": 241,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     },
+     {
+      "field": "monsterType",
+      "present": 426,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     },
+     {
+      "field": "position",
+      "present": 426,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "dict"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 426,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 426,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     }
+    ]
+   },
+   {
+    "type": "DRAGON_SOUL_GIVEN",
+    "count": 61,
+    "matches": 49,
+    "simulator_type": null,
+    "fields": [
+     {
+      "field": "name",
+      "present": 61,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     },
+     {
+      "field": "teamId",
+      "present": 61,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 61,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 61,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     }
+    ]
+   },
+   {
+    "type": "OBJECTIVE_BOUNTY_PRESTART",
+    "count": 57,
+    "matches": 41,
+    "simulator_type": null,
+    "fields": [
+     {
+      "field": "actualStartTime",
+      "present": 57,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "teamId",
+      "present": 57,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 57,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 57,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     }
+    ]
+   },
+   {
+    "type": "PAUSE_END",
+    "count": 50,
+    "matches": 50,
+    "simulator_type": null,
+    "fields": [
+     {
+      "field": "realTimestamp",
+      "present": 50,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 50,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 50,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     }
+    ]
+   },
+   {
+    "type": "GAME_END",
+    "count": 50,
+    "matches": 50,
+    "simulator_type": "match_end",
+    "fields": [
+     {
+      "field": "gameId",
+      "present": 50,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "realTimestamp",
+      "present": 50,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 50,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 50,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     },
+     {
+      "field": "winningTeam",
+      "present": 50,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     }
+    ]
+   },
+   {
+    "type": "OBJECTIVE_BOUNTY_FINISH",
+    "count": 20,
+    "matches": 14,
+    "simulator_type": null,
+    "fields": [
+     {
+      "field": "teamId",
+      "present": 20,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 20,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 20,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     }
+    ]
+   },
+   {
+    "type": "CHAMPION_TRANSFORM",
+    "count": 3,
+    "matches": 3,
+    "simulator_type": null,
+    "fields": [
+     {
+      "field": "participantId",
+      "present": 3,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "timestamp",
+      "present": 3,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "int"
+      ]
+     },
+     {
+      "field": "transformType",
+      "present": 3,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     },
+     {
+      "field": "type",
+      "present": 3,
+      "missing": 0,
+      "null": 0,
+      "types": [
+       "str"
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "summary_fields": {
+  "match_info": {
+   "documents": 50,
+   "distinct_keys": 16,
+   "keys_in_every_document": 16,
+   "keys_missing_in_some": {},
+   "null_values": {},
+   "empty_string_values": {
+    "tournamentCode": 50
+   }
+  },
+  "participants": {
+   "documents": 500,
+   "distinct_keys": 156,
+   "keys_in_every_document": 156,
+   "keys_missing_in_some": {},
+   "null_values": {},
+   "empty_string_values": {
+    "summonerName": 500
+   }
+  },
+  "teams": {
+   "documents": 100,
+   "distinct_keys": 4,
+   "keys_in_every_document": 4,
+   "keys_missing_in_some": {},
+   "null_values": {},
+   "empty_string_values": {}
+  }
+ },
+ "timestamps": {
+  "events": 58540,
+  "timestamp_not_int": 0,
+  "out_of_order_in_listed_order": 0,
+  "ties_with_previous_event": 14674,
+  "negative": 0,
+  "after_game_end_event": 0,
+  "later_than_own_frame_timestamp": 0,
+  "earlier_than_previous_frame_timestamp": 0,
+  "pause_end_at_zero": 50,
+  "frames": 1397,
+  "frame_interval_ms": {
+   "60000": 50
+  },
+  "first_frame_at_zero": 50,
+  "frame_gaps_off_by_more_than_1s": 0,
+  "duration_vs_end_minus_start_s": {
+   "n": 50,
+   "min": -1.975,
+   "median": 0.226,
+   "max": 0.759
+  },
+  "game_end_event_vs_duration_s": {
+   "n": 50,
+   "min": 0.002,
+   "median": 0.514,
+   "max": 0.998
+  },
+  "game_end_real_ts_vs_game_end_timestamp_ms": {
+   "n": 50,
+   "min": 216,
+   "median": 248,
+   "max": 2572
+  },
+  "start_minus_creation_s": {
+   "n": 50,
+   "min": 13.701,
+   "median": 66.846,
+   "max": 117.255
+  }
+ },
+ "odd_values": {
+  "buildings_killer_0": 17,
+  "ended_in_surrender": 21,
+  "game_end_winner_agrees_with_teams": 50,
+  "kills": 2829,
+  "kills_by_non_champion_killer_0": 7,
+  "kills_without_assist_field": 574,
+  "matches_with_exactly_one_winner": 50,
+  "monster_kills_killer_0": 3,
+  "participant_id_0_on_ITEM_PURCHASED": 100,
+  "participant_id_0_on_SKILL_LEVEL_UP": 27,
+  "participant_id_outside_1_10": 127,
+  "purchases": 11599,
+  "team_id_100": 50,
+  "team_id_200": 50,
+  "undos": 567,
+  "undos_gold_gain_negative": 73,
+  "undos_gold_gain_positive": 478,
+  "undos_gold_gain_zero": 16,
+  "undos_of_a_purchase_after_id_0": 478,
+  "undos_of_a_sale_before_id_0": 95,
+  "wards_creator_0": 156,
+  "wards_type_BLUE_TRINKET": 671,
+  "wards_type_CONTROL_WARD": 1152,
+  "wards_type_SIGHT_WARD": 2659,
+  "wards_type_UNDEFINED": 3813,
+  "wards_type_YELLOW_TRINKET": 2204
+ },
+ "duplicates": {
+  "identical_events_beyond_first": 1981,
+  "matches_with_identical_events": 50,
+  "identical_beyond_first_by_type": {
+   "WARD_PLACED": 1305,
+   "ITEM_DESTROYED": 410,
+   "ITEM_PURCHASED": 193,
+   "TURRET_PLATE_DESTROYED": 55,
+   "SKILL_LEVEL_UP": 18
+  },
+  "matches_with_identical_by_type": {
+   "ITEM_DESTROYED": 50,
+   "ITEM_PURCHASED": 50,
+   "TURRET_PLATE_DESTROYED": 30,
+   "WARD_PLACED": 7,
+   "SKILL_LEVEL_UP": 5
+  },
+  "identical_group_sizes": {
+   "2": 805,
+   "3": 17,
+   "4": 1,
+   "18": 67
+  },
+  "identical_ward_placed_by_ward_type": {
+   "UNDEFINED": 1305
+  },
+  "collisions_type_timestamp_actor": 6114,
+  "collisions_type_timestamp_actor_target": 2006,
+  "note": "a collision count is the number of events whose key was already used in the same match; identical events are included in both"
+ },
+ "mapping": [
+  {
+   "simulator_field": "event_id",
+   "simulator_types": "all",
+   "real_source": "none",
+   "how": "derive",
+   "coverage": null,
+   "note": "no event id in the data; must be derived (match id + position, or a content hash)"
+  },
+  {
+   "simulator_field": "event_type",
+   "simulator_types": "all",
+   "real_source": "event.type",
+   "how": "rename",
+   "coverage": null,
+   "note": "upper-case names; only 3 of the real types have a simulator type"
+  },
+  {
+   "simulator_field": "schema_version",
+   "simulator_types": "all",
+   "real_source": "metadata.dataVersion",
+   "how": "different meaning",
+   "coverage": null,
+   "note": "API format version, not our event schema version"
+  },
+  {
+   "simulator_field": "event_time",
+   "simulator_types": "all",
+   "real_source": "info.gameStartTimestamp + event.timestamp",
+   "how": "derive",
+   "coverage": null,
+   "note": "epoch ms + ms since game start, vs our ISO-8601 UTC string"
+  },
+  {
+   "simulator_field": "match_id",
+   "simulator_types": "all",
+   "real_source": "metadata.matchId",
+   "how": "direct",
+   "coverage": null,
+   "note": "string with a platform prefix, vs our UUID"
+  },
+  {
+   "simulator_field": "match_seq",
+   "simulator_types": "all",
+   "real_source": "none (frame index, event index)",
+   "how": "derive",
+   "coverage": null,
+   "note": "list position; timestamps tie, so position is needed"
+  },
+  {
+   "simulator_field": "patch_version",
+   "simulator_types": "all",
+   "real_source": "info.gameVersion",
+   "how": "derive",
+   "coverage": null,
+   "note": "4-part version; cut to major.minor"
+  },
+  {
+   "simulator_field": "region",
+   "simulator_types": "all",
+   "real_source": "info.platformId",
+   "how": "rename",
+   "coverage": null,
+   "note": "different code set"
+  },
+  {
+   "simulator_field": "player_id",
+   "simulator_types": "kill",
+   "real_source": "CHAMPION_KILL.killerId",
+   "how": "join",
+   "coverage": {
+    "events": 2829,
+    "with_value": 2829
+   },
+   "note": "participant 1-10 -> PUUID via the participant list; 0 = not a champion"
+  },
+  {
+   "simulator_field": "victim_id",
+   "simulator_types": "kill",
+   "real_source": "CHAMPION_KILL.victimId",
+   "how": "join",
+   "coverage": {
+    "events": 2829,
+    "with_value": 2829
+   },
+   "note": "participant 1-10 -> PUUID"
+  },
+  {
+   "simulator_field": "player_id",
+   "simulator_types": "item_purchase",
+   "real_source": "ITEM_PURCHASED.participantId",
+   "how": "join",
+   "coverage": {
+    "events": 11599,
+    "with_value": 11599
+   },
+   "note": "participant 1-10 -> PUUID"
+  },
+  {
+   "simulator_field": "item_id",
+   "simulator_types": "item_purchase",
+   "real_source": "ITEM_PURCHASED.itemId",
+   "how": "direct",
+   "coverage": {
+    "events": 11599,
+    "with_value": 11599
+   },
+   "note": "integer, vs our string id"
+  },
+  {
+   "simulator_field": "gold",
+   "simulator_types": "item_purchase",
+   "real_source": "none on the event",
+   "how": "absent",
+   "coverage": null,
+   "note": "needs a static item price table; ITEM_UNDO carries goldGain"
+  },
+  {
+   "simulator_field": "champion_id",
+   "simulator_types": "kill, item_purchase, champion_pick",
+   "real_source": "info.participants[].championId",
+   "how": "join",
+   "coverage": null,
+   "note": "integer + name, per participant, not per event"
+  },
+  {
+   "simulator_field": "team",
+   "simulator_types": "champion_pick",
+   "real_source": "info.participants[].teamId",
+   "how": "rename",
+   "coverage": null,
+   "note": "100 / 200, vs blue / red"
+  },
+  {
+   "simulator_field": "winning_team",
+   "simulator_types": "match_end",
+   "real_source": "GAME_END.winningTeam",
+   "how": "rename",
+   "coverage": {
+    "events": 50,
+    "with_value": 50
+   },
+   "note": "100 / 200; also info.teams[].win"
+  },
+  {
+   "simulator_field": "duration_s",
+   "simulator_types": "match_end",
+   "real_source": "info.gameDuration",
+   "how": "direct",
+   "coverage": null,
+   "note": "seconds (see timestamps)"
+  }
+ ],
+ "reverse": {
+  "simulator_types_without_a_timeline_event": {
+   "match_start": "info.gameStartTimestamp (no timeline event; PAUSE_END at t=0 is the closest)",
+   "champion_pick": "info.participants[].championId + teamId (no time per pick; the draft is not in the data)"
+  },
+  "simulator_fields_without_a_real_source": [
+   "event_id",
+   "match_seq",
+   "gold",
+   "schema_version (different meaning)"
+  ],
+  "real_types_without_a_simulator_type": [
+   {
+    "type": "ITEM_DESTROYED",
+    "count": 12228
+   },
+   {
+    "type": "WARD_PLACED",
+    "count": 10499
+   },
+   {
+    "type": "SKILL_LEVEL_UP",
+    "count": 7227
+   },
+   {
+    "type": "LEVEL_UP",
+    "count": 6633
+   },
+   {
+    "type": "TURRET_PLATE_DESTROYED",
+    "count": 2572
+   },
+   {
+    "type": "WARD_KILL",
+    "count": 2264
+   },
+   {
+    "type": "BUILDING_KILL",
+    "count": 583
+   },
+   {
+    "type": "ITEM_UNDO",
+    "count": 567
+   },
+   {
+    "type": "CHAMPION_SPECIAL_KILL",
+    "count": 442
+   },
+   {
+    "type": "ITEM_SOLD",
+    "count": 430
+   },
+   {
+    "type": "ELITE_MONSTER_KILL",
+    "count": 426
+   },
+   {
+    "type": "DRAGON_SOUL_GIVEN",
+    "count": 61
+   },
+   {
+    "type": "OBJECTIVE_BOUNTY_PRESTART",
+    "count": 57
+   },
+   {
+    "type": "PAUSE_END",
+    "count": 50
+   },
+   {
+    "type": "OBJECTIVE_BOUNTY_FINISH",
+    "count": 20
+   },
+   {
+    "type": "CHAMPION_TRANSFORM",
+    "count": 3
+   }
+  ],
+  "real_events_without_a_simulator_type": 44062
+ },
+ "volumes": [
+  {
+   "metric": "kills per match",
+   "real": {
+    "n": 50,
+    "min": 22,
+    "median": 56.5,
+    "max": 94
+   },
+   "simulator": {
+    "n": 50,
+    "min": 5,
+    "median": 9,
+    "max": 15
+   }
+  },
+  {
+   "metric": "item purchases per match",
+   "real": {
+    "n": 50,
+    "min": 139,
+    "median": 241.5,
+    "max": 309
+   },
+   "simulator": {
+    "n": 50,
+    "min": 31,
+    "median": 40,
+    "max": 52
+   }
+  },
+  {
+   "metric": "events per match (all types)",
+   "real": {
+    "n": 50,
+    "min": 581,
+    "median": 1220,
+    "max": 1941
+   },
+   "simulator": {
+    "n": 50,
+    "min": 49,
+    "median": 62,
+    "max": 77
+   }
+  },
+  {
+   "metric": "match duration (s)",
+   "real": {
+    "n": 50,
+    "min": 918,
+    "median": 1652.5,
+    "max": 2328
+   },
+   "simulator": {
+    "n": 50,
+    "min": 1289,
+    "median": 1823,
+    "max": 2387
+   }
+  },
+  {
+   "metric": "players per match",
+   "real": {
+    "n": 50,
+    "min": 10,
+    "median": 10,
+    "max": 10
+   },
+   "simulator": {
+    "n": 50,
+    "min": 10,
+    "median": 10,
+    "max": 10
+   }
+  }
+ ],
+ "simulator": {
+  "lines": 3071,
+  "parse_failed": 0,
+  "events": 3071,
+  "matches": 50,
+  "types": [
+   {
+    "type": "item_purchase",
+    "count": 1992,
+    "fields_non_null": [
+     "champion_id",
+     "event_id",
+     "event_time",
+     "event_type",
+     "gold",
+     "item_id",
+     "match_id",
+     "match_seq",
+     "patch_version",
+     "player_id",
+     "region",
+     "schema_version"
+    ],
+    "fields_always_null": [
+     "duration_s",
+     "team",
+     "victim_id",
+     "winning_team"
+    ],
+    "fields_missing": 0
+   },
+   {
+    "type": "champion_pick",
+    "count": 500,
+    "fields_non_null": [
+     "champion_id",
+     "event_id",
+     "event_time",
+     "event_type",
+     "match_id",
+     "match_seq",
+     "patch_version",
+     "player_id",
+     "region",
+     "schema_version",
+     "team"
+    ],
+    "fields_always_null": [
+     "duration_s",
+     "gold",
+     "item_id",
+     "victim_id",
+     "winning_team"
+    ],
+    "fields_missing": 0
+   },
+   {
+    "type": "kill",
+    "count": 479,
+    "fields_non_null": [
+     "champion_id",
+     "event_id",
+     "event_time",
+     "event_type",
+     "match_id",
+     "match_seq",
+     "patch_version",
+     "player_id",
+     "region",
+     "schema_version",
+     "victim_id"
+    ],
+    "fields_always_null": [
+     "duration_s",
+     "gold",
+     "item_id",
+     "team",
+     "winning_team"
+    ],
+    "fields_missing": 0
+   },
+   {
+    "type": "match_start",
+    "count": 50,
+    "fields_non_null": [
+     "event_id",
+     "event_time",
+     "event_type",
+     "match_id",
+     "match_seq",
+     "patch_version",
+     "region",
+     "schema_version"
+    ],
+    "fields_always_null": [
+     "champion_id",
+     "duration_s",
+     "gold",
+     "item_id",
+     "player_id",
+     "team",
+     "victim_id",
+     "winning_team"
+    ],
+    "fields_missing": 0
+   },
+   {
+    "type": "match_end",
+    "count": 50,
+    "fields_non_null": [
+     "duration_s",
+     "event_id",
+     "event_time",
+     "event_type",
+     "match_id",
+     "match_seq",
+     "patch_version",
+     "region",
+     "schema_version",
+     "winning_team"
+    ],
+    "fields_always_null": [
+     "champion_id",
+     "gold",
+     "item_id",
+     "player_id",
+     "team",
+     "victim_id"
+    ],
+    "fields_missing": 0
+   }
+  ],
+  "event_time_iso_ms_z": 3071,
+  "patch": {
+   "14.3": 3071
+  },
+  "region": {
+   "NA": 882,
+   "KR": 831,
+   "BR": 806,
+   "EUW": 552
+  },
+  "duration_s": {
+   "n": 50,
+   "min": 1289,
+   "median": 1823,
+   "max": 2387
+  }
+ },
+ "phase3_inputs": [
+  {
+   "input": "Missing is not null",
+   "evidence": "timeline events: 1791 absent fields, 0 explicit nulls; the simulator always sends every field, with null when unused",
+   "gate": "required-field checks must treat an absent key and null the same way"
+  },
+  {
+   "input": "Empty strings in identifier-like fields",
+   "evidence": "participant fields with empty strings: summonerName (500)",
+   "gate": "treat '' as missing for ids and names"
+  },
+  {
+   "input": "Unknown event types",
+   "evidence": "19 real event types, 3 map to a simulator type; 44062 of 58540 events (75.3%) have none",
+   "gate": "an allowlist of event types; unknown types go to the dead-letter queue, counted, not dropped"
+  },
+  {
+   "input": "Ties in event time",
+   "evidence": "14674 of 58540 events (25.1%) share the timestamp of the event before them",
+   "gate": "ordering and match_seq cannot come from time alone; keep the list position"
+  },
+  {
+   "input": "Order and range of event times",
+   "evidence": "out of order in listed order: 0; negative: 0; after GAME_END: 0; later than own frame: 0",
+   "gate": "event_time within [game start, game end]; counts above say how strict this can be"
+  },
+  {
+   "input": "Relative timestamps",
+   "evidence": "event timestamps are ms since game start; absolute time needs info.gameStartTimestamp from the match file",
+   "gate": "a timeline without its match summary cannot get an event_time: hold or dead-letter it"
+  },
+  {
+   "input": "Participant 0 on player events",
+   "evidence": "participantId outside 1-10: 0_on_ITEM_PURCHASED (100), 0_on_SKILL_LEVEL_UP (27)",
+   "gate": "a purchase or skill event with participant 0 cannot be joined to a player: flag it (quarantine or keep with a null player), do not drop it"
+  },
+  {
+   "input": "Non-champion actors",
+   "evidence": "7 of 2829 kills (0.2%) have killerId 0",
+   "gate": "killer 0 is valid (not a player); a player join must allow it"
+  },
+  {
+   "input": "Corrections in the stream",
+   "evidence": "ITEM_UNDO: 567 vs 11599 purchases",
+   "gate": "a purchase is not final; downstream counts need undo handling"
+  },
+  {
+   "input": "Natural keys collide",
+   "evidence": "identical events beyond the first: 1981 (by type: WARD_PLACED: 1305, ITEM_DESTROYED: 410, ITEM_PURCHASED: 193, TURRET_PLATE_DESTROYED: 55, SKILL_LEVEL_UP: 18); (type, time, actor) collisions: 6114; with target: 2006",
+   "gate": "event_id = match id + frame index + event index (stable position), not a content hash"
+  },
+  {
+   "input": "More than one patch",
+   "evidence": "patches in the sample: 16.22 (30), 16.23 (20)",
+   "gate": "patch comes from each match (gameVersion cut to major.minor); the SCD2 patch dimension must expect several in one day"
+  }
+ ],
+ "checks": {
+  "reconciliation": "PASS (all totals add up)",
+  "privacy": "PASS: 0 of 1713 identifiers found (game_id 50, game_name 50, match_id 60, name_tag 341, player_name 341, puuid 533, summonerid 338); tags are checked together with the name (name#tag); names under 5 characters are matched as whole words; self-test planted one of each kind and caught it"
+ }
+}

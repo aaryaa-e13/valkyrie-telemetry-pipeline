@@ -21,8 +21,8 @@ No Kafka, Spark or Delta is used. Standard library Python only.
 
 | Committed (this folder) | Never committed |
 |---|---|
-| `fetch_matches.py`, its tests in `tests/unit/` | Raw API responses (`realdata/`, gitignored) |
-| Findings as counts and field paths only (later step) | Match ids, player ids (PUUIDs), names, tags |
+| `fetch_matches.py`, `compare_schema.py`, their tests in `tests/unit/` | Raw API responses (`realdata/`, gitignored) |
+| [`FINDINGS.md`](FINDINGS.md) and `findings.json`: counts and field paths only | Match ids, player ids (PUUIDs), names, tags |
 | | Raw event payloads, the API key |
 
 ## Fetching
@@ -51,3 +51,29 @@ unset RIOT_API_KEY
 - A re-run only fetches files that are missing.
 - The last line is `SUMMARY {json}` with counts only. Exit codes are in the script's
   docstring.
+
+## Comparing with the simulator
+
+```bash
+.venv/bin/python -m simulator.main --config simulator/config.yaml --seed 42 \
+  --matches 50 --dry-run > realdata/sim_events.jsonl
+.venv/bin/python -I research/real_match_data/compare_schema.py \
+  --raw realdata/raw --sim realdata/sim_events.jsonl
+```
+
+The first command is the simulator's existing dry run: no Kafka, no manifest. The second
+writes `findings.json` and `FINDINGS.md` here, but only if the totals reconcile and no
+identifier read from the raw files appears in either file (exit 1 otherwise, nothing
+written). See [`FINDINGS.md`](FINDINGS.md).
+
+## API observations from the live fetch (2026-11-26)
+
+- 104 calls (ladder 1, match-id pages 3, matches 50, timelines 50), all HTTP 200, 0 retries,
+  131.1 s. The ladder had 300 entries, all with a `puuid`; 3 ladder players gave 60 ids.
+- App rate limit of the dev key: `x-app-rate-limit: 100:120,20:1`. Method limits differ per
+  endpoint: ladder `500:600,30:10`, match `2000:10`.
+- Observation only, interpretation UNVERIFIED: the last app count read `7:120` after about
+  95 calls in 120 s, which suggests fixed windows rather than a sliding window. Pacing was
+  not changed.
+- The first live runs got HTTP 403 `error code: 1010` from the network edge, because of
+  urllib's default User-Agent (see `docs/WHAT_BROKE.md`).
