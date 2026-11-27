@@ -37,13 +37,26 @@ after a restart; txnVersion is always the batch id.
 Single writer: this query is the only writer of silver and late. That is what
 makes "check the other table, then insert" safe without a cross-table
 transaction. Effectively-once, not "exactly-once".
+
+Phase 3 (slice 1; plan docs/plans/phase3-plan.md, D3.1-D3.3):
+  * key check amended (C3): a blank event_id ('' or whitespace) is no key.
+  * quality gates (streaming/gates.py) in the plan: hard rules -> the dead-letter
+    table (DLQ), soft rules -> `quality_flags`. In-batch dedupe prefers a copy that
+    passes every hard rule, then the lowest offset (D2.3 for all-valid batches).
+  * write order: DLQ -> late -> silver -> cut versions -> control row -> commits/N.
+    DLQ rows are keyed by `dlq_key` ('id:<event_id>' or 'off:<topic>/<p>/<offset>').
+    The first decision for an id is final: an accepted copy of an id that is open in
+    the DLQ is counted (dup_of_dlq, late_dup_of_dlq: a stranded valid copy, D3.1) and
+    not inserted; a rejected copy of an accepted id is rejected_dup_of_accepted.
+  * the control row records the versions of silver, late, DLQ and resolutions read
+    after the batch's writes: a consistent cut for gold and verify (addendum B).
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -52,17 +65,20 @@ from pyspark.sql import Column, DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.streaming import StreamingQuery
 from pyspark.sql.types import (
+    ArrayType,
     BooleanType,
     DateType,
     IntegerType,
     LongType,
+    MapType,
     StringType,
     StructField,
     StructType,
     TimestampType,
 )
 
-from streaming import faults
+from common import delta_log
+from streaming import dlq, faults, gates
 from streaming.bronze import table_has_data, table_txn_version
 from streaming.config import SilverJobConfig
 from streaming.schemas import EVENT_JSON_SCHEMA
@@ -70,6 +86,7 @@ from streaming.silver_merge import merge_bounds, merge_condition
 from streaming.start_guard import BronzeStartupError, decide, read_checkpoint_state
 from streaming.watermark import (
     SnapshotStatusError,
+    SplitError,
     batch_starts_in_snapshot,
     check_split,
     recorded_delay_problem,
@@ -122,11 +139,39 @@ CONTROL_SCHEMA = StructType([
     StructField("ontime_rows", LongType(), True),
     StructField("dup_of_late", LongType(), True),
     StructField("wm_read_ms", LongType(), True),
+    # --- Phase 3 slice 1 (D3.x). Appended at the end, in this order (ALTER ADD COLUMNS).
+    StructField("rules_version", IntegerType(), True),
+    StructField("excluded_blank_event_id", LongType(), True),
+    StructField("keyless_rows", LongType(), True),
+    StructField("rejected_rows", LongType(), True),
+    StructField("dlq_keyless_inserted_this_attempt", LongType(), True),
+    StructField("dlq_keyless_already_present", LongType(), True),
+    StructField("dlq_keyed_inserted_this_attempt", LongType(), True),
+    StructField("dlq_keyed_already_present", LongType(), True),
+    StructField("rejected_dup_of_accepted", LongType(), True),
+    StructField("late_dup_of_dlq", LongType(), True),
+    StructField("late_already_present", LongType(), True),
+    StructField("dup_of_dlq", LongType(), True),
+    StructField("ontime_already_present", LongType(), True),
+    StructField("reject_counts", MapType(StringType(), LongType()), True),
+    StructField("flag_counts", MapType(StringType(), LongType()), True),
+    StructField("dlq_ms", LongType(), True),
+    StructField("d_open_read_ms", LongType(), True),
+    StructField("silver_version", LongType(), True),
+    StructField("late_version", LongType(), True),
+    StructField("dlq_version", LongType(), True),
+    StructField("resolutions_version", LongType(), True),
+    StructField("cut_ms", LongType(), True),
 ])
 SLICE3_CONTROL_FIELDS = 16   # columns before slice 4 (the upgrade adds the rest)
 LATE_EXTRA_FIELDS = (StructField("watermark_used", TimestampType(), True),
                      StructField("lag_behind_wm_ms", LongType(), True))
-
+# Phase 3: soft-rule flags on silver and late rows ([] = none; NULL = row from before Phase 3).
+QUALITY_FLAGS = StructField("quality_flags", ArrayType(StringType()), True)
+REASON, REASONS = "_reason", "_reasons"            # internal plan columns, never written
+# Carried in the plan for the DLQ rows; never written to silver or late.
+PLAN_EXTRA = (REASON, REASONS, "raw_value", "ingest_date")
+INTERNAL_COLUMNS = (LATE_FLAG, *PLAN_EXTRA)
 
 class SilverStartupError(BronzeStartupError):
     """Silver refused to start (exit 2). Subclass so one except covers both jobs."""
@@ -136,10 +181,13 @@ class SilverStartupError(BronzeStartupError):
 
 
 def key_ok() -> Column:
-    """D9 key check. parse_ok already implies the other two today; they are checked
-    explicitly so a future change to parse_ok cannot let a NULL key through."""
+    """D9 key check, amended in Phase 3 (C3): a blank event_id ('' or whitespace after
+    trim) is no key, so blank ids cannot collapse into one silver row (slice 0, P1).
+    parse_ok already implies the NULL checks; they stay explicit so a future change to
+    parse_ok cannot let a NULL key through."""
+    eid = F.col("event_id")
     return (F.coalesce(F.col("parse_ok"), F.lit(False))
-            & F.col("event_id").isNotNull() & F.col("event_time").isNotNull())
+            & eid.isNotNull() & (F.trim(eid) != F.lit("")) & F.col("event_time").isNotNull())
 
 
 @dataclass(frozen=True)
@@ -150,13 +198,14 @@ class BatchCounts:
     excluded_unparsed: int
     excluded_null_event_id: int
     excluded_null_event_time: int
-    excluded_total: int
+    excluded_total: int          # = keyless rows (all go to the DLQ, keyed by offset)
     keyed_rows: int
     keyed_unique: int
     min_date: date | None
     max_date: date | None
     clamped_max_us: int | None   # m_N: max least(event_time, kafka_timestamp), keyed rows
     clamped_rows: int            # keyed rows with kafka_timestamp < event_time
+    excluded_blank_event_id: int = 0   # Phase 3 (C3): '' or whitespace event_id
 
     @property
     def dup_in_batch(self) -> int:
@@ -195,25 +244,41 @@ def batch_counts(df: DataFrame) -> BatchCounts:
         F.max(keyed_date).alias("max_date"),
         F.max(F.unix_micros(clamped_event_time())).alias("clamped_max_us"),
         one(k & kts.isNotNull() & (kts < F.col("event_time"))).alias("clamped"),
+        one(F.col("event_id").isNotNull() & (F.trim(F.col("event_id")) == F.lit("")))
+        .alias("blank_id"),
     ).first()
     assert r is not None  # an aggregate without grouping always returns one row
     cmax = r["clamped_max_us"]
     return BatchCounts(int(r["rows_in"]), int(r["unparsed"]), int(r["null_id"]),
                        int(r["null_time"]), int(r["excluded"]), int(r["keyed"]),
                        int(r["keyed_unique"]), r["min_date"], r["max_date"],
-                       None if cmax is None else int(cmax), int(r["clamped"]))
+                       None if cmax is None else int(cmax), int(r["clamped"]),
+                       int(r["blank_id"]))
+
+
+def with_gates(df: DataFrame, rules_version: int) -> DataFrame:
+    """Bronze rows + the hard-rule result (REASON, REASONS) and the soft flags."""
+    return (df.withColumn(REASON, gates.reason_code(rules_version))
+            .withColumn(REASONS, gates.reasons(rules_version))
+            .withColumn(QUALITY_FLAGS.name, gates.flags()))
 
 
 def dedupe_in_batch(df: DataFrame) -> DataFrame:
-    """Keyed rows only, one per event_id: the lowest (topic, partition, offset)."""
-    w = Window.partitionBy("event_id").orderBy(*ORDER_KEY)
+    """Keyed rows only, one per event_id. Phase 3: a copy that passes every hard rule
+    is preferred (REASON NULL first), then the lowest (topic, partition, offset), as in
+    D2.3. Without the REASON column (Phase 2 callers) only the offset order applies."""
+    order = ([F.col(REASON).isNotNull()] if REASON in df.columns else []) + list(ORDER_KEY)
+    w = Window.partitionBy("event_id").orderBy(*order)
     return (df.where(key_ok()).withColumn("_rn", F.row_number().over(w))
             .where(F.col("_rn") == 1).drop("_rn"))
 
 
 def to_silver_rows(df: DataFrame, query_id: str, batch_id: int,
-                   inserted_at: datetime) -> DataFrame:
-    """Project bronze rows to the silver columns (no raw_value, no parse_ok: Q5)."""
+                   inserted_at: datetime, keep: tuple[str, ...] = ()) -> DataFrame:
+    """Project bronze rows to the silver columns (no raw_value, no parse_ok: Q5).
+
+    `keep`: extra columns carried along for the plan (e.g. raw_value for the DLQ);
+    they are dropped before any silver or late write (INTERNAL_COLUMNS)."""
     return df.select(
         *EVENT_COLUMNS,
         F.to_date("event_time").alias(PARTITION_COLUMN),
@@ -222,14 +287,20 @@ def to_silver_rows(df: DataFrame, query_id: str, batch_id: int,
         F.lit(query_id).alias("silver_query_id"),
         F.lit(batch_id).cast("long").alias("silver_batch_id"),
         F.lit(inserted_at).cast("timestamp").alias("silver_inserted_at"),
+        *[F.col(c) for c in keep],
     )
 
 
-def silver_schema(bronze_df: DataFrame) -> StructType:
-    """Silver schema derived from bronze's, every column nullable (like bronze, D2.2)."""
+def _base_silver_schema(bronze_df: DataFrame) -> StructType:
     shape = to_silver_rows(bronze_df.limit(0), "q", 0, datetime(2026, 1, 1, tzinfo=UTC))
     return StructType([StructField(f.name, f.dataType, True, f.metadata)
                        for f in shape.schema.fields])
+
+
+def silver_schema(bronze_df: DataFrame) -> StructType:
+    """Silver schema derived from bronze's, every column nullable (like bronze, D2.2),
+    plus Phase 3's quality_flags at the end (where ALTER ADD COLUMNS puts it)."""
+    return StructType([*_base_silver_schema(bronze_df).fields, QUALITY_FLAGS])
 
 
 def late_schema(bronze_df: DataFrame) -> StructType:
@@ -246,7 +317,12 @@ def is_late(wm_us: int | None) -> Column:
 
 @dataclass(frozen=True)
 class SplitCounts:
-    """One aggregation over the deduped, flagged rows of a batch."""
+    """One aggregation over the deduped, flagged rows of a batch.
+
+    `late` and `ontime` count ACCEPTED rows (no hard rule fails); `rejected` counts the
+    kept copies that fail a hard rule (they go to the DLQ, keyed by event_id). Without the
+    REASON column (Phase 2 callers) every row is accepted.
+    """
 
     deduped: int
     late: int
@@ -255,19 +331,33 @@ class SplitCounts:
     late_max_date: date | None
     ontime_min_date: date | None
     ontime_max_date: date | None
+    rejected: int = 0
+    rejected_min_date: date | None = None
+    rejected_max_date: date | None = None
+    flag_counts: dict[str, int] = field(default_factory=dict)
 
 
 def split_counts(rows: DataFrame) -> SplitCounts:
-    """Counts and date bounds per class (rows carry the LATE_FLAG column)."""
-    late, d = F.col(LATE_FLAG), F.col(PARTITION_COLUMN)
+    """Counts and date bounds per class (rows carry LATE_FLAG; Phase 3 also REASON)."""
+    d = F.col(PARTITION_COLUMN)
+    accepted = F.col(REASON).isNull() if REASON in rows.columns else F.lit(True)
+    late, ontime = accepted & F.col(LATE_FLAG), accepted & ~F.col(LATE_FLAG)
     one = lambda cond: F.coalesce(F.sum(F.when(cond, 1).otherwise(0)), F.lit(0))  # noqa: E731
-    r = rows.agg(F.count(F.lit(1)).alias("n"), one(late).alias("late"), one(~late).alias("ontime"),
+    flagged = QUALITY_FLAGS.name in rows.columns
+    flag_aggs = [one(accepted & F.array_contains(F.col(QUALITY_FLAGS.name), code))
+                 .alias(f"flag_{code}") for code in gates.SOFT_CODES] if flagged else []
+    r = rows.agg(F.count(F.lit(1)).alias("n"), one(late).alias("late"),
+                 one(ontime).alias("ontime"), one(~accepted).alias("rejected"),
                  F.min(F.when(late, d)).alias("llo"), F.max(F.when(late, d)).alias("lhi"),
-                 F.min(F.when(~late, d)).alias("olo"), F.max(F.when(~late, d)).alias("ohi"),
+                 F.min(F.when(ontime, d)).alias("olo"), F.max(F.when(ontime, d)).alias("ohi"),
+                 F.min(F.when(~accepted, d)).alias("rlo"),
+                 F.max(F.when(~accepted, d)).alias("rhi"), *flag_aggs,
                  ).first()
     assert r is not None
+    flags = {code: int(r[f"flag_{code}"]) for code in gates.SOFT_CODES
+             if flagged and int(r[f"flag_{code}"]) > 0}
     return SplitCounts(int(r["n"]), int(r["late"]), int(r["ontime"]), r["llo"], r["lhi"],
-                       r["olo"], r["ohi"])
+                       r["olo"], r["ohi"], int(r["rejected"]), r["rlo"], r["rhi"], flags)
 
 
 # --- tables -------------------------------------------------------------------------
@@ -296,34 +386,56 @@ def _ensure_table(spark: SparkSession, path: str, schema: StructType,
         raise SilverStartupError(f"{what} table {path}: " + "; ".join(problems))
 
 
-def ensure_silver_tables(spark: SparkSession, cfg: SilverJobConfig) -> None:
-    """Create/check silver (partitioned by event_date), control and late (not partitioned).
+def _add_missing_columns(spark: SparkSession, path: str, schema: StructType,
+                         what: str, why: str) -> None:
+    """ALTER TABLE ADD COLUMNS for the schema's columns the table lacks (nullable).
 
-    One-time upgrade from slice 3 (Q1 (a), logged as WARNING "upgrade"):
-      * control: missing slice 4 columns are added (ALTER TABLE ADD COLUMNS, nullable);
-      * late: created although the control table already has rows.
-    The guard (check_silver_guard) has already refused the cases where this would hide
-    lost data (a late table that existed and is gone).
+    Scalar adds on an append-only table: VERIFIED (D2.4); array/map adds: VERIFIED
+    (slice 0, P2). Logged as WARNING "upgrade"."""
+    have = set(spark.read.format("delta").load(path).columns)
+    missing = [f for f in schema.fields if f.name not in have]
+    if not missing:
+        return
+    cols = ", ".join(f"`{f.name}` {f.dataType.simpleString().upper()}" for f in missing)
+    spark.sql(f"ALTER TABLE delta.`{path}` ADD COLUMNS ({cols})")
+    log.warning(f"upgrade: {what} columns added ({why})", extra={"fields": {
+        "table_path": path, "columns": [f.name for f in missing]}})
+
+
+def ensure_silver_tables(spark: SparkSession, cfg: SilverJobConfig) -> None:
+    """Create/check silver (partitioned by event_date), control, late, and Phase 3's
+    dead-letter, resolutions and replays tables (not partitioned; all append-only).
+
+    Upgrades (logged as WARNING "upgrade"; the guard has already refused the cases
+    where they would hide lost data):
+      * slice 4: control's slice 4 columns; the late table for an existing silver;
+      * Phase 3: control's Phase 3 columns; `quality_flags` on silver and late; the
+        DLQ, resolutions and replays tables for an existing silver.
     """
     from delta.tables import DeltaTable
 
     bronze = spark.read.format("delta").load(cfg.bronze_path)
     _ensure_table(spark, cfg.table_path, silver_schema(bronze), PARTITION_COLUMN, "silver")
+    _add_missing_columns(spark, cfg.table_path, silver_schema(bronze), "silver", "Phase 3")
     control_had_rows = table_has_data(spark, cfg.control_path)
     _ensure_table(spark, cfg.control_path, CONTROL_SCHEMA, None, "silver control")
-    have = set(spark.read.format("delta").load(cfg.control_path).columns)
-    missing = [f for f in CONTROL_SCHEMA.fields if f.name not in have]
-    if missing:
-        cols = ", ".join(f"{f.name} {f.dataType.simpleString().upper()}" for f in missing)
-        spark.sql(f"ALTER TABLE delta.`{cfg.control_path}` ADD COLUMNS ({cols})")
-        log.warning("upgrade: control columns added (slice 4, D2.4)", extra={"fields": {
-            "table_path": cfg.control_path, "columns": [f.name for f in missing]}})
+    _add_missing_columns(spark, cfg.control_path, CONTROL_SCHEMA, "control",
+                         "slice 4 D2.4 / Phase 3")
     late_existed = DeltaTable.isDeltaTable(spark, cfg.late_path)
     _ensure_table(spark, cfg.late_path, late_schema(bronze), None, "silver late")
+    _add_missing_columns(spark, cfg.late_path, late_schema(bronze), "late", "Phase 3")
     if not late_existed and control_had_rows:
         log.warning("upgrade: late table created for an existing silver (slice 4, D2.4); "
                     "earlier batches had no watermark", extra={"fields": {
                         "table_path": cfg.late_path}})
+    for path, schema, what in ((cfg.dlq_path, dlq.DLQ_SCHEMA, "dead letter"),
+                               (cfg.resolutions_path, dlq.RESOLUTIONS_SCHEMA, "resolutions"),
+                               (cfg.replays_path, dlq.REPLAYS_SCHEMA, "replays")):
+        existed = DeltaTable.isDeltaTable(spark, path)
+        _ensure_table(spark, path, schema, None, what)
+        if not existed and control_had_rows:
+            log.warning(f"upgrade: {what} table created for an existing silver (Phase 3)",
+                        extra={"fields": {"table_path": path}})
 
 
 # --- start-up guard ------------------------------------------------------------------
@@ -362,6 +474,73 @@ def _late_table_problem(spark: SparkSession, cfg: SilverJobConfig, query_id: str
     return None
 
 
+def _phase3_ran(spark: SparkSession, control_path: str) -> bool:
+    """True if any control row was written by Phase 3 code (rules_version set)."""
+    from delta.tables import DeltaTable
+
+    if not DeltaTable.isDeltaTable(spark, control_path):
+        return False
+    ctl = spark.read.format("delta").load(control_path)
+    return ("rules_version" in ctl.columns
+            and ctl.where(F.col("rules_version").isNotNull()).limit(1).count() > 0)
+
+
+def _dlq_tables_problem(spark: SparkSession, cfg: SilverJobConfig) -> str | None:
+    """The DLQ and resolutions tables may be missing only before the first Phase 3 batch."""
+    from delta.tables import DeltaTable
+
+    gone = [p for p in (cfg.dlq_path, cfg.resolutions_path)
+            if not DeltaTable.isDeltaTable(spark, p)]
+    if gone and _phase3_ran(spark, cfg.control_path):
+        return (f"{', '.join(gone)} missing, but control rows already have rules_version: "
+                "the table existed and is gone, so DLQ decisions may be lost. Refusing to "
+                "create an empty one as an upgrade")
+    return None
+
+
+def rules_version_problem(spark: SparkSession, cfg: SilverJobConfig,
+                          state: Any) -> str | None:
+    """Plan 2.7: QUALITY_RULES_VERSION may change only after a clean stop.
+
+    While batch P is in flight (P > C), its re-run must use the version its first
+    attempt used. Evidence for that version, in order: P's control row (T == C + 1),
+    P's DLQ rows. Without evidence, batch C's recorded version must match: the first
+    attempt's version is unknown, so finishing P with C's version is the only choice
+    that cannot differ from it once a writer has run. Phase 2 batches (rules_version
+    NULL) have no version: the first Phase 3 batch may follow them. None if fine.
+    """
+    from delta.tables import DeltaTable
+
+    p, c, qid = state.last_planned, state.last_committed, state.query_id
+    if p is None or not qid or (c is not None and p <= c):
+        return None
+    configured = cfg.rules_version
+    by_batch: dict[int, int] = {}
+    if DeltaTable.isDeltaTable(spark, cfg.control_path):
+        ctl = spark.read.format("delta").load(cfg.control_path)
+        if "rules_version" in ctl.columns:
+            by_batch = {int(r["batch_id"]): int(r["rules_version"]) for r in ctl.where(
+                (F.col("silver_query_id") == qid) & F.col("batch_id").between(p - 1, p)
+                & F.col("rules_version").isNotNull()).select("batch_id", "rules_version")
+                .collect()}
+    seen = {by_batch[p]} if p in by_batch else set()
+    if DeltaTable.isDeltaTable(spark, cfg.dlq_path):
+        seen |= {int(r["rules_version"]) for r in spark.read.format("delta").load(cfg.dlq_path)
+                 .where((F.col("silver_query_id") == qid) & (F.col("silver_batch_id") == p))
+                 .select("rules_version").distinct().collect()}
+    hint = ("Set it back, start the stream once so batch {p} finishes, stop it cleanly, then "
+            "change the version (it applies from the next batch). Not overridable.")
+    if seen and seen != {configured}:
+        return (f"QUALITY_RULES_VERSION={configured} but batch {p} of query {qid} is in "
+                f"flight and its first attempt used rules version {sorted(seen)}. "
+                + hint.format(p=p))
+    if not seen and (p - 1) in by_batch and by_batch[p - 1] != configured:
+        return (f"QUALITY_RULES_VERSION={configured} but batch {p} of query {qid} is in "
+                f"flight; its first attempt's version is not recorded and batch {p - 1} "
+                f"used rules version {by_batch[p - 1]}. " + hint.format(p=p))
+    return None
+
+
 def check_silver_guard(spark: SparkSession, cfg: SilverJobConfig) -> str:
     """Silver's start-up guard (DECISIONS D2.3, D2.4).
 
@@ -375,7 +554,10 @@ def check_silver_guard(spark: SparkSession, cfg: SilverJobConfig) -> str:
         of any query has watermark_delay_s yet);
     and, never overridable by SILVER_ALLOW_REBUILD:
       * W (WATERMARK_DELAY_S) must equal the W this query id recorded (Q2);
-      * the next batch's snapshot status must be readable from the checkpoint (A2).
+      * the next batch's snapshot status must be readable from the checkpoint (A2);
+      * QUALITY_RULES_VERSION may not change while a batch is in flight (Phase 3, 2.7).
+    Phase 3 also refuses (overridable, like the late table) a missing DLQ or
+    resolutions table once a Phase 3 batch ran.
 
     NOT refused: a missing/reset silver checkpoint on a populated silver table.
     The new query re-reads bronze; every write is insert-if-absent, so nothing is
@@ -391,10 +573,11 @@ def check_silver_guard(spark: SparkSession, cfg: SilverJobConfig) -> str:
         "query": cfg.query_name, "checkpoint_path": cfg.checkpoint_path,
         "query_id": state.query_id, "checkpoint_planned": state.last_planned,
         "checkpoint_committed": state.last_committed,
-        "watermark_delay_s": cfg.watermark_delay_s}
+        "watermark_delay_s": cfg.watermark_delay_s, "rules_version": cfg.rules_version}
     recorded = recorded_delays(spark, cfg.control_path)
     problem = _late_table_problem(
-        spark, cfg, state.query_id if state.last_planned is not None else None, recorded)
+        spark, cfg, state.query_id if state.last_planned is not None else None, recorded
+    ) or _dlq_tables_problem(spark, cfg)
     if state.last_planned is None:
         if problem is None:
             if table_has_data(spark, cfg.table_path):
@@ -409,6 +592,9 @@ def check_silver_guard(spark: SparkSession, cfg: SilverJobConfig) -> str:
         if state.query_id:
             refusal = recorded_delay_problem(recorded.get(state.query_id),
                                              cfg.watermark_delay_s, state.query_id)
+            if refusal:
+                raise SilverStartupError(refusal)
+            refusal = rules_version_problem(spark, cfg, state)
             if refusal:
                 raise SilverStartupError(refusal)
             nxt = 0 if state.last_committed is None else state.last_committed + 1
@@ -489,7 +675,9 @@ class BatchPlan:
     wm_read_ms: int
     counts: BatchCounts
     split: SplitCounts
-    rows: DataFrame          # deduped silver-shaped rows + LATE_FLAG
+    rows: DataFrame          # deduped keyed rows, silver-shaped + LATE_FLAG + PLAN_EXTRA
+    keyless: DataFrame | None = None   # the batch's keyless rows + gate columns (lazy)
+    rules_version: int = 1
 
     def release(self) -> None:
         self.rows.unpersist()
@@ -506,11 +694,12 @@ def prior_max_us(spark: SparkSession, control_path: str, query_id: str,
 
 def plan_batch(df: DataFrame, batch_id: int, cfg: SilverJobConfig, query_id: str,
                started: datetime) -> BatchPlan:
-    """Snapshot status, wm(N), counts, dedupe and split; fails before any write.
+    """Snapshot status, wm(N), counts, gates, dedupe and split; fails before any write.
 
     Raises:
         SnapshotStatusError: offsets/N-1 cannot say whether N is a snapshot batch.
-        SplitError: late + on-time != keyed_unique (a row would be in neither table).
+        SplitError: rejected + late + on-time != keyed_unique (a row would be in no
+            table, or in two).
     """
     spark = df.sparkSession
     in_snapshot = batch_starts_in_snapshot(cfg.checkpoint_path, batch_id)
@@ -519,29 +708,168 @@ def plan_batch(df: DataFrame, batch_id: int, cfg: SilverJobConfig, query_id: str
     wm_read_ms = int((time.monotonic() - t0) * 1000)
     wm = watermark_us(prior, cfg.watermark_delay_s, in_snapshot)
     counts = batch_counts(df)
-    rows = (to_silver_rows(dedupe_in_batch(df), query_id, batch_id, started)
+    gated = with_gates(df, cfg.rules_version)
+    rows = (to_silver_rows(dedupe_in_batch(gated), query_id, batch_id, started,
+                           keep=(QUALITY_FLAGS.name, *PLAN_EXTRA))
             .withColumn(LATE_FLAG, is_late(wm)).persist())
     try:
         split = split_counts(rows)
-        check_split(counts.keyed_unique, split.deduped, split.late, split.ontime)
+        check_split(counts.keyed_unique, split.deduped, split.late, split.ontime,
+                    split.rejected)
     except BaseException:
         rows.unpersist()
         raise
     return BatchPlan(int(batch_id), query_id, started, in_snapshot, wm, wm_read_ms, counts,
-                     split, rows)
+                     split, rows, gated.where(~key_ok()), cfg.rules_version)
+
+
+# --- writes: DLQ -> late -> silver (plan 2.4) -------------------------------------------
+
+
+def _to_dlq(df: DataFrame, keyed: bool, plan: BatchPlan, ingest_time: str) -> DataFrame:
+    """DLQ rows from plan rows (keyed) or bronze rows (keyless)."""
+    return df.select(
+        dlq.dlq_key(F.lit(keyed)).alias("dlq_key"),
+        F.lit(dlq.KEY_KIND_ID if keyed else dlq.KEY_KIND_OFFSET).alias("key_kind"),
+        F.col(REASON).alias("reason_code"), F.col(REASONS).alias("reasons"),
+        F.lit(plan.rules_version).cast("int").alias("rules_version"),
+        "event_id", "event_type", "event_time", "match_id", "match_seq", "raw_value",
+        *LINEAGE_COLUMNS,
+        F.col(ingest_time).alias("bronze_ingest_time"),
+        F.col("ingest_date").alias("bronze_ingest_date"),
+        F.lit(plan.query_id).alias("silver_query_id"),
+        F.lit(plan.batch_id).cast("long").alias("silver_batch_id"),
+        F.lit(plan.started).cast("timestamp").alias("dlq_inserted_at"),
+        (F.timestamp_micros(F.lit(plan.wm_us)) if plan.wm_us is not None
+         else F.lit(None).cast("timestamp")).alias("watermark_used"),
+        F.lit(plan.in_snapshot).alias("in_initial_snapshot"),
+    )
+
+
+@dataclass(frozen=True)
+class DlqResult:
+    keyless_inserted: int = 0
+    keyless_present: int = 0
+    keyed_inserted: int = 0
+    keyed_present: int = 0
+    rejected_dup_of_accepted: int = 0
+    reject_counts: dict[str, int] = field(default_factory=dict)
+    ms: int = 0
+
+
+def _in_accepted(spark: SparkSession, cfg: SilverJobConfig, lo: date, hi: date) -> DataFrame:
+    """Event ids in S (pruned to [lo, hi], as D2.3) or L (whole; small)."""
+    s = (spark.read.format("delta").load(cfg.table_path)
+         .where(F.col(PARTITION_COLUMN).between(F.lit(lo), F.lit(hi))).select("event_id"))
+    return s.union(spark.read.format("delta").load(cfg.late_path).select("event_id"))
+
+
+def write_dlq(spark: SparkSession, cfg: SilverJobConfig, plan: BatchPlan) -> DlqResult:
+    """Step 2: keyless rows (by offset) and rejected keyed rows (by event_id) -> DLQ.
+
+    A rejected copy of an id already accepted (in S within +-H, or in L) is
+    `rejected_dup_of_accepted` and not inserted (the first decision is final).
+    Insert-if-absent on dlq_key. Nothing to reject: no read, no commit.
+
+    Raises:
+        SplitError: a keyless row passes every hard rule (it would be in no table).
+        DlqWriteError: the MERGE inserted another number of rows than planned.
+    """
+    keyless_n, rejected_n = plan.counts.excluded_total, plan.split.rejected
+    if keyless_n == 0 and rejected_n == 0:
+        return DlqResult()
+    assert plan.keyless is not None
+    t0 = time.monotonic()
+    keyless = _to_dlq(plan.keyless, False, plan, "ingest_time")
+    rejected = _to_dlq(plan.rows.where(F.col(REASON).isNotNull()), True, plan,
+                       "bronze_ingest_time")
+    reject_counts: dict[str | None, int] = {
+        r["reason_code"]: int(r["count"])
+        for r in keyless.unionByName(rejected).groupBy("reason_code").count().collect()}
+    if None in reject_counts:
+        raise SplitError(f"{reject_counts[None]} keyless rows pass every hard rule of rules "
+                         f"version {plan.rules_version}: they would be in no table")
+    dup_of_accepted = 0
+    if rejected_n > 0:
+        lo, hi = merge_bounds(plan.split.rejected_min_date, plan.split.rejected_max_date,
+                              cfg.dedupe_horizon_days)
+        rejected = rejected.join(_in_accepted(spark, cfg, lo, hi), "event_id", "left_anti")
+        dup_of_accepted = rejected_n - rejected.count()
+    present = spark.read.format("delta").load(cfg.dlq_path).select("dlq_key")
+    # unionByName: the anti-join above moved event_id to the first column.
+    src = keyless.unionByName(rejected).join(present, "dlq_key", "left_anti").persist()
+    try:
+        r = src.agg(F.coalesce(F.sum(F.when(F.col("key_kind") == dlq.KEY_KIND_ID, 1)
+                                     .otherwise(0)), F.lit(0)).alias("keyed"),
+                    F.count(F.lit(1)).alias("n")).first()
+        assert r is not None
+        new_keyed, new_total = int(r["keyed"]), int(r["n"])
+        dlq.insert_if_absent(spark, cfg.dlq_path, src, dlq.DLQ_COLUMNS, "dlq_key",
+                             dlq.DLQ_VIEW, new_total)
+    finally:
+        src.unpersist()
+    new_keyless = new_total - new_keyed
+    keyed_n = rejected_n - dup_of_accepted
+    return DlqResult(new_keyless, keyless_n - new_keyless, new_keyed, keyed_n - new_keyed,
+                     dup_of_accepted, {str(k): v for k, v in reject_counts.items()},
+                     int((time.monotonic() - t0) * 1000))
+
+
+def read_d_open(spark: SparkSession, cfg: SilverJobConfig,
+                plan: BatchPlan) -> tuple[DataFrame | None, int]:
+    """D_open's ids, persisted (release with unpersist), and the read's ms.
+
+    Read AFTER the DLQ write: it then holds this batch's rejected ids too, which are
+    never among its accepted ids (one copy per id), so every attempt of the batch
+    sees the same set for its accepted rows. No accepted rows: no read."""
+    if plan.split.late + plan.split.ontime == 0:
+        return None, 0
+    t0 = time.monotonic()
+    ids = dlq.open_keyed_ids(spark, cfg.dlq_path, cfg.resolutions_path).persist()
+    ids.count()
+    return ids, int((time.monotonic() - t0) * 1000)
+
+
+def _classify(src: DataFrame, other: DataFrame, d_open: DataFrame | None) -> DataFrame:
+    """src + _in_other / _in_dlq flags (the first decision is final, plan 2.6)."""
+    out = src.join(other.select("event_id").distinct().withColumn("_in_other", F.lit(True)),
+                   "event_id", "left")
+    if d_open is None:
+        out = out.withColumn("_in_dlq", F.lit(False))
+    else:
+        out = out.join(d_open.withColumn("_in_dlq", F.lit(True)), "event_id", "left")
+    return (out.withColumn("_in_other", F.coalesce(F.col("_in_other"), F.lit(False)))
+            .withColumn("_in_dlq", F.coalesce(F.col("_in_dlq"), F.lit(False))))
+
+
+def _classified_counts(df: DataFrame) -> tuple[int, int, int]:
+    """(in the other table, in D_open only, candidates)."""
+    one = lambda cond: F.coalesce(F.sum(F.when(cond, 1).otherwise(0)), F.lit(0))  # noqa: E731
+    r = df.agg(one(F.col("_in_other")).alias("o"),
+               one(~F.col("_in_other") & F.col("_in_dlq")).alias("d"),
+               one(~F.col("_in_other") & ~F.col("_in_dlq")).alias("c")).first()
+    assert r is not None
+    return int(r["o"]), int(r["d"]), int(r["c"])
+
+
+def _target_columns(rows: DataFrame, extra: tuple[str, ...] = ()) -> tuple[str, ...]:
+    return (*[c for c in rows.columns if c not in INTERNAL_COLUMNS], *extra)
 
 
 @dataclass(frozen=True)
 class LateResult:
     dup_of_silver: int = 0
+    dup_of_dlq: int = 0
     inserted: int = 0
+    already_present: int = 0
     lo: date | None = None
     hi: date | None = None
     ms: int = 0
 
 
-def write_late(spark: SparkSession, cfg: SilverJobConfig, plan: BatchPlan) -> LateResult:
-    """Step 5: late rows not already in silver -> insert-if-absent into late.
+def write_late(spark: SparkSession, cfg: SilverJobConfig, plan: BatchPlan,
+               d_open: DataFrame | None = None) -> LateResult:
+    """Step 3: accepted late rows in neither silver nor D_open -> insert-if-absent into late.
 
     The silver lookup is pruned to the late rows' own dates +- H (late_merge_lo/hi),
     so one old late row never widens silver's MERGE window. No late rows: no read,
@@ -554,73 +882,110 @@ def write_late(spark: SparkSession, cfg: SilverJobConfig, plan: BatchPlan) -> La
     lo, hi = merge_bounds(plan.split.late_min_date, plan.split.late_max_date,
                           cfg.dedupe_horizon_days)
     in_silver = (spark.read.format("delta").load(cfg.table_path)
-                 .where(F.col(PARTITION_COLUMN).between(F.lit(lo), F.lit(hi)))
-                 .select("event_id"))
-    wm_col = F.timestamp_micros(F.lit(plan.wm_us))
-    src = (plan.rows.where(F.col(LATE_FLAG)).drop(LATE_FLAG)
-           .join(in_silver, "event_id", "left_anti")
-           .withColumn("watermark_used", wm_col)
+                 .where(F.col(PARTITION_COLUMN).between(F.lit(lo), F.lit(hi))))
+    late_rows = plan.rows.where(F.col(LATE_FLAG) & F.col(REASON).isNull())
+    cols = _target_columns(plan.rows, tuple(f.name for f in LATE_EXTRA_FIELDS))
+    src = (_classify(late_rows, in_silver, d_open)
+           .withColumn("watermark_used", F.timestamp_micros(F.lit(plan.wm_us)))
            .withColumn("lag_behind_wm_ms",
                        F.floor((F.lit(plan.wm_us) - F.unix_micros("event_time")) / 1000)
                        .cast("long"))).persist()
     try:
-        candidates = src.count()
+        in_s, in_d, candidates = _classified_counts(src)
         inserted = 0
         if candidates > 0:
-            src.createOrReplaceTempView(LATE_VIEW)
+            src.where(~F.col("_in_other") & ~F.col("_in_dlq")).select(*cols) \
+               .createOrReplaceTempView(LATE_VIEW)
             result = spark.sql(
                 f"MERGE INTO delta.`{cfg.late_path}` t USING {LATE_VIEW} s "
-                "ON t.event_id = s.event_id WHEN NOT MATCHED THEN INSERT *").first()
+                "ON t.event_id = s.event_id WHEN NOT MATCHED THEN INSERT "
+                f"({', '.join(cols)}) VALUES ({', '.join('s.' + c for c in cols)})").first()
             inserted = int(result["num_inserted_rows"]) if result is not None else 0
     finally:
         src.unpersist()
-    return LateResult(plan.split.late - candidates, inserted, lo, hi,
+    return LateResult(in_s, in_d, inserted, candidates - inserted, lo, hi,
                       int((time.monotonic() - t0) * 1000))
 
 
 @dataclass(frozen=True)
 class SilverResult:
     dup_of_late: int = 0
+    dup_of_dlq: int = 0
     inserted: int = 0
+    already_present: int = 0
     lo: date | None = None
     hi: date | None = None
     ms: int = 0
     skipped: bool = True
 
 
-def write_silver(spark: SparkSession, cfg: SilverJobConfig, plan: BatchPlan) -> SilverResult:
-    """Step 6: on-time rows not already in late -> insert-only MERGE into silver.
+def write_silver(spark: SparkSession, cfg: SilverJobConfig, plan: BatchPlan,
+                 d_open: DataFrame | None = None) -> SilverResult:
+    """Step 4: accepted on-time rows in neither late nor D_open -> insert-only MERGE.
 
-    Bounds: DATE literals from the on-time rows only (never NULL, D2.3). No on-time
-    rows left after removing ids already in late: no MERGE, no commit.
+    Bounds: DATE literals from the on-time rows only (never NULL, D2.3). No candidate
+    left after removing ids already in late or D_open: no MERGE, no commit.
     """
     if plan.split.ontime == 0:
         return SilverResult()
     lo, hi = merge_bounds(plan.split.ontime_min_date, plan.split.ontime_max_date,
                           cfg.dedupe_horizon_days)
-    in_late = spark.read.format("delta").load(cfg.late_path).select("event_id")
-    src = (plan.rows.where(~F.col(LATE_FLAG)).drop(LATE_FLAG)
-           .join(in_late, "event_id", "left_anti")).persist()
+    in_late = spark.read.format("delta").load(cfg.late_path)
+    ontime = plan.rows.where(~F.col(LATE_FLAG) & F.col(REASON).isNull())
+    cols = _target_columns(plan.rows)
+    src = _classify(ontime, in_late, d_open).persist()
     try:
-        candidates = src.count()
+        in_l, in_d, candidates = _classified_counts(src)
         if candidates == 0:
-            return SilverResult(dup_of_late=plan.split.ontime)   # all already in late
-        src.createOrReplaceTempView(MERGE_VIEW)
+            return SilverResult(dup_of_late=in_l, dup_of_dlq=in_d)
+        src.where(~F.col("_in_other") & ~F.col("_in_dlq")).select(*cols) \
+           .createOrReplaceTempView(MERGE_VIEW)
         t0 = time.monotonic()
         result = spark.sql(
             f"MERGE INTO delta.`{cfg.table_path}` t USING {MERGE_VIEW} s "
-            f"ON {merge_condition(lo, hi)} WHEN NOT MATCHED THEN INSERT *").first()
+            f"ON {merge_condition(lo, hi)} WHEN NOT MATCHED THEN INSERT "
+            f"({', '.join(cols)}) VALUES ({', '.join('s.' + c for c in cols)})").first()
         ms = int((time.monotonic() - t0) * 1000)
     finally:
         src.unpersist()
     inserted = int(result["num_inserted_rows"]) if result is not None else 0
-    return SilverResult(plan.split.ontime - candidates, inserted, lo, hi, ms, skipped=False)
+    return SilverResult(in_l, in_d, inserted, candidates - inserted, lo, hi, ms,
+                        skipped=False)
+
+
+@dataclass(frozen=True)
+class Cut:
+    """Table versions read after a batch's writes (addendum B): a consistent cut."""
+
+    silver: int | None
+    late: int | None
+    dlq: int | None
+    resolutions: int | None
+    ms: int
+    ms_each: dict[str, int]
+
+
+def read_cut(cfg: SilverJobConfig) -> Cut:
+    """The 4 versions, from the Delta logs (stdlib, no Spark job), each timed."""
+    out: dict[str, int | None] = {}
+    ms_each: dict[str, int] = {}
+    t_all = time.monotonic()
+    for name, path in (("silver", cfg.table_path), ("late", cfg.late_path),
+                       ("dlq", cfg.dlq_path), ("resolutions", cfg.resolutions_path)):
+        t0 = time.monotonic()
+        out[name] = delta_log.current_version(path)
+        ms_each[name] = int((time.monotonic() - t0) * 1000)
+    return Cut(out["silver"], out["late"], out["dlq"], out["resolutions"],
+               int((time.monotonic() - t_all) * 1000), ms_each)
 
 
 def control_row(cfg: SilverJobConfig, plan: BatchPlan, late: LateResult,
-                silver: SilverResult) -> dict[str, Any]:
-    """Step 7's row. Deterministic per batch except *_this_attempt, *_ms, processed_at."""
+                silver: SilverResult, dlq_res: DlqResult | None = None,
+                cut: Cut | None = None, d_open_ms: int = 0) -> dict[str, Any]:
+    """Step 5's row. Deterministic per batch except *_this_attempt, *_already_present,
+    *_ms and processed_at (their sums per class are deterministic, plan 2.5)."""
     c = plan.counts
+    dr = dlq_res or DlqResult()
     return {
         "silver_query_id": plan.query_id, "batch_id": plan.batch_id, "rows_in": c.rows_in,
         "excluded_unparsed": c.excluded_unparsed,
@@ -643,16 +1008,38 @@ def control_row(cfg: SilverJobConfig, plan: BatchPlan, late: LateResult,
         "late_merge_lo": late.lo, "late_merge_hi": late.hi, "late_ms": late.ms,
         "ontime_rows": plan.split.ontime, "dup_of_late": silver.dup_of_late,
         "wm_read_ms": plan.wm_read_ms,
+        # Phase 3 (plan 2.5, 2.7; addenda A and B)
+        "rules_version": plan.rules_version,
+        "excluded_blank_event_id": c.excluded_blank_event_id,
+        "keyless_rows": c.excluded_total,
+        "rejected_rows": plan.split.rejected,
+        "dlq_keyless_inserted_this_attempt": dr.keyless_inserted,
+        "dlq_keyless_already_present": dr.keyless_present,
+        "dlq_keyed_inserted_this_attempt": dr.keyed_inserted,
+        "dlq_keyed_already_present": dr.keyed_present,
+        "rejected_dup_of_accepted": dr.rejected_dup_of_accepted,
+        "late_dup_of_dlq": late.dup_of_dlq,
+        "late_already_present": late.already_present,
+        "dup_of_dlq": silver.dup_of_dlq,
+        "ontime_already_present": silver.already_present,
+        "reject_counts": dict(dr.reject_counts),
+        "flag_counts": dict(plan.split.flag_counts),
+        "dlq_ms": dr.ms, "d_open_read_ms": d_open_ms,
+        "silver_version": cut.silver if cut else None,
+        "late_version": cut.late if cut else None,
+        "dlq_version": cut.dlq if cut else None,
+        "resolutions_version": cut.resolutions if cut else None,
+        "cut_ms": cut.ms if cut else None,
     }
 
 
 def process_batch(df: DataFrame, batch_id: int, cfg: SilverJobConfig,
                   query_id: str) -> dict[str, Any]:
-    """One bronze micro-batch -> late, silver, control row (in that order).
+    """One bronze micro-batch -> DLQ, late, silver, cut, control row (in that order).
 
     Returns the control row as a dict (also logged as "silver batch").
     Raises (the batch fails, nothing more is written for it): SnapshotStatusError,
-    SplitError, MergeBoundsError.
+    SplitError, MergeBoundsError, DlqWriteError.
     """
     spark = df.sparkSession
     started = datetime.now(UTC)
@@ -660,20 +1047,33 @@ def process_batch(df: DataFrame, batch_id: int, cfg: SilverJobConfig,
     try:
         plan = plan_batch(df, batch_id, cfg, query_id, started)
         n_late, n_ontime = plan.split.late, plan.split.ontime
+        d_open: DataFrame | None = None
         try:
             faults.hit("after_read", batch_id, n_late, n_ontime)   # test-only hooks (D2.6)
-            late = write_late(spark, cfg, plan)
+            dlq_res = write_dlq(spark, cfg, plan)
+            faults.hit("after_dlq", batch_id, n_late, n_ontime)
+            d_open, d_open_ms = read_d_open(spark, cfg, plan)
+            late = write_late(spark, cfg, plan, d_open)
             faults.hit("after_late", batch_id, n_late, n_ontime)
-            silver = write_silver(spark, cfg, plan)
+            silver = write_silver(spark, cfg, plan, d_open)
             faults.hit("after_silver", batch_id, n_late, n_ontime)
         finally:
             plan.release()
-        row = control_row(cfg, plan, late, silver)
+            if d_open is not None:
+                d_open.unpersist()
+        cut = read_cut(cfg)
+        row = control_row(cfg, plan, late, silver, dlq_res, cut, d_open_ms)
         write_control_row(spark, cfg.control_path, row)
         faults.hit("after_control", batch_id, n_late, n_ontime)
+        stranded = late.dup_of_dlq + silver.dup_of_dlq
+        if stranded:
+            log.warning("valid copy stranded in DLQ (D3.1: fixed in Phase 4)", extra={
+                "fields": {"query": cfg.query_name, "batch_id": int(batch_id),
+                           "dup_of_dlq": silver.dup_of_dlq,
+                           "late_dup_of_dlq": late.dup_of_dlq}})
         log.info("silver batch", extra={"fields": {
-            "query": cfg.query_name, **{k: (v.isoformat() if isinstance(v, date) else v)
-                                        for k, v in row.items()}}})
+            "query": cfg.query_name, "cut_ms_each": cut.ms_each,
+            **{k: (v.isoformat() if isinstance(v, date) else v) for k, v in row.items()}}})
         return row
     finally:
         df.unpersist()

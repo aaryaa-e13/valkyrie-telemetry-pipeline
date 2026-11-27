@@ -336,7 +336,13 @@ def summarize_verify(report: dict[str, Any]) -> dict[str, Any]:
     cons = sv.get("consistency") or {}
     out["silver"]["consistency"] = {k: cons.get(k) for k in (
         "checkable", "silver_rows_upto_batch", "late_rows_upto_batch",
-        "bronze_keyed_distinct_ids", "control_excluded_total", "bronze_keyless_rows")}
+        "dlq_open_keyed_rows_upto_batch", "bronze_keyed_distinct_ids",
+        "control_excluded_total", "bronze_keyless_rows")}
+    dl = sv.get("dlq") or {}
+    out["silver"]["dlq"] = {   # Phase 3: good data must give 0 DLQ rows for the run
+        "verdicts": dl.get("verdicts"), "dlq_rows_for_run": dl.get("dlq_rows_for_run"),
+        "dlq_total_rows": dl.get("dlq_total_rows"), "phase3_batches": dl.get("phase3_batches"),
+        "cut": dl.get("cut")}
     return out
 
 

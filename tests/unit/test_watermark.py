@@ -93,8 +93,13 @@ def test_microseconds_round_trip_exactly() -> None:
 def test_split_check() -> None:
     check_split(keyed_unique=5, deduped=5, late=2, ontime=3)
     check_split(keyed_unique=0, deduped=0, late=0, ontime=0)
-    with pytest.raises(SplitError, match="neither table"):
+    check_split(keyed_unique=5, deduped=5, late=1, ontime=3, rejected=1)   # Phase 3
+    with pytest.raises(SplitError, match="no table"):
         check_split(keyed_unique=5, deduped=5, late=2, ontime=2)
+    with pytest.raises(SplitError, match="rejected 1 \\+ late 2 \\+ on-time 3"):
+        check_split(keyed_unique=5, deduped=5, late=2, ontime=3, rejected=1)
+    with pytest.raises(SplitError, match="negative"):
+        check_split(keyed_unique=5, deduped=5, late=2, ontime=4, rejected=-1)
     with pytest.raises(SplitError, match="dedupe kept"):
         check_split(keyed_unique=5, deduped=6, late=2, ontime=3)
     with pytest.raises(SplitError, match="negative"):

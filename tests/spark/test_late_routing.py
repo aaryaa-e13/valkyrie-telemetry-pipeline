@@ -51,9 +51,13 @@ T0 = datetime(2026, 11, 19, 12, 0, 0, tzinfo=UTC)
 W = timedelta(seconds=60)
 MS = timedelta(milliseconds=1)
 fast = pytest.mark.spark_fast
-# Control fields that legitimately differ per attempt (C2, plus processed_at: see report).
+# Control fields that legitimately differ per attempt (C2, plus processed_at: see report;
+# Phase 3 plan 2.5: the *_already_present terms and the DLQ, D_open and cut timings).
 ATTEMPT_FIELDS = {"inserted_this_attempt", "late_inserted_this_attempt", "merge_ms", "late_ms",
-                  "wm_read_ms", "processed_at"}
+                  "wm_read_ms", "processed_at", "dlq_keyless_inserted_this_attempt",
+                  "dlq_keyless_already_present", "dlq_keyed_inserted_this_attempt",
+                  "dlq_keyed_already_present", "late_already_present",
+                  "ontime_already_present", "dlq_ms", "d_open_read_ms", "cut_ms"}
 Row = tuple[int, str | None, datetime, datetime | None]   # offset, id (None = bad), time, kafka
 
 
@@ -273,7 +277,7 @@ def test_split_check_fails_the_batch_before_any_write(spark: SparkSession, tmp_p
     monkeypatch.setattr(silver, "split_counts",
                         lambda rows: replace(real(rows), ontime=real(rows).ontime - 1))
     before = _versions(cfg)
-    with pytest.raises(SplitError, match="neither table"):
+    with pytest.raises(SplitError, match="no table"):
         process_batch(_batch(spark, [r(2, "a", T0 - timedelta(hours=1)), r(3, "b", T0)]),
                       1, cfg, "q-1")
     assert _versions(cfg) == before
@@ -708,7 +712,8 @@ def test_verify_counts_late_rows_and_catches_an_id_in_both_tables(spark: SparkSe
     failed, notes, rep = check()
     assert failed and (rep["in_both_ids"], rep["ids_in_both_tables"]) == (1, 1)
     assert any(n.startswith("1 R1:") for n in notes)
-    assert any("+ late rows 1 != distinct keyed bronze ids 4" in n for n in notes)
+    assert any("+ late rows 1 + D_open keyed rows 0 != distinct keyed bronze ids 4" in n
+               for n in notes)
 
 
 @fast

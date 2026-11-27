@@ -49,6 +49,24 @@ version V, so it has read bronze versions < V):
     sum(control excluded_total) == keyless rows of bronze@V-1
     control batch ids of the current query == 0..C (one row per batch)
 These print "not checkable" (never "pass") when the preconditions do not hold.
+Phase 3 (slice 1; pure parts in streaming/oracle_dlq.py). With D = the dead-letter
+table, D_open = its keyed rows without a resolution:
+    R8 per Phase 3 control row, the equations of plan 2.5 add up
+    R9 at batch C's recorded cut (its control row's silver/late/dlq/resolutions
+       versions, addendum B): S, L, D_open pairwise disjoint; no dlq_key twice; no
+       keyed event_id twice in D; resolved ids in S or L. Versions written after the
+       cut are reported (`versions_after_cut`), not judged.
+    The consistency balance above becomes silver + late + D_open keyed (upto C) ==
+       distinct keyed bronze ids, plus DLQ keyless rows (upto C) == sum keyless_rows
+       of Phase 3 batches (plan 2.8's R9 balances, kept here so one fault -> one rule).
+    R10 good data is never dead-lettered (manifests v1-v3 are good data; manifest v4,
+       with deliberate bad data, is slice 2). R10a: no DLQ row carries a manifest id.
+       R10b: no DLQ row sits at offsets only this run wrote (a partition whose
+       count == max - min + 1); rows in ranges other producers shared are counted and
+       reported as not checkable. Pure verdict: oracle_dlq.r10_verdicts.
+    dlq_rows_for_run  every DLQ row R10 looked at (by id + own + shared offsets); the
+       smokes report it and must show 0.
+The key check follows the job's (C3): a blank event_id is no key.
 
 Accepts manifest v1, v2 and v3 (see common/manifest_reader.py).
 
@@ -81,7 +99,9 @@ from pyspark.sql import functions as F
 
 from common.logging_setup import setup_logging
 from common.manifest_reader import Manifest, ManifestError, load_manifest
+from streaming import dlq as dlq_mod
 from streaming import oracle as orc
+from streaming import oracle_dlq as odl
 
 log = logging.getLogger("streaming.verify_manifest")
 
@@ -90,6 +110,8 @@ DEFAULT_SILVER = "/data/lake/silver/game_events"
 DEFAULT_CONTROL = "/data/lake/_control/silver_batches"
 DEFAULT_LATE = "/data/lake/silver/late_events"
 DEFAULT_SILVER_CHECKPOINT = "/data/checkpoints/silver"
+DEFAULT_DLQ = "/data/lake/silver/dead_letter"
+DEFAULT_RESOLUTIONS = "/data/lake/_control/dlq_resolutions"
 OFFSET_KEY = ("kafka_topic", "kafka_partition", "kafka_offset")
 LAYERS = ("bronze", "silver", "all")
 
@@ -198,8 +220,7 @@ def verify(spark: SparkSession, manifest_path: Path, table_path: str,
 
 
 def _keyed(df: Any) -> Any:
-    return df.where(F.coalesce(F.col("parse_ok"), F.lit(False)) & F.col("event_id").isNotNull()
-                    & F.col("event_time").isNotNull())
+    return df.where(_job_key())
 
 
 def _null_key(df: Any) -> Any:
@@ -216,12 +237,18 @@ def _table_stats(df: Any) -> dict[str, int]:
 
 def verify_silver(spark: SparkSession, manifest_path: Path, silver_path: str, late_path: str,
                   control_path: str, checkpoint_path: str, bronze_path: str,
-                  horizon_days: int) -> dict[str, Any]:
-    """Silver + late section of the report (see module docstring). Read-only."""
+                  horizon_days: int, dlq_path: str | None = None,
+                  resolutions_path: str | None = None) -> dict[str, Any]:
+    """Silver + late (+ DLQ) section of the report (see module docstring). Read-only.
+
+    dlq_path / resolutions_path default to the job's sibling folders of the late and
+    control tables (streaming/config.py)."""
     from delta.tables import DeltaTable
 
     from streaming.start_guard import committed_source_offset, read_checkpoint_state
 
+    dlq_path = dlq_path or str(Path(late_path).parent / "dead_letter")
+    resolutions_path = resolutions_path or str(Path(control_path).parent / "dlq_resolutions")
     rep: dict[str, Any] = {"table_path": silver_path, "late_path": late_path}
     if not DeltaTable.isDeltaTable(spark, silver_path):
         rep["table_missing"] = True
@@ -291,11 +318,15 @@ def verify_silver(spark: SparkSession, manifest_path: Path, silver_path: str, la
                                        "versionAsOf", latest_version(spark, control_path))
                                    .load(control_path))
 
+    state = read_checkpoint_state(checkpoint_path)
+    committed = committed_source_offset(checkpoint_path)
+    rep["dlq"] = dlq_section(spark, manifest, expected, silver_path, late_path, control_path,
+                             dlq_path, resolutions_path, state.query_id,
+                             None if committed is None else committed[0])
+
     # --- consistency, pinned to what silver has consumed --------------------------
     cons: dict[str, Any] = {"checkable": False}
     rep["consistency"] = cons
-    state = read_checkpoint_state(checkpoint_path)
-    committed = committed_source_offset(checkpoint_path)
     if committed is None or committed[1] is None or not state.query_id:
         cons["reason"] = f"no committed silver batch with readable offsets in {checkpoint_path}"
         return rep
@@ -323,6 +354,15 @@ def verify_silver(spark: SparkSession, manifest_path: Path, silver_path: str, la
                       F.coalesce(F.sum("excluded_total"), F.lit(0)).alias("excl")).first()
     upto = ~((F.col("silver_query_id") == qid) & (F.col("silver_batch_id") > c))
     silver_upto, late_upto = silver.where(upto).count(), late.where(upto).count()
+    dl = rep["dlq"]
+    d_open_upto = d_keyless_upto = 0
+    p3_keyless = int(dl.get("control_keyless_rows_phase3") or 0)
+    if dl.get("dlq_table_exists"):
+        d_all = spark.read.format("delta").load(dlq_path).where(upto)
+        res_keys = spark.read.format("delta").load(resolutions_path).select("dlq_key")
+        d_open_upto = (d_all.where(F.col("key_kind") == "event_id")
+                       .join(res_keys, "dlq_key", "left_anti").count())
+        d_keyless_upto = d_all.where(F.col("key_kind") == "offset").count()
     cons.update(
         checkable=True,
         bronze_rows=b.count(),
@@ -330,6 +370,8 @@ def verify_silver(spark: SparkSession, manifest_path: Path, silver_path: str, la
         bronze_keyless_rows=b.count() - keyed.count(),
         max_copy_spread_days=int(spread), horizon_days=horizon_days,
         silver_rows_upto_batch=silver_upto, late_rows_upto_batch=late_upto,
+        dlq_open_keyed_rows_upto_batch=d_open_upto, dlq_keyless_rows_upto_batch=d_keyless_upto,
+        control_keyless_rows_phase3=p3_keyless,
         control_rows=int(ctl["n"]), control_distinct_batches=int(ctl["ids"]),
         control_batch_range=[int(ctl["lo"]), int(ctl["hi"])],
         control_excluded_total=int(ctl["excl"]),
@@ -338,13 +380,145 @@ def verify_silver(spark: SparkSession, manifest_path: Path, silver_path: str, la
     return rep
 
 
+# --- Phase 3: DLQ, R8, R9 (slice 1) -------------------------------------------------
+
+R8_FIELDS = ("silver_query_id", "batch_id", "rules_version", "rows_in", "keyed_unique",
+             *sorted({t for _, terms in odl.R8_EQUATIONS for t in terms} - {"keyed_rows"}),
+             "rejected_rows", "reject_counts", "silver_version", "late_version",
+             "dlq_version", "resolutions_version")
+
+
+def r10_counts(manifest: Manifest, expected: DataFrame, dlq: DataFrame) -> dict[str, Any]:
+    """The numbers R10 judges (oracle_dlq.r10_verdicts): this run's rows in the DLQ.
+
+    By id: every DLQ row (any key kind, resolved or not) with a manifest id. By offset:
+    the rows NOT caught by id, inside a partition's [min, max] of the manifest, split
+    into the run's own ranges (count == max - min + 1) and shared ones.
+    """
+    by_id = dlq.join(expected, "event_id", "left_semi").select("dlq_key").distinct()
+    out: dict[str, Any] = {
+        "ids_listed": len(manifest.event_pairs),
+        "by_id_rows": by_id.count(),
+        "by_id_examples": [r.dlq_key for r in by_id.limit(odl.MAX_EXAMPLES).collect()],
+        "own_rows": 0, "own_keyless": 0, "own_examples": [],
+        "shared_rows": 0, "shared_keyless": 0}
+    if not (manifest.kafka_offsets and manifest.topic):
+        out.update(offsets_checkable=False,
+                   offsets_reason="the manifest has no kafka_offsets (v1)")
+        return out
+    ranges = {int(p): r for p, r in manifest.kafka_offsets.items()}
+    out["offsets_checkable"] = True
+    out["ranges"] = {str(p): {"min": r.min, "max": r.max, "count": r.count,
+                              "own": odl.own_range(r.min, r.max, r.count)}
+                     for p, r in sorted(ranges.items())}
+    in_send = reduce(lambda x, y: x | y, [
+        (F.col("kafka_partition") == F.lit(p)) & F.col("kafka_offset").between(r.min, r.max)
+        for p, r in ranges.items()])
+    at = (dlq.where((F.col("kafka_topic") == manifest.topic) & in_send)
+          .join(by_id, "dlq_key", "left_anti"))
+    for r in at.groupBy("kafka_partition", "key_kind").count().collect():
+        side = "own" if out["ranges"][str(r.kafka_partition)]["own"] else "shared"
+        out[f"{side}_rows"] += int(r["count"])
+        if r.key_kind == dlq_mod.KEY_KIND_OFFSET:
+            out[f"{side}_keyless"] += int(r["count"])
+    own_p = [p for p, r in ranges.items() if out["ranges"][str(p)]["own"]]
+    if out["own_rows"] and own_p:
+        out["own_examples"] = [r.dlq_key for r in at.where(F.col("kafka_partition").isin(own_p))
+                               .select("dlq_key").limit(odl.MAX_EXAMPLES).collect()]
+    return out
+
+
+def dlq_section(spark: SparkSession, manifest: Manifest, expected: DataFrame,
+                silver_path: str, late_path: str, control_path: str, dlq_path: str,
+                resolutions_path: str, query_id: str | None,
+                committed_batch: int | None) -> dict[str, Any]:
+    """R8 over every control row, R9 at batch C's cut, and this run's DLQ rows."""
+    from delta.tables import DeltaTable
+
+    out: dict[str, Any] = {"dlq_path": dlq_path, "resolutions_path": resolutions_path}
+    ctl = spark.read.format("delta").option(
+        "versionAsOf", latest_version(spark, control_path)).load(control_path)
+    if "rules_version" not in ctl.columns:
+        out.update(dlq_table_exists=DeltaTable.isDeltaTable(spark, dlq_path),
+                   phase3_batches=0, r8=odl.r8([]),
+                   r9={"checkable": False, "reason": "no Phase 3 control row"})
+        return out
+    rows = [r.asDict() for r in ctl.select(*R8_FIELDS).collect()]
+    p3 = [r for r in rows if r["rules_version"] is not None]
+    out["phase3_batches"] = len(p3)
+    out["r8"] = odl.r8(rows)
+    out["control_keyless_rows_phase3"] = sum(
+        int(r["keyless_rows"] or 0) for r in p3 if r["silver_query_id"] == query_id
+        and committed_batch is not None and r["batch_id"] <= committed_batch)
+    exists = DeltaTable.isDeltaTable(spark, dlq_path) and DeltaTable.isDeltaTable(
+        spark, resolutions_path)
+    out["dlq_table_exists"] = exists
+    if not exists:
+        out["r9"] = {"checkable": False, "reason": f"{dlq_path} or {resolutions_path} missing"}
+        return out
+    d_now = spark.read.format("delta").option(
+        "versionAsOf", latest_version(spark, dlq_path)).load(dlq_path)
+    out["dlq_total_rows"] = d_now.count()
+    out["r10"] = r10 = r10_counts(manifest, expected, d_now)
+    out["dlq_rows_for_run"] = r10["by_id_rows"] + r10["own_rows"] + r10["shared_rows"]
+    cut_row = next((r for r in p3 if r["silver_query_id"] == query_id
+                    and r["batch_id"] == committed_batch), None)
+    if cut_row is None:
+        out["r9"] = {"checkable": False, "reason": f"batch {committed_batch} of query "
+                     f"{query_id} has no Phase 3 control row (no recorded cut)"}
+        return out
+    out["cut_batch"] = committed_batch
+    cut = {k: cut_row[f"{k}_version"] for k in ("silver", "late", "dlq", "resolutions")}
+    out["cut"] = cut
+    if None in cut.values():
+        out["r9"] = {"checkable": False, "reason": f"incomplete cut {cut}"}
+        return out
+
+    def ids(path: str, v: int) -> DataFrame:
+        return spark.read.format("delta").option("versionAsOf", v).load(path)
+
+    s = ids(silver_path, cut["silver"]).select("event_id")
+    lt = ids(late_path, cut["late"]).select("event_id")
+    d = ids(dlq_path, cut["dlq"])
+    res = ids(resolutions_path, cut["resolutions"]).select("dlq_key")
+    keyed = d.where(F.col("key_kind") == "event_id")
+    d_open = keyed.join(res, "dlq_key", "left_anti").select("event_id")
+    resolved = keyed.join(res, "dlq_key", "left_semi").select("event_id")
+    st = d.agg(F.count("*").alias("n"), F.count_distinct("dlq_key").alias("keys")).first()
+    kst = keyed.agg(F.count("*").alias("n"),
+                    F.count_distinct("event_id").alias("ids")).first()
+
+    def both(a: DataFrame, b: DataFrame) -> int:
+        return a.distinct().join(b.distinct(), "event_id").count()
+
+    out["r9"] = {
+        "checkable": True, "cut": cut,
+        "s_and_d_open": both(s, d_open), "l_and_d_open": both(lt, d_open),
+        "s_and_l": both(s, lt),
+        "duplicate_dlq_keys": int(st["n"]) - int(st["keys"]),
+        "duplicate_keyed_dlq_ids": int(kst["n"]) - int(kst["ids"]),
+        "resolved_not_accepted": resolved.distinct().join(
+            s.union(lt), "event_id", "left_anti").count(),
+        "d_open_keyed_rows": d_open.count(), "dlq_rows": int(st["n"]),
+    }
+    # Reported, not judged (yet): versions written after the cut. A writer outside the
+    # stream (or a tamper) shows here; R1-R3 read the latest versions and still see it.
+    latest = {"silver": latest_version(spark, silver_path),
+              "late": latest_version(spark, late_path),
+              "dlq": latest_version(spark, dlq_path),
+              "resolutions": latest_version(spark, resolutions_path)}
+    out["versions_after_cut"] = {k: latest[k] - cut[k] for k in cut}
+    return out
+
+
 # --- oracle R4-R6 (slice 5) --------------------------------------------------------
 
 
 def _job_key() -> Column:
-    """The silver job's key check (streaming/silver.py key_ok), written again here."""
+    """The silver job's key check (streaming/silver.py key_ok, amended by C3: a blank
+    event_id is no key), written again here."""
     return (F.coalesce(F.col("parse_ok"), F.lit(False)) & F.col("event_id").isNotNull()
-            & F.col("event_time").isNotNull())
+            & (F.trim(F.col("event_id")) != F.lit("")) & F.col("event_time").isNotNull())
 
 
 def _clamped_us(keyed: Column) -> Column:
@@ -546,10 +720,18 @@ def evaluate_silver(rep: dict[str, Any]) -> tuple[bool, list[str]]:
         v = orc.verdicts(rep["oracle"])
         failed = failed or "FAIL" in v.values()
         notes += orc.failure_notes(rep["oracle"], v)
+    if "dlq" in rep:
+        d_failed, d_notes = evaluate_dlq(rep["dlq"])
+        failed = failed or d_failed
+        notes += d_notes
     cons = rep["consistency"]
     if not cons["checkable"]:
         notes.append(f"consistency not checkable: {cons['reason']}")
         return failed, notes
+    if cons["dlq_keyless_rows_upto_batch"] != cons["control_keyless_rows_phase3"]:
+        failed = True
+        notes.append(f"DLQ keyless rows {cons['dlq_keyless_rows_upto_batch']} != sum "
+                     f"keyless_rows {cons['control_keyless_rows_phase3']} of Phase 3 batches")
     if cons["control_excluded_total"] != cons["bronze_keyless_rows"]:
         failed = True
         notes.append(f"R7: control excluded_total {cons['control_excluded_total']} != bronze "
@@ -565,13 +747,43 @@ def evaluate_silver(rep: dict[str, Any]) -> tuple[bool, list[str]]:
                      f"{cons['max_copy_spread_days']} days apart > horizon "
                      f"{cons['horizon_days']} (both copies are kept by design)")
     elif (cons["silver_rows_upto_batch"] + cons["late_rows_upto_batch"]
-          != cons["bronze_keyed_distinct_ids"]):
+          + cons["dlq_open_keyed_rows_upto_batch"] != cons["bronze_keyed_distinct_ids"]):
         failed = True
         notes.append(f"silver rows {cons['silver_rows_upto_batch']} + late rows "
-                     f"{cons['late_rows_upto_batch']} != distinct keyed bronze ids "
+                     f"{cons['late_rows_upto_batch']} + D_open keyed rows "
+                     f"{cons['dlq_open_keyed_rows_upto_batch']} != distinct keyed bronze ids "
                      f"{cons['bronze_keyed_distinct_ids']} (bronze versions < "
                      f"{cons['bronze_versions_consumed_below']})")
     return failed, notes
+
+
+def evaluate_dlq(dl: dict[str, Any]) -> tuple[bool, list[str]]:
+    """(failed, notes) for the Phase 3 DLQ part; also stores dl["verdicts"]."""
+    notes: list[str] = []
+    r8 = dl["r8"]
+    if r8["batches_checked"] == 0:
+        v8 = "not checkable: no Phase 3 control row"
+    else:
+        v8 = "FAIL" if r8["violations"] > 0 else "PASS"
+    if v8 == "FAIL":
+        notes.append(f"R8: {r8['violations']} Phase 3 control rows whose equations do not "
+                     f"add up: {r8['examples']}")
+    if dl.get("phase3_batches", 0) > 0:
+        v9, n9 = odl.r9_verdict(dl["r9"])
+        notes += n9
+        if not dl.get("dlq_table_exists"):
+            v9 = "FAIL"
+            notes.append(f"R9: {dl['r9'].get('reason')} after Phase 3 batches ran")
+    else:
+        v9 = "not checkable: no Phase 3 control row"
+    if "r10" in dl:
+        v10, n10 = odl.r10_verdicts(dl["r10"])
+        notes += n10
+    else:
+        reason = "not checkable: no DLQ table to look in"
+        v10 = {"R10a": reason, "R10b": reason}
+    dl["verdicts"] = {"R8": v8, "R9": v9, **v10}
+    return "FAIL" in (v8, v9, *v10.values()), notes
 
 
 def _versions(text: str) -> list[int]:
@@ -594,6 +806,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--control-path", default=DEFAULT_CONTROL)
     p.add_argument("--late-path", default=DEFAULT_LATE)
     p.add_argument("--silver-checkpoint", default=DEFAULT_SILVER_CHECKPOINT)
+    p.add_argument("--dlq-path", default=DEFAULT_DLQ)
+    p.add_argument("--resolutions-path", default=DEFAULT_RESOLUTIONS)
     p.add_argument("--dedupe-horizon-days", type=int,
                    default=int(os.environ.get("DEDUPE_HORIZON_DAYS", "7")))
     p.add_argument("--fail-on-duplicates", action="store_true")
@@ -619,7 +833,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.layer in ("silver", "all"):  # silver first: bronze is read after it
             silver = verify_silver(spark, args.manifest, args.silver_path, args.late_path,
                                    args.control_path, args.silver_checkpoint, args.table_path,
-                                   args.dedupe_horizon_days)
+                                   args.dedupe_horizon_days, args.dlq_path,
+                                   args.resolutions_path)
         if args.layer in ("bronze", "all"):
             report = verify(spark, args.manifest, args.table_path, args.versions)
     finally:

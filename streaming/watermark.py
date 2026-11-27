@@ -123,21 +123,24 @@ def us_to_datetime(us: int | None) -> datetime | None:
     return None if us is None else EPOCH + timedelta(microseconds=int(us))
 
 
-def check_split(keyed_unique: int, deduped: int, late: int, ontime: int) -> None:
-    """Every keyed id is in exactly one class (D4). Called before any write.
+def check_split(keyed_unique: int, deduped: int, late: int, ontime: int,
+                rejected: int = 0) -> None:
+    """Every keyed id is in exactly one class (D4; Phase 3 adds `rejected`, plan 2.4).
+    Called before any write.
 
     Raises:
         SplitError: a count is negative, the deduped rows are not one per keyed id,
-            or late + on-time != keyed_unique.
+            or rejected + late + on-time != keyed_unique.
     """
-    if min(keyed_unique, deduped, late, ontime) < 0:
+    if min(keyed_unique, deduped, late, ontime, rejected) < 0:
         raise SplitError(f"negative count: keyed_unique={keyed_unique} deduped={deduped} "
-                         f"late={late} ontime={ontime}")
+                         f"late={late} ontime={ontime} rejected={rejected}")
     if deduped != keyed_unique:
         raise SplitError(f"in-batch dedupe kept {deduped} rows for {keyed_unique} keyed ids")
-    if late + ontime != keyed_unique:
-        raise SplitError(f"late {late} + on-time {ontime} != keyed unique ids {keyed_unique}: "
-                         "some rows would be in neither table (or both); nothing written")
+    if rejected + late + ontime != keyed_unique:
+        raise SplitError(f"rejected {rejected} + late {late} + on-time {ontime} != keyed unique "
+                         f"ids {keyed_unique}: some rows would be in no table (or two); "
+                         "nothing written")
 
 
 def recorded_delay_problem(recorded: int | None, configured: int, query_id: str) -> str | None:

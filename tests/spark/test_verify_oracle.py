@@ -36,6 +36,7 @@ from pyspark.sql import DataFrame, SparkSession  # noqa: E402
 from pyspark.sql import functions as F  # noqa: E402
 
 from simulator.events import EventType, GameEvent  # noqa: E402
+from streaming import dlq  # noqa: E402
 from streaming.bronze import bronze_schema, ensure_bronze_table, to_raw_rows  # noqa: E402
 from streaming.config import SilverJobConfig  # noqa: E402
 from streaming.silver import ensure_silver_tables, process_batch  # noqa: E402
@@ -163,7 +164,7 @@ def check(spark: SparkSession, tmp_path: Path, cfg: SilverJobConfig,
     rep = verify_silver(spark, path, cfg.table_path, cfg.late_path, cfg.control_path,
                         cfg.checkpoint_path, cfg.bronze_path, 7)
     failed, notes = evaluate_silver(rep)
-    rules = {m.group(1) for n in notes if (m := re.match(r"(?:\d+ )?(R\d[a-d]?):", n))}
+    rules = {m.group(1) for n in notes if (m := re.match(r"(?:\d+ )?(R\d+[a-d]?):", n))}
     assert failed == bool(rules), notes
     return rules, rep, notes
 
@@ -200,6 +201,14 @@ def test_baseline_passes_every_rule_with_both_gates_checkable(spark, tmp_path, l
     assert (t["slight_margin_ms"], t["slight_with_wm_null"]) == (10_000, 0)
     assert [(b["batch_id"], b["run_silver"], b["run_late"], b["late_inserted_this_attempt"])
             for b in t["run_batches"]] == [(0, 2, 0, 0), (1, 2, 1, 1), (2, 2, 0, 0)]
+    # R10 (good data never dead-lettered): the DLQ is empty and offsets 0-6 are the
+    # run's own range (7 messages); the broken message at offset 8 is outside it.
+    dl = rep["dlq"]
+    assert {k: dl["verdicts"][k] for k in ("R10a", "R10b")} == {"R10a": "PASS",
+                                                                 "R10b": "PASS"}
+    assert dl["r10"]["ranges"] == {"0": {"min": 0, "max": 6, "count": 7, "own": True}}
+    assert (dl["dlq_rows_for_run"], dl["r10"]["own_rows"], dl["r10"]["shared_rows"]) \
+        == (0, 0, 0)
 
 
 # --- R1-R3 still fail on their own (with the new rules quiet) --------------------------
@@ -350,3 +359,56 @@ def test_isolation_uses_the_jobs_clamp(spark, tmp_path, lake, row, isolated: boo
         assert gate_reason(rep) == "PASS"
     else:
         assert gate_reason(rep).startswith("not checkable: isolation: not isolated")
+
+
+# --- R10: good data is never dead-lettered ----------------------------------------------
+
+def _dead_letter(spark: SparkSession, cfg: SilverJobConfig, event_id: str | None,
+                 offset: int) -> None:
+    """Append one DLQ row as the job would write it for the message at `offset`.
+
+    Stamped batch 3 (after the last committed batch 2): R9 and the consistency balance
+    read up to that cut, so the tamper reaches R10 only (one fault -> one rule)."""
+    keyed = event_id is not None
+    row = dict.fromkeys(dlq.DLQ_COLUMNS)
+    row.update(dlq_key=f"id:{event_id}" if keyed else f"off:game-events/0/{offset}",
+               key_kind=dlq.KEY_KIND_ID if keyed else dlq.KEY_KIND_OFFSET,
+               reason_code="H1" if not keyed else "H6", reasons=["test tamper"],
+               rules_version=1, event_id=event_id, kafka_topic="game-events",
+               kafka_partition=0, kafka_offset=offset, silver_query_id="q-1",
+               silver_batch_id=3)
+    spark.createDataFrame([row], dlq.DLQ_SCHEMA).write.format("delta").mode("append") \
+        .save(cfg.dlq_path)
+
+
+def test_r10a_a_good_event_pushed_to_the_dlq(spark, tmp_path, lake) -> None:
+    _dead_letter(spark, lake, "b0", 2)       # b0 is one of the run's good events
+    rules, rep, notes = check(spark, tmp_path, lake)
+    assert rules == {"R10a"}, notes          # caught by id, so not counted again by R10b
+    r10 = rep["dlq"]["r10"]
+    assert (r10["by_id_rows"], r10["by_id_examples"], r10["own_rows"]) == (1, ["id:b0"], 0)
+    assert rep["dlq"]["verdicts"]["R10b"] == "PASS"
+
+
+def test_r10b_a_keyless_row_at_the_runs_own_offset(spark, tmp_path, lake) -> None:
+    _dead_letter(spark, lake, None, 3)       # offset 3 is the run's s1 message
+    rules, rep, notes = check(spark, tmp_path, lake)
+    assert rules == {"R10b"}, notes
+    r10 = rep["dlq"]["r10"]
+    assert (r10["own_rows"], r10["own_keyless"], r10["own_examples"]) \
+        == (1, 1, ["off:game-events/0/3"])
+    assert rep["dlq"]["dlq_rows_for_run"] == 1
+
+
+def test_r10_the_broken_test_message_outside_the_range_is_not_the_runs(
+        spark, tmp_path, lake) -> None:
+    # The lake's deliberately unparsable bronze row (offset 8) dead-lettered as the
+    # job would: outside the run's offsets 0-6, so it is not counted as good data.
+    _dead_letter(spark, lake, None, 8)
+    rules, rep, notes = check(spark, tmp_path, lake)
+    assert rules == set(), notes
+    r10 = rep["dlq"]["r10"]
+    assert (rep["dlq"]["dlq_total_rows"], rep["dlq"]["dlq_rows_for_run"], r10["own_rows"],
+            r10["shared_rows"]) == (1, 0, 0, 0)
+    assert {k: rep["dlq"]["verdicts"][k] for k in ("R10a", "R10b")} == {
+        "R10a": "PASS", "R10b": "PASS"}

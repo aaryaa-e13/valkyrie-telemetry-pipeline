@@ -44,7 +44,7 @@ POINT_VAR = "VALKYRIE_FAULT_POINT"
 TAG_VAR = "VALKYRIE_FAULT_TAG"
 DIR_VAR = "VALKYRIE_FAULT_DIR"
 DEFAULT_DIR = "/data/faults"
-POINTS = ("after_read", "after_late", "after_silver", "after_control")
+POINTS = ("after_read", "after_dlq", "after_late", "after_silver", "after_control")
 HOLD_S = 120.0
 
 

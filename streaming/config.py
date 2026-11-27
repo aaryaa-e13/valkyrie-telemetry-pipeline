@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 _TRUE = {"1", "true", "yes"}
 
@@ -95,6 +96,16 @@ class SilverJobConfig:
     # limit is set; it is written down here so the cap is explicit (slice 4, C3)
     # and tests can use a small one. It also caps the initial snapshot.
     max_files_per_trigger: int = 1000
+    # Phase 3 (D3.x). Empty = a sibling folder of the late / control table, so a config
+    # that only sets the Phase 2 paths (tests, tools) can never touch the live lake:
+    #   dead letter  <parent of late_path>/dead_letter
+    #   resolutions  <parent of control_path>/dlq_resolutions
+    #   replays      <parent of control_path>/replays   (written by replay, slice 3)
+    dlq_path: str = ""
+    resolutions_path: str = ""
+    replays_path: str = ""
+    # Quality rules version (streaming/gates.py). Fixed while a batch is in flight.
+    rules_version: int = 1
     # Start although the silver checkpoint and silver/control tables disagree
     # (streaming/silver.py, DECISIONS D2.3). A reset silver checkpoint alone
     # needs no override: rebuilding silver from bronze is idempotent.
@@ -107,11 +118,25 @@ class SilverJobConfig:
             raise ValueError("watermark_delay_s must be an integer >= 1")
         if self.max_files_per_trigger < 1:
             raise ValueError("max_files_per_trigger must be >= 1")
+        from streaming.gates import RULES_VERSIONS
+
+        if not self.dlq_path:
+            object.__setattr__(self, "dlq_path",
+                               str(Path(self.late_path).parent / "dead_letter"))
+        if not self.resolutions_path:
+            object.__setattr__(self, "resolutions_path",
+                               str(Path(self.control_path).parent / "dlq_resolutions"))
+        if not self.replays_path:
+            object.__setattr__(self, "replays_path",
+                               str(Path(self.control_path).parent / "replays"))
+        if isinstance(self.rules_version, bool) or self.rules_version not in RULES_VERSIONS:
+            raise ValueError(f"rules_version must be one of {list(RULES_VERSIONS)}, "
+                             f"got {self.rules_version!r}")
         paths = {self.bronze_path, self.table_path, self.control_path, self.checkpoint_path,
-                 self.late_path}
-        if "" in paths or len(paths) != 5:
-            raise ValueError("bronze, silver, late, control and checkpoint paths must be set "
-                             "and distinct")
+                 self.late_path, self.dlq_path, self.resolutions_path, self.replays_path}
+        if "" in paths or len(paths) != 8:
+            raise ValueError("bronze, silver, late, dead-letter, resolutions, replays, "
+                             "control and checkpoint paths must be set and distinct")
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> SilverJobConfig:
@@ -137,6 +162,10 @@ class SilverJobConfig:
             max_files_per_trigger=int(get("SILVER_MAX_FILES_PER_TRIGGER",
                                           str(d.max_files_per_trigger))),
             allow_rebuild=get("SILVER_ALLOW_REBUILD", "0").lower() in _TRUE,
+            dlq_path=get("SILVER_DLQ_PATH", ""),
+            resolutions_path=get("DLQ_RESOLUTIONS_PATH", ""),
+            replays_path=get("REPLAYS_PATH", ""),
+            rules_version=int(get("QUALITY_RULES_VERSION", str(d.rules_version))),
         )
 
 

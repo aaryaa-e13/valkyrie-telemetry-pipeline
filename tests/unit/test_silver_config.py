@@ -43,3 +43,33 @@ def test_env_names() -> None:
 def test_invalid_config_is_refused(env: dict[str, str]) -> None:
     with pytest.raises(ValueError):
         SilverJobConfig.from_env(env)
+
+
+def test_phase3_paths_default_to_siblings_of_late_and_control() -> None:
+    cfg = SilverJobConfig.from_env({})
+    assert cfg.dlq_path == "/data/lake/silver/dead_letter"
+    assert cfg.resolutions_path == "/data/lake/_control/dlq_resolutions"
+    assert cfg.replays_path == "/data/lake/_control/replays"
+    assert cfg.rules_version == 1
+    moved = SilverJobConfig(late_path="/t/x/late", control_path="/t/y/control")
+    assert (moved.dlq_path, moved.resolutions_path, moved.replays_path) == (
+        "/t/x/dead_letter", "/t/y/dlq_resolutions", "/t/y/replays")
+
+
+def test_phase3_env_names() -> None:
+    cfg = SilverJobConfig.from_env({"SILVER_DLQ_PATH": "/d", "DLQ_RESOLUTIONS_PATH": "/r",
+                                    "REPLAYS_PATH": "/p", "QUALITY_RULES_VERSION": "2"})
+    assert (cfg.dlq_path, cfg.resolutions_path, cfg.replays_path, cfg.rules_version) == (
+        "/d", "/r", "/p", 2)
+
+
+@pytest.mark.parametrize("env", [
+    {"QUALITY_RULES_VERSION": "3"},
+    {"QUALITY_RULES_VERSION": "0"},
+    {"SILVER_DLQ_PATH": "/data/lake/silver/late_events"},          # DLQ == late
+    {"DLQ_RESOLUTIONS_PATH": "/data/lake/_control/silver_batches"},  # == control
+    {"REPLAYS_PATH": "/data/lake/_control/dlq_resolutions"},       # == resolutions
+])
+def test_phase3_invalid_values_are_rejected(env: dict[str, str]) -> None:
+    with pytest.raises(ValueError):
+        SilverJobConfig.from_env(env)
