@@ -457,3 +457,73 @@ None of this touches the pipeline.
 - **Fix:** the probe output was read from its first `{` line. `make vacuum` (slice 6) will
   write its report to a file, not rely on stdout.
 - **Lesson:** stdout is not only yours when a library runs in the same process.
+
+### The DLQ write failed with INCOMPATIBLE_COLUMN_TYPE (Phase 3 slice 1)
+- **Symptom:** the first Spark test of the DLQ write failed: "UNION can only be performed
+  on tables with compatible column types. The 4th column ... STRING ... ARRAY<STRING>".
+- **Root cause:** the rejected keyed rows were anti-joined with silver and late on
+  `event_id` (`join(other, "event_id", "left_anti")`). A join with a USING column puts that
+  column first, so the rejected rows no longer had the DLQ column order. `union` matches
+  columns by position, not by name.
+- **Fix:** `unionByName` in the DLQ write. Verify's run-row count unions only `dlq_key`.
+  The test that caught it (`tests/spark/test_dlq.py`, one batch with every rule) stays.
+- **Lesson:** after a join, never `union` by position. Phase 2 code was safe only because
+  it never unioned joined frames.
+
+### The Spark test JVM ran out of heap after ~120 tests (Phase 3 slice 1) — KNOWN LIMIT
+- **Symptom:** the full `make test-spark` (one pytest process, 147 tests) failed every
+  test from test 124 on (`test_verify_oracle.py`) with `SparkOutOfMemoryError:
+  [UNABLE_TO_ACQUIRE_MEMORY] Unable to acquire 262144 bytes of memory, got 0`. 7 tests
+  failed in one run, 24 in the next (3 more tests). The same tests pass alone
+  (`exp-isolated`: 2 tests, 6 min 40 s). No assertion failed: it was memory only.
+- **Numbers** (test container: 3 GiB limit = 3,221,225,472 bytes, `-Xmx2g`, `local[1]`;
+  live heap measured after a forced GC by a local pytest plugin):
+  - Full suite: live heap 127 MB after test 10, 823 MB after 40, 1,121 MB after 70,
+    1,259 MB after 100. The container reached its 3 GiB limit in every full run.
+  - What stays alive (JVM class histogram, after test 18 of `test_dlq.py`): 163 `DeltaLog`
+    objects (one per table path any test opened), 163 `Snapshot`, 153 `ShuffleDependency`
+    (153 shuffles still registered, never cleaned), 287 `QueryExecution`. The heap is
+    mostly Catalyst plan objects (`TreeNode` lambdas, `BestEffortLazyVal`: 225 MB at test
+    135 of the full run). About 5 MB of live heap per table path.
+- **Standard fixes tried, one at a time** (`test_dlq.py`, 19 tests; live heap after test
+  1 -> 13 -> 18, MB; reference run 75 -> 553 -> 819). None stopped the growth:
+  - Spark UI keeping 50 executions instead of 1000: 67 -> 503 -> 790.
+  - Spark UI off in the test session: 70 -> 544 -> 821.
+  - `DeltaLog.clearCache()` after every test: 67 -> 447 -> 540 (after test 16). Delta's
+    cached state RDDs went to 0, but the heap kept growing (about 28 MB per test instead
+    of about 44).
+  - Stop active streaming queries and `catalog.clearCache()` after each test: 74 -> 547
+    -> 818. There were already 0 active queries and 0 cache-manager entries after every
+    test, so there was nothing to release.
+  - Python `gc.collect()` after each test (Py4J proxies held by cycles): 64 -> 535 -> 805.
+    Live Py4J proxies stayed between 50 and 260 the whole time, so Python does not pin
+    the plans.
+- **Root cause: NOT FOUND (time-boxed).** Something inside the JVM keeps each opened
+  table path's DeltaLog, snapshot and their query plans (with their shuffles and
+  broadcasts) alive, and it is not Delta's `deltaLogCache`, the Spark UI, the cache
+  manager, active streams or Python. A heap-dump walk to the GC root was started and
+  stopped at the time box. Phase 3 crossed the 2 GB heap because each test lake now has 3
+  more tables (DLQ, resolutions, replays) and the suite has about 40 more tests (belief,
+  not measured).
+- **Fix (a workaround, not a root-cause fix):** `make test-spark` runs one pytest process,
+  so one JVM, per test file. Nothing piles up across files. `SPARK_TESTS=path` still runs
+  one process. The test session's Spark config is unchanged, and so are the job's and
+  verify's.
+- **Known limit, Phase 4 item:** the live job opens about 7 fixed paths, so the same
+  retention would be bounded there. That is a belief: its growth line was flat in slice 1's
+  baseline (+0.004 GiB between runs), but long runs were never measured. **Phase 4: watch
+  the live job's container and heap growth line on the long chaos runs** (D3.3's rule), and
+  reopen this if it grows.
+- **Test containers, after the split (D3.5):**
+  - Test containers get 4 GiB, and `make test-spark` refuses while the job runs.
+  - A test JVM with `-Xmx2g` holds more than its heap. In the m4g run, `test_verify_oracle.py`
+    held heap 2,048 MB, non-heap about 370 MB and about 700 MB that no JVM counter covers,
+    with 550-630 threads.
+  - That uncounted part grows into the room the container gives it, so a fixed
+    limit-minus-margin anon line was dropped as a test gate. The gate is now: all pass,
+    exit 0, 0 OOM kills and 0 swap per file.
+- **Phase 4 item (not now):** find the uncounted native memory with JVM Native Memory
+  Tracking (`-XX:NativeMemoryTracking=summary` on a test JVM), and watch thread counts per
+  file and in the live job.
+- **Lesson:** one long-lived test JVM is shared state too. Measure live heap per test
+  (after a GC) before reading an out-of-memory error as a code bug.

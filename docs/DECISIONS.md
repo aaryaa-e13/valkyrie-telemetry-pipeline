@@ -1545,3 +1545,200 @@ every file).
   heap > 1.6 GiB, GC > 10 %, OOM) apply to every run, warm-up included. The "after"
   measurements of each slice use the same sequence (Spark stopped, then the same runs back
   to back), so like is compared with like.
+
+### D3.4 Slice 1: gates and the dead-letter queue in the stream (2026-11-26)
+Built as planned (plan sections 1-2, addenda A and B). The choices made while building:
+- **Key (C3):** `key_ok` also needs a non-blank `event_id` (after trim). A blank id is
+  keyless, so it goes to the DLQ by offset (H2). Verify's two key mirrors changed with it.
+  Live bronze had 0 blank ids before the change (read-only count, bronze version 140), so
+  no live row moves.
+- **Where the gates run:** `plan_batch` adds the gate columns before dedupe, so dedupe can
+  prefer a copy that passes every hard rule, then the lowest offset (D2.3 unchanged for
+  all-valid batches). `m_k` still counts every keyed row, rejected ones included (plan 1.5).
+- **Write order:** DLQ -> late -> silver -> cut -> control row -> `commits/N`. New fault
+  point `after_dlq` (same firing condition as the other four: late and on-time rows; slice 5
+  decides whether its live run also needs DLQ rows).
+- **The DLQ write:** keyless rows by `off:<topic>/<partition>/<offset>`, rejected keyed
+  rows by `id:<event_id>`. A rejected copy of an id already in silver (+-H) or late is
+  `rejected_dup_of_accepted` and not written. The rows are anti-joined with the DLQ first,
+  and the insert-if-absent MERGE must insert exactly that many (`DlqWriteError`
+  otherwise: a second writer or a bug). Nothing to reject: no read, no commit.
+- **D_open** (keyed DLQ rows without a resolution) is read once per batch, after the DLQ
+  write. It then also holds this batch's own rejected ids, which are never among its
+  accepted ids (one copy per id), so every attempt of a batch sees the same set.
+  An accepted copy whose id is in D_open is counted (`dup_of_dlq`, `late_dup_of_dlq`),
+  not inserted, and logged as WARNING `valid copy stranded in DLQ` (D3.1).
+- **Explicit column lists in the silver and late MERGEs** instead of `INSERT *`: an
+  upgraded table has `quality_flags` at the end, a new one has it elsewhere, and a named
+  list does not depend on column order.
+- **Defaults for the new paths are sibling folders** of the late and control tables
+  (`dead_letter`, `dlq_resolutions`, `replays`). A config that sets only the Phase 2 paths
+  (tests, tools) therefore can never touch the live lake.
+- **Control row:** the plan's `dlq_inserted` / `dlq_already_present` are split into keyless
+  and keyed terms, so both DLQ equations of plan 2.5 can be checked (R8). Plus the cut
+  (`silver_version`, `late_version`, `dlq_version`, `resolutions_version`, read from the
+  Delta logs after the writes, no Spark job) and `cut_ms`, with each read's ms in the
+  `silver batch` log line.
+- **Rules-version guard (not overridable):** while batch P is in flight, the version
+  recorded for P (its control row, else its DLQ rows) must match. Without such a record,
+  batch P - 1's version must match. The first attempt's version is then unknown, and
+  finishing P with P - 1's version is the one choice that cannot differ from it once a
+  writer has run. A Phase 2 batch (no version) may be followed by any version.
+- **A missing DLQ or resolutions table after a Phase 3 batch** is refused (overridable with
+  `SILVER_ALLOW_REBUILD`, like the late table, D2.4).
+- **The replays table** is created now with a fixed schema; slice 3 writes it.
+- **Verify:** R8 (the equations, per Phase 3 control row) and R9 (at batch C's recorded
+  cut: S, L and D_open disjoint, no `dlq_key` twice, no keyed id twice, resolved ids in S
+  or L). Every smoke FAILs if the run has a DLQ row (R10, D3.5).
+- **The balances of plan 2.8 stay in verify's consistency section,** not in R9. That
+  section already owned D2.3's balance; it now reads "silver + late + D_open keyed ==
+  distinct keyed bronze ids", plus "DLQ keyless rows == sum keyless_rows of Phase 3
+  batches". Repeating them under R9 would make one fault fail two rules, and the tamper
+  tests assert exact sets of failing rules.
+- **Writes after the cut** are reported per table (`versions_after_cut`), not judged. R9
+  reads at the cut, so it cannot see them; R1-R3 read the newest versions and still do.
+  Turning it into a FAIL (a cheap second-writer detector) is an open question for the user.
+
+### D3.5 R10 "good data is never dead-lettered"; one JVM per Spark test file (2026-11-27)
+- **R10 replaces the unnamed "DLQ rows of this run" check** (manifests v1-v3 are good
+  data). The old check failed with a note that named no rule, picked keyless rows by the
+  run's offset range even where other producers wrote inside it, and gave no verdict.
+  - **R10a:** a DLQ row (any key kind, resolved or not) whose `event_id` is one of the
+    manifest's ids FAILs. Not checkable when the manifest lists no ids.
+  - **R10b:** a DLQ row not caught by R10a at offsets only this run wrote FAILs. A
+    partition's `[min, max]` is the run's own range when `count == max - min + 1`. Rows in
+    ranges that other producers shared cannot be attributed: they are counted (`shared_rows`,
+    `shared_keyless`) and the verdict is "not checkable", never PASS. Without
+    `kafka_offsets` (manifest v1): not checkable.
+  - What changed in strength: a good event pushed to the DLQ still FAILs, by id or at the
+    run's own offsets (tamper tests in `test_dlq_verify.py` and `test_verify_oracle.py`). The one
+    case that no longer FAILs is a row in an offset range other producers shared: it was
+    a FAIL that could blame the run for another producer's message, and it is now
+    "not checkable" with its count shown. `dlq_rows_for_run` (by id + own + shared)
+    stays in the report; every smoke must show 0.
+  - Every DLQ failure note now starts with its rule name (R9 or R10), as the tamper tests
+    require.
+- **`make test-spark` runs one pytest process per test file** (`SPARK_TESTS=path` still
+  runs one process). It is a workaround for the test-JVM retention in WHAT_BROKE (holder
+  not found). Tradeoff: one JVM start per file instead of one in total, against a full
+  suite that no longer depends on how many tables earlier files opened. The test
+  session's Spark settings, the job and verify are unchanged.
+- **Memory stop line for TEST containers** (set 2026-11-27, before the measuring rerun;
+  **replaced after measurement** by the gate at the end of D3.5). STOP when anonymous memory (`memory.stat` `anon`) is > 2.5 GiB, or
+  on any test failure, OOM kill or non-zero exit. File cache (`file`) does not count.
+  - Why not the job's line: D2.5's line (container peak > 2.8 GiB) was set for the
+    streaming job. Applied to test containers it tripped on four files, but
+    `test_silver.py` peaked at 2.978 GiB with at most 444 MB of live heap and 1,417 MB
+    committed. Most of that peak can be file cache from the Delta tables the tests write
+    into the container's `/tmp`, and the kernel reclaims file cache before it OOM-kills.
+    Anonymous memory (heap, JVM native memory, Python) is what cannot be reclaimed.
+    2.5 GiB leaves 0.5 GiB of the 3 GiB limit for the cache and the kernel.
+  - Applied to `test_dlq.py` and `test_silver.py` (the files with the highest peaks):
+    if both stay under it, no file is split. If either goes over, that file is split by
+    theme, and a split file still over the line is a STOP.
+  - The streaming job's line (container peak > 2.8 GiB, D2.5) is unchanged. The "after"
+    runs also report the job's anon/file breakdown, as information for Phase 4, not as a
+    new line.
+  - **Measured, and the premise was wrong** (the same day). The file cache was small:
+    0.21-0.26 GiB at most, and 25-48 MB at the moment of the anon peak. The peaks were
+    anonymous memory: 2.950 GiB (`test_dlq.py`) and 2.927 GiB (`test_silver.py`), almost
+    all of it the `java` process; Python held about 50 MB. Both files were split as
+    planned (`test_dlq.py` / `test_dlq_recovery.py` / `test_dlq_verify.py`,
+    `test_silver.py` / `test_silver_stream.py`, shared builders in `dlq_helpers.py` and
+    `silver_helpers.py`). Every split file still had 2.2-2.9 GiB of anon, the 2-test file
+    included. **So 2.5 GiB of anon is too tight for a JVM allowed `-Xmx2g`:** the heap may
+    grow to 2 GiB and JVM native memory comes on top, however few tests a file has. The
+    line was set before the facts were known, and it was the line that was wrong, not the
+    tests.
+- **Why the JVM is bigger than its heap** (measured on `test_dlq_recovery.py` at `-Xmx2g`,
+  JVM memory MXBeans sampled every 3 s next to the container's anon memory). At the anon
+  peak (3,003 MB) the java process held 2,899 MB:
+  - 2,048 MB of committed heap: during a test the heap grows to the full `-Xmx`, and the
+    forced GC at teardown shrinks it again, so per-test numbers under-read it;
+  - 366 MB of non-heap (metaspace, code cache) and 0 MB of direct buffers;
+  - 485 MB that no JVM counter covers (median 550 MB over the run; up to 576 threads).
+- **A smaller test heap was tried and not kept.** With `-Xmx1536m` for tests only, all 147
+  tests passed with 0 OOM kills, but three files stayed over 2.5 GiB of anon:
+  `test_dlq_recovery.py` 2.525 GiB, `test_verify_oracle.py` 2.649 GiB, and
+  `test_late_routing.py` 2.975 GiB. That last peak is two JVMs: one test starts the real
+  pipeline, a 512m JVM, as a subprocess. All three filled the whole 1,536 MB heap. A heap
+  small enough to pass the line (about 1.25 GB) would be below what they use, so it was
+  reverted.
+- **Decision (2026-11-27): test containers get `mem_limit` 4 GiB, and the test JVM keeps
+  `-Xmx2g`, the same as the job.** This changes the earlier "no limit changes", for the
+  test harness only. It failed the 3.5 GiB anon rule below and was reverted at first. It
+  was then restored, after measurement, together with the new gate (end of D3.5), as the
+  exact Makefile version measured in the m4g run. No new full-suite run was made for it:
+  m4g is the evidence for this configuration.
+  - The job (`spark`, 3 GiB, `SPARK_DRIVER_MEMORY` 2g) and verify (`spark-tools`, 1.5 GiB)
+    are unchanged.
+  - How: `make test-spark` sets `SPARK_MEM_LIMIT=4g` (`SPARK_TEST_MEM_LIMIT`) on its own
+    `docker compose run` only.
+  - Why: tests run with the same heap as the job, so they cover what the job does, and
+    the anon measured (heap + about 0.85-1.1 GB native) fits under 4 GiB with room. A test
+    heap below the job's would make test failures say little about the job.
+  - Cost: the laptop budget. Kafka 1 + job 3 + tests 4 = 8 GiB is over the 6.5 GiB line,
+    so `make test-spark` refuses with exit 2 while the job container (`valkyrie-spark`)
+    runs.
+- **Test-container rule, set before the 4 GiB run (replaced the 2.5 GiB anon line; itself
+  replaced after measurement by the gate below): KEEP only if** all tests pass, there are 0 OOM kills, there is 0 swap use (`memory.swap.current`,
+  `memory.swap.peak` and `memory.swap.events` sampled), and every file's anon peak is at
+  most 3.5 GiB. Otherwise revert and STOP.
+  - Swap in the earlier 3 GiB runs: **unknown per run**. Docker lets a container swap as
+    much as its memory limit by default, WSL has 4 GiB of swap, and those samplers did not
+    record swap. The WSL VM did swap since its boot at 09:05, which was before all of
+    those runs: `/proc/vmstat` shows `pswpout` 436,925 pages, about 1.67 GiB written out.
+    That counter is VM-wide, so it cannot say which run swapped. It is possible that
+    "0 OOM kills" at 3 GiB relied on swap.
+- **Result of the 4 GiB run (m4g): failed the 3.5 GiB anon rule; reverted, then restored
+  under the new gate below.**
+  - Passed: all 147 tests passed, every file exited 0 and there were 0 OOM kills.
+  - Swap: 0 in every container (`swap.current`, `swap.peak` and all swap events stayed 0).
+    The VM-wide `pswpout` did not move during the run (436,925 before and after).
+  - Every container had the 4 GiB limit (4,294,967,296 bytes). The suite took 4,494 s
+    (74 min 54 s).
+  - **The anon line failed in one file.** `test_late_routing.py` reached **3.681 GiB**,
+    with 14 samples over 3.5 GiB.
+    - All 14 fall in the two minutes (18:28:57-18:30:54 UTC) when
+      `test_upgrade_from_slice3_then_each_new_guard_refuses_with_exit_2` runs the real
+      pipeline as a second JVM.
+    - At the peak, the test JVM's RSS was 3.04 GB (heap committed 2,048 MB, non-heap
+      390 MB, about 600 MB uncounted) and the child JVM's was 0.67 GB.
+    - With one JVM, this file's highest anon was 3.143 GiB.
+  - Highest anon in the other files:
+    - `test_verify_oracle.py` 3.144 GiB (java RSS 3.13 GB: heap 2,048, non-heap 371,
+      about 700 MB uncounted, 554 threads);
+    - `test_dlq_recovery.py` 2.888 GiB;
+    - all others 0.57-2.49 GiB.
+    - File cache was at most 0.26 GiB in every file.
+  - **Observed, cause UNVERIFIED:** with 1 GiB more room, the same test JVM grew bigger.
+    Under the 3 GiB limit, `test_verify_oracle.py` never went above 3.000 GiB of container
+    usage (part 4, `docker stats`; anon itself was not sampled then). Here it reached
+    3.144 GiB of anon, and the test JVM alone in `test_late_routing.py` reached
+    3.143 GiB. So the native part outside the heap seems to grow into the room it is
+    given. A higher container limit therefore does not set a fixed peak.
+- **We stop iterating on test-container memory lines (2026-11-27).** The 2.5 GiB and
+  3.5 GiB anon lines were limit-minus-margin guesses. The m4g run shows that JVM non-heap
+  grows into the room it is given, so a fixed margin is not a sound test gate.
+- **Test-container gate (replaces both anon lines, set after measurement for the reason
+  above):** all tests pass, every file exits 0, 0 OOM kills and 0 swap, all per file.
+  - Every slice report gives the anon peak per file, compared with the m4g baseline
+    (table below).
+  - A file whose anon peak is within 0.2 GiB of the container limit (at or above 3.8 GiB
+    with 4 GiB) is **flagged** for the next slice's plan. That is not a STOP.
+  - The job's lines (D2.5 container peak, D3.3 growth line) are unchanged.
+  - m4g baseline, anon peak per file (GiB; 4 GiB limit, `-Xmx2g`, 0 swap, 0 OOM kills):
+
+    | File | anon peak | File | anon peak |
+    |---|---|---|---|
+    | test_bronze_table.py | 1.741 | test_phase3_pins.py | 1.591 |
+    | test_delta_compat.py | 1.134 | test_raw_parse.py | 0.571 |
+    | test_dlq.py | 2.093 | test_silver.py | 2.082 |
+    | test_dlq_recovery.py | 2.888 | test_silver_stream.py | 2.490 |
+    | test_dlq_verify.py | 2.461 | test_verify_manifest.py | 2.163 |
+    | test_jars_lock_image.py | (too short) | test_verify_oracle.py | 3.144 |
+    | test_late_routing.py | 3.681 (two JVMs) | | |
+
+  - No file is flagged at this baseline. The highest, `test_late_routing.py`, is
+    0.32 GiB under the 4 GiB limit.
+  - The uncounted native memory and the thread counts are a Phase 4 item (WHAT_BROKE).

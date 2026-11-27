@@ -123,9 +123,36 @@ verify: dirs spark-image ## Compare bronze+silver with a manifest (MANIFEST=... 
 		python -m streaming.verify_manifest --manifest /app/$(MANIFEST) --layer $(or $(LAYER),all) \
 		$(VERIFY_ARGS)
 
-test-spark: dirs ## Run all Spark tests in the Spark image (SPARK_TESTS=path to narrow)
+# One pytest process (one JVM) per Spark test file: a single JVM keeps every Delta table
+# path it opened (DeltaLog + plans, ~5 MB each) and ran out of its 2 GB heap after ~120
+# tests (WHAT_BROKE, Phase 3 slice 1). SPARK_TESTS=path narrows to ONE process.
+# Test containers get 4 GiB (the job keeps 3 GiB): a test JVM with -Xmx2g, like the job's,
+# reached 2.2-2.9 GiB of anonymous memory (heap 2 GiB + ~0.85-1.1 GB native), D3.5. Only
+# with the job stopped: Kafka 1 + job 3 + tests 4 = 8 GiB is over the laptop's 6.5 GiB line.
+SPARK_TEST_MEM_LIMIT ?= 4g
+SPARK_PYTEST = SPARK_MEM_LIMIT=$(SPARK_TEST_MEM_LIMIT) \
 	$(COMPOSE) --profile spark run --rm --no-deps -T -v ./:/app:ro spark \
-		python -m pytest $(or $(SPARK_TESTS),tests/spark) -q -p no:cacheprovider $(SPARK_TEST_ARGS)
+	python -m pytest -q -p no:cacheprovider
+SPARK_TEST_FILES = $(sort $(wildcard tests/spark/test_*.py))
+
+test-spark: dirs ## Run all Spark tests, one JVM per test file (refuses while the job runs)
+	@if [ "$$(docker inspect -f '{{.State.Running}}' valkyrie-spark 2>/dev/null)" = "true" ]; then \
+		echo "make test-spark: the streaming job (container valkyrie-spark) is running." >&2; \
+		echo "Test containers use $(SPARK_TEST_MEM_LIMIT); with the job's 3 GiB and Kafka's 1 GiB" >&2; \
+		echo "that is over the laptop's 6.5 GiB budget. Stop it first: make spark-stop" >&2; \
+		exit 2; \
+	fi
+	@if [ -n "$(SPARK_TESTS)" ]; then \
+		$(SPARK_PYTEST) $(SPARK_TESTS) $(SPARK_TEST_ARGS); \
+	else \
+		failed=""; start=$$(date +%s); \
+		for f in $(SPARK_TEST_FILES); do \
+			echo "== $$f (started $$(date -u +%H:%M:%S) UTC)"; \
+			$(SPARK_PYTEST) $$f $(SPARK_TEST_ARGS) || failed="$$failed $$f"; \
+		done; \
+		echo "== all Spark test files: $$(( $$(date +%s) - start )) s"; \
+		if [ -n "$$failed" ]; then echo "FAILED files:$$failed"; exit 1; fi; \
+	fi
 
 test-spark-fast: dirs ## Quick Spark subset for the dev loop (marker spark_fast, < 5 min)
 	$(COMPOSE) --profile spark run --rm --no-deps -T -v ./:/app:ro spark \

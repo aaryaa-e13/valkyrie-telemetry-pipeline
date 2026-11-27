@@ -54,7 +54,7 @@ make up       # start Kafka and create the topic
 | `make sim-late` | The same with 30% of events sent deliberately late | up to 2 min |
 | `make timing-check MANIFEST=manifests/run_X.json` | Reads a run back from Kafka and compares each message's Kafka timestamp with its `event_time` | a few seconds |
 | `make verify MANIFEST=manifests/run_X.json` | Compares raw Parquet with one run's manifest | about 20 s |
-| `make test-unit`, `make test-spark`, `make lint` | Unit tests, Spark tests and linter | seconds |
+| `make test-unit`, `make test-spark`, `make lint` | Unit tests, Spark tests (about 75 min, one JVM per test file) and linter | seconds; about 75 min for Spark |
 
 `make help` lists every target. `make demo`, `make smoke` and `make smoke-restart` start the
 Spark job themselves and use a fresh seed each time. Phase 2 times are in the next section.
@@ -152,13 +152,14 @@ One Spark process runs two streaming queries, each with a 10 s trigger.
 | `make timing-check MANIFEST=...` | Reads a run back from Kafka: was any event sent before its `event_time`? | nothing | seconds |
 | `make faults-config-check` | Counts mentions of the fault hooks in the default Compose config (must print 0) | nothing | seconds |
 | `make delta-compat` | Delta compatibility gate, checks C1-C14 | nothing | about 4 min |
-| `make test-unit`, `make test-spark`, `make lint` | 519 unit tests; 111 Spark tests in the Spark image; ruff | nothing | seconds; 28-47 min; seconds |
+| `make test-unit`, `make test-spark`, `make lint` | 642 unit tests; 147 Spark tests in the Spark image, one JVM per test file in a 4 GiB container (refuses while the Spark job runs: `make spark-stop` first); ruff | nothing | seconds; about 75 min; seconds |
 
 Every e2e target ends with a `SUMMARY {json}` line and exits 0 on PASS (exit codes: D1.16,
 D2.5, D2.6). Times are from single runs on the WSL2 laptop, not benchmarks. They vary between
-runs: for `make smoke`, `make smoke-restart` and `make test-spark` the upper end is from the
+runs: for `make smoke` and `make smoke-restart` the upper end is from the
 final Phase 2 gate, run after `make down && make up` (so smoke also waited for Spark to start);
 about 4 of its 5.7 smoke minutes were the final verify (`docs/evidence/phase2/gate/`).
+The `make test-spark` time is from one Phase 3 slice 1 run (4,494 s, D3.5).
 
 ### What is tested, and how
 
