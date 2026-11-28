@@ -527,3 +527,31 @@ None of this touches the pipeline.
   file and in the live job.
 - **Lesson:** one long-lived test JVM is shared state too. Measure live heap per test
   (after a GC) before reading an out-of-memory error as a code bug.
+
+### Silver addBatch over the slice 1 keep line after the heap change (Phase 3 slice 1) — KNOWN LIMIT
+- **What happened:**
+  - The job's heap went from 2g to 1536m (DECISIONS D3.6), and the after sequence ran
+    once.
+  - Memory and correctness passed: smoke-late peak 2.458 GiB, 0 OOM kills, 0 swap, all R
+    checks PASS.
+  - The median silver addBatch over smokes 4-7 was **16,755.5 ms**, over the 14,832 ms
+    keep line. smoke-late's median was 20,172 ms (15 batches, all over 10 s), against
+    10,623 ms in the 2g after runs and 7,884 ms in the Phase 2 baseline.
+- **What is known (VERIFIED, `docs/plans/s1/h1536*.`, `after*.`, `leak.jsonl`):**
+  - GC took only 0.27-0.58 % of the time, so the smaller heap did not turn into GC time.
+  - Every timed part of the silver batch was slower than in the 2g after runs, including
+    the plain control-table read. Medians over 4 smokes, 2g → 1536m:
+    - `wm_read_ms` 1,459 → 2,176;
+    - `d_open_read_ms` 708 → 1,162;
+    - `merge_ms` 2,645 → 3,103;
+    - `cut_ms` 2 → 4.5.
+  - The wm read rose to 3,903 ms in smoke 7, over D2.4's 3 s line.
+  - Two smokes still at 2g, a few hours earlier (part 4d), already took 19,374 and
+    15,817 ms.
+- **Root cause: NOT FOUND.** The evidence above points away from the heap size, toward
+  either the lake growing (more files and versions to read per batch) or laptop load. Both
+  are beliefs, not measured.
+- **Fix: none.** The rule fixed before the run (D3.6) said no more tuning after a FAIL.
+- **Next:** decided by the project owner. It belongs with D2.4's addBatch revisit and the
+  slice 6 OPTIMIZE item.
+

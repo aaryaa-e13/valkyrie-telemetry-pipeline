@@ -116,7 +116,9 @@ services:
   # ---------------------------------------------------------------------------
   # Spark Structured Streaming: Kafka -> bronze Delta table (profile: spark).
   # Local mode inside one container: driver + executors share one JVM.
-  # Memory: 2g JVM heap + ~1g headroom (off-heap, metaspace, Python) = 3g limit.
+  # Memory: 1536m JVM heap + ~1.2g headroom (metaspace, JVM native, Python) = 3g limit.
+  # With 2g, G1 could grow the heap until the container hit its 3g limit (DECISIONS D3.6).
+  # Test containers set their own 2g (Makefile SPARK_TEST_DRIVER_MEMORY).
   # ---------------------------------------------------------------------------
   spark:
     profiles: ["spark"]
@@ -130,7 +132,7 @@ services:
         condition: service_healthy
     environment:
       SPARK_MASTER: ${SPARK_MASTER:-local[4]}
-      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-2g}
+      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-1536m}
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       TOPIC_NAME: ${TOPIC_NAME:-game-events}
       TRIGGER_INTERVAL: ${TRIGGER_INTERVAL:-10 seconds}

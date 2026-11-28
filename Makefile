@@ -130,7 +130,9 @@ verify: dirs spark-image ## Compare bronze+silver with a manifest (MANIFEST=... 
 # reached 2.2-2.9 GiB of anonymous memory (heap 2 GiB + ~0.85-1.1 GB native), D3.5. Only
 # with the job stopped: Kafka 1 + job 3 + tests 4 = 8 GiB is over the laptop's 6.5 GiB line.
 SPARK_TEST_MEM_LIMIT ?= 4g
-SPARK_PYTEST = SPARK_MEM_LIMIT=$(SPARK_TEST_MEM_LIMIT) \
+# Test JVMs keep -Xmx2g; the job's default is 1536m since D3.6 (a known mismatch).
+SPARK_TEST_DRIVER_MEMORY ?= 2g
+SPARK_PYTEST = SPARK_MEM_LIMIT=$(SPARK_TEST_MEM_LIMIT) SPARK_DRIVER_MEMORY=$(SPARK_TEST_DRIVER_MEMORY) \
 	$(COMPOSE) --profile spark run --rm --no-deps -T -v ./:/app:ro spark \
 	python -m pytest -q -p no:cacheprovider
 SPARK_TEST_FILES = $(sort $(wildcard tests/spark/test_*.py))
@@ -155,7 +157,7 @@ test-spark: dirs ## Run all Spark tests, one JVM per test file (refuses while th
 	fi
 
 test-spark-fast: dirs ## Quick Spark subset for the dev loop (marker spark_fast, < 5 min)
-	$(COMPOSE) --profile spark run --rm --no-deps -T -v ./:/app:ro spark \
+	SPARK_DRIVER_MEMORY=$(SPARK_TEST_DRIVER_MEMORY) $(COMPOSE) --profile spark run --rm --no-deps -T -v ./:/app:ro spark \
 		python -m pytest tests/spark -q -p no:cacheprovider -m spark_fast --durations=10
 
 # Delta compatibility gate (Phase 2 slice 1, DECISIONS D2.1): checks C1-C14 in the

@@ -1742,3 +1742,68 @@ Built as planned (plan sections 1-2, addenda A and B). The choices made while bu
   - No file is flagged at this baseline. The highest, `test_late_routing.py`, is
     0.32 GiB under the 4 GiB limit.
   - The uncounted native memory and the thread counts are a Phase 4 item (WHAT_BROKE).
+
+### D3.6 The job's memory step is sizing, not a leak; job heap 2g -> 1536m (2026-11-28)
+- **What happened:** in slice 1's after sequence the job crossed two of its lines (D2.5,
+  D3.3):
+  - growth from smoke 4 to smoke 5: +0.436 GiB container, +0.400 GiB heap peak;
+  - smoke-late: container peak 2.951 GiB, and `memory.current` reached the 3 GiB limit.
+- **Leak or sizing? Measured on the running job** (jcmd's module,
+  `java -m jdk.jcmd/sun.tools.jcmd.JCmd`; the `jcmd` launcher is not in the image). At each
+  point: `GC.heap_info`, a full GC (`GC.run`), `GC.heap_info` again.
+
+  | Point | Heap committed | Heap used | Live after full GC |
+  |---|---|---|---|
+  | start (job idle 7.5 h) | 570.0 MiB | 409.8 MiB | 167.0 MiB |
+  | after smoke 1 | 874.0 MiB | 504.2 MiB | 197.9 MiB |
+  | after smoke 2 | 884.0 MiB | 393.9 MiB | 198.7 MiB |
+
+  - The live heap grew +30.9 MiB and then +0.8 MiB per smoke. That is under the ~50 MB
+    leak line fixed before the measurement, so **not a leak**.
+  - What grows is the heap that G1 commits: 570 to 880 MiB with about 200 MiB live.
+- **Why it fills the container (arithmetic on measured parts):** after the full GC the
+  container held:
+  - heap committed: 657 MiB;
+  - metaspace: 242 MiB;
+  - Python: about 76 MiB;
+  - other JVM native memory: about 690 MiB.
+
+  With G1 at its full 2 GiB, that is about 2.98 GiB, the 3 GiB limit. So `-Xmx2g` can
+  fill a 3 GiB container with no leak at all, and the peak and growth lines then fire.
+- **Decision:** the job's heap default `SPARK_DRIVER_MEMORY` 2g -> **1536m** (compose
+  default only; plan section 6, lever 3).
+  - Estimated peak: 1.5 + 0.24 + 0.69 + 0.08, about 2.5 GiB, under the 2.8 GiB line.
+  - The container limit stays at 3 GiB, so the laptop budget is unchanged
+    (Kafka 1 + job 3 + batch 2 = 6 GiB of limits).
+  - The Python fallback of "2g" in `streaming/pipeline.py` and `bronze.py` applies only
+    when the variable is unset. Compose always sets it.
+- **Known mismatch:** test JVMs keep `-Xmx2g`. `make test-spark` and `make test-spark-fast`
+  pass `SPARK_DRIVER_MEMORY=2g` (`SPARK_TEST_DRIVER_MEMORY`). So the tests run with more
+  heap than the job, and a test can pass with heap use the job would not survive. Every
+  after sequence measures the job's own heap.
+- **Rule for the one after sequence, fixed before it:** Spark restarted, then 3 warm-up
+  smokes, smokes 4-7, then smoke-late. PASS needs all of:
+  - median silver addBatch ≤ 14,832 ms, over smokes 4-7, the runs after the warm-up
+    (runs 2-7 are reported next to it; smoke 1 starts Spark and is excluded, as in D3.3);
+  - container peak ≤ 2.8 GiB in every run;
+  - growth ≤ 0.1 GiB between consecutive smokes after the warm-up;
+  - every R check PASS;
+  - 0 missing and 0 duplicate ids;
+  - 0 OOM kills and 0 swap.
+
+  FAIL means no more tuning: report, a WHAT_BROKE known limit, a commit only if
+  correctness passed, STOP.
+- **Result of that sequence (2026-11-28, `-Xmx1536m` VERIFIED from the job's command
+  line): FAIL on speed, PASS on everything else.**
+  - **Speed: FAIL.** Median silver addBatch over smokes 4-7 = median(16,809, 13,552,
+    16,702, 19,560) = **16,755.5 ms > 14,832 ms**. Runs 2-7 give the same median.
+  - **Memory: PASS.**
+    - Container peaks were 1.510-1.986 GiB in the smokes and **2.458 GiB in smoke-late**
+      (≤ 2.8; it was 2.951 at 2g).
+    - Growth after the warm-up: +0.063, +0.006, +0.069 and +0.073 GiB (each ≤ 0.1). The
+      heap peak stayed flat at 0.744 GiB from smoke 3.
+    - 0 swap, 0 OOM kills, GC 0.27-0.58 %.
+  - **Correctness: PASS.** All 8 runs PASS: 351 events, 0 missing, 0 duplicates, all R
+    checks PASS, 0 DLQ rows.
+  - By the rule: no more tuning. Known limit in WHAT_BROKE. The heap change is committed,
+    because correctness passed.
