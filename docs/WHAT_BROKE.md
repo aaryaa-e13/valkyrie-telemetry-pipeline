@@ -555,3 +555,59 @@ None of this touches the pipeline.
 - **Next:** decided by the project owner. It belongs with D2.4's addBatch revisit and the
   slice 6 OPTIMIZE item.
 
+
+### Bad rows moved the watermark by 2 minutes in backfill (Phase 3 slice 2, D3.7 condition 1)
+- **Symptom:** the condition 1 Spark test (`tests/spark/test_dlq_oracle.py`) failed in
+  backfill: with the run's `future_time` rows added, m_k and the watermark were up to 2 min
+  ahead of the same batches with good rows only. Realtime passed.
+- **Root cause:** a `future_time` row (+24 h, kept with flag S1) is keyed, so it counted in
+  m_k, clamped to its Kafka time. In backfill the Kafka time is the send time, after every
+  event of the run, so the clamped value became the batch's m_k. The clamp (D2.4) bounds a
+  future row by its Kafka time; that bound is only tight in realtime. `epoch_time` rows
+  were harmless (1970 is below every good row).
+- **Fix (project owner's decision):** a keyed row with `event_time > ingest_time + 5 min`
+  never counts in m_k, whatever its class (`streaming/silver.py` `beyond_future_tolerance`).
+  Verify's own recompute (`_clamped_us`, R6d and isolation) uses the same rule. Live bronze
+  had 0 such rows, so no recorded batch changes.
+- **Tests:** condition 1 now also checks the same good rows go to late; a boundary test at
+  +5 min / +5 min 1 ms for accepted, flagged and rejected rows.
+- **Lesson:** "the clamp bounds the effect" was an assumption, not a measurement. A test
+  that feeds the same good batches with and without bad rows found it.
+
+### Two Spark tests broke on the new watermark rule: hand-built rows had no ingest_time (Phase 3 slice 2, my test data)
+- **Symptom:** `test_silver.py`, 2 failed: `UNRESOLVED_COLUMN` `ingest_time` in
+  `batch_counts`.
+- **Root cause:** those two tests built their input frames by hand with only the columns
+  the old m_k read. Real bronze always has `ingest_time` (`streaming/bronze.py`).
+- **Fix:** the two frames gain `ingest_time` (= their Kafka time). Expected values unchanged.
+
+### The Spark image has no PyYAML or confluent-kafka (Phase 3 slice 2)
+- **Symptom:** `ImportError` collecting `test_dlq_oracle.py`: the Spark tests could not
+  import the simulator's config, generator or producer.
+- **Fix:** no image change. `tests/fixtures/build_bad_run.py` builds one real bad run on the
+  host with the real simulator code and checks in `tests/fixtures/bad_run.json`;
+  `tests/unit/test_bad_run_fixture.py` rebuilds it and fails on any difference.
+- **Then:** the first rebuild differed in `created_at` (the wall clock). The builder pins it
+  to the fixture's fixed NOW.
+
+### r10d_verdict crashed when there was no DLQ table (Phase 3 slice 2, my code)
+- **Symptom:** `KeyError` in `streaming/oracle_dlq.py` `r10d_verdict` on a report without
+  DLQ details.
+- **Fix:** it returns "not checkable" when the R10d section says `checkable: False`. Caught
+  before any live run.
+
+### R14 double-reported R9's finding (Phase 3 slice 2, my design)
+- **Symptom:** the tamper "a silver row for a DLQ id" also failed R14 (stranded DLQ copy).
+- **Root cause:** a DLQ row next to an accepted id is R9's finding (an id in both), not a
+  stranded copy.
+- **Fix:** R14 skips ids already in silver or late. Each tamper test now fails exactly its
+  expected set of rules.
+
+### Verify (spark-tools) reaches its 1.5 GiB limit on a bad-data run (Phase 3 slice 2) — KNOWN LIMIT
+- **What happened (VERIFIED, cgroup samples):** in smoke-bad run 2 the `spark-tools`
+  container's `memory.peak` was 1.500 GiB (its limit), anon 1.481 GiB, and it swapped 63 MB.
+  0 OOM kills. Runs 3 and 4: 1.420 and 1.397 GiB, swap 0. Run 1 was not sampled.
+- **Not known:** how much R11/R14 (new bronze reads in verify) add; `spark-tools` was never
+  sampled before slice 2.
+- **Fix: none.** The plan's line for `spark-tools` is 0 OOM kills, and it held. No tuning
+  without a decision.

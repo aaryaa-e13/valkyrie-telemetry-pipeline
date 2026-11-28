@@ -148,11 +148,12 @@ One Spark process runs two streaming queries, each with a 10 s trigger.
 | `make smoke-restart` | Graceful stop, a run sent while Spark is down, restart: nothing re-read, skipped or stored twice | 10-16 events | 3.2-6.7 min |
 | `make smoke-late` | Realtime run (4 matches, 30% of events late), judged by R1-R6 | about 250 events | 7.4-9.0 min |
 | `make smoke-faults` | SIGKILL at each silver write boundary and once inside bronze, then restart and judge; `E2E_ARGS="--point after_late"` runs one point | about 50 events per silver point, 14 per bronze attempt | about 10 min per silver point, 5 min for bronze |
+| `make smoke-bad` | Bad-data run (`simulator/config.bad.yaml`, a seed that covers every bad kind): each bad event must land where its gate says (DLQ with the right reason, or silver with the right flag), checked per gate from 5 sides; R8-R11 and R14; exit 0 PASS, 1 FAIL, 2 not checkable, 6 evidence incomplete (D3.7) | 243-247 events, 73-83 of them bad | 4.9-5.5 min |
 | `make verify MANIFEST=... [LAYER=bronze\|silver\|all]` | Read-only check of one run against its manifest | nothing | not measured separately |
 | `make timing-check MANIFEST=...` | Reads a run back from Kafka: was any event sent before its `event_time`? | nothing | seconds |
 | `make faults-config-check` | Counts mentions of the fault hooks in the default Compose config (must print 0) | nothing | seconds |
 | `make delta-compat` | Delta compatibility gate, checks C1-C14 | nothing | about 4 min |
-| `make test-unit`, `make test-spark`, `make lint` | 642 unit tests; 147 Spark tests in the Spark image, one JVM per test file in a 4 GiB container (refuses while the Spark job runs: `make spark-stop` first); ruff | nothing | seconds; about 75 min; seconds |
+| `make test-unit`, `make test-spark`, `make lint` | 763 unit tests; 168 Spark tests in the Spark image, one JVM per test file in a 4 GiB container (refuses while the Spark job runs: `make spark-stop` first); ruff | nothing | seconds; about 75 min; seconds |
 
 Every e2e target ends with a `SUMMARY {json}` line and exits 0 on PASS (exit codes: D1.16,
 D2.5, D2.6). Times are from single runs on the WSL2 laptop, not benchmarks. They vary between
@@ -160,6 +161,8 @@ runs: for `make smoke` and `make smoke-restart` the upper end is from the
 final Phase 2 gate, run after `make down && make up` (so smoke also waited for Spark to start);
 about 4 of its 5.7 smoke minutes were the final verify (`docs/evidence/phase2/gate/`).
 The `make test-spark` time is from one Phase 3 slice 1 run (4,494 s, D3.5).
+Phase 3 slice 2 added Spark tests and did not re-time the whole suite: the 9 files it touched
+took 99 min on their own (D3.7).
 
 ### What is tested, and how
 

@@ -1864,3 +1864,40 @@ Plan `docs/plans/phase3-slice2-plan.md`, approved with these decisions:
     rejected rows;
   - a pin: the exclusion equals the S1 flag on every three-way case;
   - an isolation case in `test_verify_oracle.py`.
+
+**Results (2026-11-28; VERIFIED from `docs/plans/s2/*.out`, the job's log and cgroup files).**
+- **Spark tests (D3.5 gate, one file per container, 4 GiB):** the 9 touched files pass, each
+  exit 0, 0 OOM kills, 0 swap. Anon peaks (GiB, m4g baseline in brackets): test_dlq_oracle
+  3.111 (new), test_dlq 2.227 (2.093), test_dlq_recovery 2.981 (2.888), test_dlq_verify
+  2.213 (2.461), test_late_routing 3.686 (3.681), test_silver 2.136 (2.082),
+  test_silver_stream 2.773 (2.490), test_verify_manifest 1.953 (2.163), test_verify_oracle
+  3.033 (3.144). None at the 3.8 GiB flag. Totals: 168 Spark tests, 763 unit tests.
+- **Live runs** (Spark started by run 1 with the new image; one `bench.smoke_measure` each):
+
+  | run | exit | events (bad) | DLQ / flagged | container peak | heap peak | GC | spark-tools peak |
+  |---|---|---|---|---|---|---|---|
+  | smoke-bad 1 | 0 | 243 (82) | 73 / 9 | 1.628 GiB | 0.499 | 0.36 % | not sampled |
+  | smoke-bad 2 | 0 | 243 (73) | 60 / 13 | 1.758 | 0.502 | 0.29 % | **1.500 (limit), swap 63 MB** |
+  | smoke-bad 3 | 0 | 247 (83) | 72 / 11 | 1.995 | 0.687 | 0.29 % | 1.420, swap 0 |
+  | smoke 4 | 0 | 14 (0) | 0 / 0 | 2.001 | 0.703 | 0.28 % | 1.397, swap 0 |
+
+  - Every smoke-bad run: verify PASS, R6a-d and R8-R11, R14 PASS, all 14 gates exact in
+    the evidence table (manifest = tables = control = recompute = not elsewhere, 0 extra),
+    no shared batches. R4/R5 "not checkable" on bad-data runs, as designed.
+  - smoke 4: the run's DLQ rows = 0; R4, R5, R6a-d, R8-R11, R14 PASS; isolated (margin
+    254,901 ms).
+  - Job lines: container peak ≤ 2.8 GiB, GC ≤ 10 %, 0 OOM kills, 0 swap (job cgroup
+    `memory.swap.peak` 0 over all 4 runs; 0 restarts). Heap: reported, no verdict (cond. 2).
+  - Growth, smoke-bad 1 → 2 → 3 (cond. 3, no verdict): peak 1.628 → 1.758 → 1.995 GiB,
+    end of run 1.461 → 1.593 → 1.832 GiB. Run 4 is not judged against run 3.
+  - `spark-tools` (verify): 0 OOM kills in the 3 sampled runs (the plan's only line), but
+    in run 2 its cgroup hit the 1.5 GiB limit (`memory.peak` 1.500 GiB, anon 1.481) and
+    swapped 63 MB. Run 1 was not sampled (it finished with a full report, so it was not
+    killed). Reported, not tuned.
+  - Reported only: silver addBatch 25,504 / 26,889 ms (smoke-bad 2, 3; run 1's only batch
+    was the first after start, 26,059 ms) and 11,378 ms (smoke 4). `dlq_ms`, the first live
+    DLQ writes: 9,807 / 9,638 / 9,807 ms per bad batch, 0 in smoke 4. `wm_read_ms`:
+    1,089 / 2,409 / 1,968 / 1,362 (all under D2.4's 3 s line).
+- **Noted, not changed:** the control row's `clamped_rows` still counts a keyed row with
+  Kafka time < event_time even when the row is past the S1 tolerance and so not in m_k. It
+  is a report counter only (no rule reads it).
