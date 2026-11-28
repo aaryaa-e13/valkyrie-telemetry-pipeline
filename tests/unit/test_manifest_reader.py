@@ -251,7 +251,7 @@ def test_broken_v3_manifests_raise_clear_errors(name: str, mutate: Any) -> None:
         parse_manifest(data)
 
 
-@pytest.mark.parametrize("version", [0, 4, 99, "3", None])
+@pytest.mark.parametrize("version", [0, 5, 99, "3", None])
 def test_unknown_versions_are_still_rejected(version: Any) -> None:
     data = copy.deepcopy(V3)
     data["manifest_version"] = version
@@ -288,7 +288,7 @@ def test_real_v3_manifest_with_late_events_roundtrips(tmp_path: Path) -> None:
             continue
         m = load_manifest(path)
         late = [p for p in plan if p.band is not None]
-        assert m.version == 3
+        assert m.version == 4 and m.bad_data is None   # the writer is v4 now
         assert m.pacing is not None and m.pacing.mode == "realtime"
         assert m.pacing.max_behind_ms == 1
         assert m.late_events is not None
@@ -316,7 +316,7 @@ def test_real_manifest_written_by_simulator_roundtrips(tmp_path: Path) -> None:
         partitions_by_match={e.match_id: {1} for e in events}, offsets_by_partition=offsets,
     )
     m = load_manifest(write_manifest(manifest, tmp_path))
-    assert m.version == 3
+    assert m.version == 4 and m.bad_data is None   # current writer: v4
     assert m.late_events == {}
     assert m.event_ids == frozenset(ids)
     assert m.kafka_offsets == {1: OffsetRange(0, len(ids) - 1, len(ids))}

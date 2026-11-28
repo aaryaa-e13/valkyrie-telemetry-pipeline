@@ -7,6 +7,9 @@ Supported versions:
     1  event ids per match, counts, checksum. No Kafka offsets.
     2  as v1, plus `kafka_offsets` {partition: {min, max, count}}.
     3  as v2, plus `pacing`, `late_counts` and `late_events` (deliberate lateness).
+    4  as v3, plus `bad_data` (deliberate bad data, Phase 3 slice 2): None when bad-data
+       mode was off. Otherwise its counts and, unless left out, one BadEventEntry per
+       delivered corrupted event with its expected result and Kafka (partition, offset).
 
 What "no lateness information" means depends on the version:
     v1/v2  lateness was NOT RECORDED: `pacing`, `late_counts` and `late_events`
@@ -24,7 +27,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-SUPPORTED_VERSIONS = frozenset({1, 2, 3})
+SUPPORTED_VERSIONS = frozenset({1, 2, 3, 4})
+BAD_CLASSES = frozenset({"dlq", "flag"})
+KEY_KINDS = frozenset({"id", "offset"})
 PACE_MODES = frozenset({"backfill", "realtime"})
 BANDS = ("slight", "very")
 EXPECTATIONS = frozenset({"keep", "may_drop"})
@@ -81,6 +86,66 @@ class LateEvent:
 
 
 @dataclass(frozen=True)
+class BadEventEntry:
+    """One delivered event that was corrupted on purpose (v4)."""
+
+    event_id: str                 # logical id (in the manifest's event_ids)
+    sent_event_id: str | None     # what the message carried: the id, "" or None
+    match_id: str
+    event_type: str
+    kind: str
+    variant: str | None
+    field: str | None
+    expected_class: str           # "dlq" or "flag"
+    expected_code: str            # reason_code (dlq) or the flag (flag)
+    expected_key_kind: str | None  # "id" or "offset" (dlq); None (flag)
+    kafka_partition: int
+    kafka_offset: int
+
+    @property
+    def id_readable(self) -> bool:
+        """Can bronze's event_id column find this message? False for a half message
+        and for a missing or blank id (bronze then finds it by offset)."""
+        return (self.kind != "malformed_json" and self.sent_event_id is not None
+                and self.sent_event_id.strip(" ") != "")
+
+    def dlq_key(self, topic: str) -> str | None:
+        """The DLQ row key the job must write (None for a kept, flagged row)."""
+        if self.expected_class != "dlq":
+            return None
+        if self.expected_key_kind == "id":
+            return f"id:{self.event_id}"
+        return f"off:{topic}/{self.kafka_partition}/{self.kafka_offset}"
+
+
+@dataclass(frozen=True)
+class BadData:
+    """The v4 `bad_data` section."""
+
+    bad_fraction: float
+    enabled_kinds: tuple[str, ...]
+    rules_version_expected: int
+    new_region_match: str | None
+    bad_counts: dict[str, int]
+    expected_rejections: dict[str, int]
+    expected_flags: dict[str, int]
+    expected_by_key_kind: dict[str, int]
+    # event_id -> entry; None when the list was left out (see the reason).
+    bad_events: dict[str, BadEventEntry] | None
+    bad_events_omitted_reason: str | None
+
+    @property
+    def expected_dlq_count(self) -> int:
+        return sum(self.expected_rejections.values())
+
+    def dlq_events(self) -> list[BadEventEntry]:
+        return [b for b in (self.bad_events or {}).values() if b.expected_class == "dlq"]
+
+    def flag_events(self) -> list[BadEventEntry]:
+        return [b for b in (self.bad_events or {}).values() if b.expected_class == "flag"]
+
+
+@dataclass(frozen=True)
 class Manifest:
     """The parts of a run manifest that verification needs."""
 
@@ -102,10 +167,24 @@ class Manifest:
     # None for v1/v2, and for v3 when the list was omitted (see the reason below).
     late_events: dict[str, LateEvent] | None = None
     late_events_omitted_reason: str | None = None
+    # v4: None when bad-data mode was off (and for v1-v3: they describe good data only).
+    bad_data: BadData | None = None
 
     @property
     def event_ids(self) -> frozenset[str]:
         return frozenset(event_id for _, event_id in self.event_pairs)
+
+    @property
+    def expected_dlq_ids(self) -> frozenset[str]:
+        """Logical ids the job must dead-letter (v4 with the list; else empty)."""
+        if self.bad_data is None:
+            return frozenset()
+        return frozenset(b.event_id for b in self.bad_data.dlq_events())
+
+    @property
+    def bad_list_missing(self) -> bool:
+        """True when bad events were sent but their list was left out."""
+        return self.bad_data is not None and self.bad_data.bad_events is None
 
 
 def _opt_int(value: Any) -> int | None:
@@ -171,6 +250,82 @@ def _parse_late_events(
     return late, None
 
 
+def _parse_bad_data(raw: Any, delivered_ids: set[str]) -> BadData | None:
+    """The v4 `bad_data` block, cross-checked (counts == list, ids delivered)."""
+    if raw is None:
+        return None
+    entries_raw = raw["bad_events"]
+    reason = raw["bad_events_omitted_reason"]
+    entries: dict[str, BadEventEntry] | None = None
+    if entries_raw is None:
+        if not reason:
+            raise ValueError("bad_events is null but no bad_events_omitted_reason is given")
+    else:
+        if reason is not None:
+            raise ValueError("bad_events is present but bad_events_omitted_reason is set")
+        entries = {}
+        for e in entries_raw:
+            cls = e["expected_class"]
+            if cls not in BAD_CLASSES:
+                raise ValueError(f"bad event {e.get('event_id')}: unknown class {cls!r}")
+            key_kind = e["expected_key_kind"]
+            if (cls == "dlq") != (key_kind in KEY_KINDS) or (cls == "flag" and key_kind):
+                raise ValueError(f"bad event {e.get('event_id')}: key kind {key_kind!r} "
+                                 f"does not fit class {cls!r}")
+            item = BadEventEntry(
+                event_id=str(e["event_id"]),
+                sent_event_id=None if e["sent_event_id"] is None else str(e["sent_event_id"]),
+                match_id=str(e["match_id"]), event_type=str(e["event_type"]),
+                kind=str(e["kind"]), variant=e["variant"], field=e["field"],
+                expected_class=cls,
+                expected_code=str(e["expected_reason" if cls == "dlq" else "expected_flag"]),
+                expected_key_kind=key_kind,
+                kafka_partition=int(e["kafka_partition"]), kafka_offset=int(e["kafka_offset"]))
+            if item.kafka_partition < 0 or item.kafka_offset < 0:
+                raise ValueError(f"bad event {item.event_id}: negative partition or offset")
+            if item.event_id in entries:
+                raise ValueError(f"bad event {item.event_id} is listed twice")
+            if item.event_id not in delivered_ids:
+                raise ValueError(f"bad event {item.event_id} is not a delivered event")
+            entries[item.event_id] = item
+    bd = BadData(
+        bad_fraction=float(raw["bad_fraction"]),
+        enabled_kinds=tuple(str(k) for k in raw["enabled_kinds"]),
+        rules_version_expected=int(raw["rules_version_expected"]),
+        new_region_match=raw["new_region_match"],
+        bad_counts={str(k): int(v) for k, v in raw["bad_counts"].items()},
+        expected_rejections={str(k): int(v) for k, v in raw["expected_rejections"].items()},
+        expected_flags={str(k): int(v) for k, v in raw["expected_flags"].items()},
+        expected_by_key_kind={str(k): int(v) for k, v in raw["expected_by_key_kind"].items()},
+        bad_events=entries, bad_events_omitted_reason=None if reason is None else str(reason))
+    if sum(bd.expected_by_key_kind.values()) != bd.expected_dlq_count:
+        raise ValueError(f"expected_by_key_kind {bd.expected_by_key_kind} does not add up to "
+                         f"expected_rejections {bd.expected_dlq_count}")
+    if entries is not None:
+        listed: dict[str, dict[str, int]] = {"bad_counts": {}, "expected_rejections": {},
+                                             "expected_flags": {}}
+        for b in entries.values():
+            listed["bad_counts"][b.kind] = listed["bad_counts"].get(b.kind, 0) + 1
+            part = "expected_rejections" if b.expected_class == "dlq" else "expected_flags"
+            listed[part][b.expected_code] = listed[part].get(b.expected_code, 0) + 1
+        for name, got in listed.items():
+            if got != getattr(bd, name):
+                raise ValueError(f"{name} {getattr(bd, name)} do not match the listed bad "
+                                 f"events {got}")
+        by_key = {k: sum(1 for b in bd.dlq_events() if b.expected_key_kind == k)
+                  for k in sorted(KEY_KINDS)}
+        if by_key != {k: bd.expected_by_key_kind.get(k, 0) for k in sorted(KEY_KINDS)}:
+            raise ValueError(f"expected_by_key_kind {bd.expected_by_key_kind} does not match "
+                             f"the listed bad events {by_key}")
+        seen: dict[tuple[int, int], str] = {}
+        for b in entries.values():
+            at = (b.kafka_partition, b.kafka_offset)
+            if at in seen:
+                raise ValueError(f"bad events {seen[at]} and {b.event_id} share {at}")
+            seen[at] = b.event_id
+    return bd
+
+
 def parse_manifest(data: dict[str, Any], path: Path | str = "<memory>") -> Manifest:
     """Validate and convert a manifest dict.
 
@@ -222,6 +377,13 @@ def parse_manifest(data: dict[str, Any], path: Path | str = "<memory>") -> Manif
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise ManifestError(f"{path}: invalid pacing/late_events: {exc!r}") from exc
 
+    bad_data: BadData | None = None
+    if version >= 4:
+        try:
+            bad_data = _parse_bad_data(data["bad_data"], {event_id for _, event_id in pairs})
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise ManifestError(f"{path}: invalid bad_data: {exc!r}") from exc
+
     return Manifest(
         path=path,
         version=version,
@@ -235,6 +397,7 @@ def parse_manifest(data: dict[str, Any], path: Path | str = "<memory>") -> Manif
         late_counts=late_counts,
         late_events=late_events,
         late_events_omitted_reason=omitted_reason,
+        bad_data=bad_data,
     )
 
 

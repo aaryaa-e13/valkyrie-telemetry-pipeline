@@ -55,6 +55,11 @@ class DeliveryTracker:
     # partition -> offset range of acknowledged messages. Lets tests know exactly
     # which offsets a consumer (Spark) must have processed to have seen this run.
     offsets_by_partition: dict[int, PartitionOffsets] = field(default_factory=dict)
+    # Bad-data mode (manifest v4): the exact (partition, offset) of each acknowledged
+    # message whose id is in `offsets_for`. Only the bad events are tracked, so this
+    # stays small at 50M events.
+    offsets_for: frozenset[str] = frozenset()
+    message_offsets: dict[str, tuple[int, int]] = field(default_factory=dict)
 
     def _record_offset(self, partition: int, offset: int) -> None:
         current = self.offsets_by_partition.get(partition)
@@ -81,6 +86,8 @@ class DeliveryTracker:
         self.delivered_ids.append(event_id)
         self.partitions_by_match[match_id].add(msg.partition())
         self._record_offset(msg.partition(), msg.offset())
+        if event_id in self.offsets_for:
+            self.message_offsets[event_id] = (msg.partition(), msg.offset())
         log.debug(
             "delivered",
             extra={"fields": {
@@ -135,13 +142,19 @@ class EventProducer:
             raise RuntimeError(f"topic {self.topic!r} unavailable: {reason}")
         return len(topic_md.partitions)
 
-    def send(self, event: GameEvent) -> None:
-        """Queue one event. Blocks briefly (serving callbacks) if the local queue is full."""
+    def send(self, event: GameEvent, value: bytes | None = None) -> None:
+        """Queue one event. Blocks briefly (serving callbacks) if the local queue is full.
+
+        `value`: the bytes to send instead of the event's JSON (bad-data mode). The key
+        stays the event's match_id, so partitioning does not change. The delivery
+        callback gets the event's logical id either way.
+        """
         callback = functools.partial(self.tracker.on_delivery, event.event_id, event.match_id)
+        payload = event.to_json_bytes() if value is None else value
         while True:
             try:
                 self._producer.produce(
-                    self.topic, key=event.key, value=event.to_json_bytes(), on_delivery=callback
+                    self.topic, key=event.key, value=payload, on_delivery=callback
                 )
                 break
             except BufferError:

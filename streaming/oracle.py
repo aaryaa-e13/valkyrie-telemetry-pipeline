@@ -67,8 +67,13 @@ def w_gate(manifest: Manifest, run_batches: Iterable[tuple[str, int]],
     """The W oracle check: manifest assumed_watermark_s == the job's recorded W."""
     batches = sorted(set(run_batches))
     out: dict[str, Any] = {"manifest_w_s": None, "control_w_s": [], "run_batches": len(batches)}
-    if manifest.version != 3 or manifest.pacing is None:
+    if manifest.version < 3 or manifest.pacing is None:
         return {**out, **not_checkable(f"manifest v{manifest.version} has no lateness data")}
+    if manifest.bad_data is not None:
+        # v4 bad-data run: the bands assume every id ends in S or L, but dead-lettered
+        # ids end in neither (slice 2 judges those runs with R10c/R10d/R11 instead).
+        return {**out, **not_checkable("bad-data run (manifest v4 bad_data): R4/R5 are "
+                                       "judged on good-data runs only")}
     out["manifest_w_s"] = manifest.pacing.assumed_watermark_s
     if manifest.late_events is None:
         return {**out, **not_checkable(

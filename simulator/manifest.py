@@ -23,6 +23,14 @@ Versions:
                       "too_many_late_events" (more than MAX_LATE_EVENTS_LISTED).
        Late events are still ordinary delivered events: they stay in
        `event_ids`, the totals and the checksum. v3 only annotates them.
+    4  adds `bad_data` (Phase 3 slice 2, DECISIONS D3.7): null when bad-data mode was
+       off, else the settings, counts and one entry per delivered corrupted event with
+       its expected result (DLQ reason + key kind, or the one soft flag) and its exact
+       Kafka (partition, offset) from the delivery report. `event_ids` and the
+       checksum keep their meaning: the LOGICAL ids delivered; `sent_event_id` is what
+       the message carried (the id, "" or null = not readable). The list is null when
+       left out; `bad_events_omitted_reason` says why ("no_manifest_ids" or
+       "too_many_bad_events"); readers then treat R10c/R10d/R11 as not checkable.
 Readers must accept all versions (see common/manifest_reader.py).
 """
 
@@ -32,12 +40,13 @@ import hashlib
 import json
 import os
 import tempfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from simulator.corrupt import KINDS, RULES_VERSION_EXPECTED, BadEvent, check_kinds
 from simulator.events import GameEvent
 from simulator.schedule import (
     BAND_SLIGHT,
@@ -50,11 +59,13 @@ from simulator.schedule import (
 )
 from simulator.sender import SendStats
 
-MANIFEST_VERSION = 3
+MANIFEST_VERSION = 4
 # Above this many late events the per-event list is left out (about 20 MB of JSON).
 MAX_LATE_EVENTS_LISTED = 100_000
+MAX_BAD_EVENTS_LISTED = 100_000
 OMITTED_NO_IDS = "no_manifest_ids"
 OMITTED_TOO_MANY = "too_many_late_events"
+OMITTED_TOO_MANY_BAD = "too_many_bad_events"
 CHECKSUM_ALGORITHM = "sha256(sorted event_ids joined by newline)"
 
 
@@ -138,6 +149,64 @@ def _late_sections(
     }
 
 
+def _bad_section(
+    bad: Mapping[str, BadEvent] | None, delivered: set[str],
+    offsets: Mapping[str, tuple[int, int]], include_event_ids: bool,
+    config: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """The v4 `bad_data` block (None when bad-data mode was off).
+
+    Only delivered bad events are counted and listed (like late_events), so the list
+    is a subset of the manifest's delivered ids.
+
+    Raises:
+        ValueError: a delivered bad event has no recorded (partition, offset).
+    """
+    if bad is None:
+        return None
+    sent = [b for b in bad.values() if b.event_id in delivered]   # generation order
+    missing = [b.event_id for b in sent if b.event_id not in offsets]
+    if missing:
+        raise ValueError(f"{len(missing)} delivered bad events have no recorded offset, "
+                         f"e.g. {missing[:3]}")
+    dlq = [b for b in sent if b.expected.cls == "dlq"]
+    flags = [b for b in sent if b.expected.cls == "flag"]
+    region = sorted({b.match_id for b in sent if b.kind == "new_region"})
+    reason: str | None = None
+    if not include_event_ids:
+        reason = OMITTED_NO_IDS
+    elif len(sent) > MAX_BAD_EVENTS_LISTED:
+        reason = OMITTED_TOO_MANY_BAD
+    entries: list[dict[str, Any]] | None = None
+    if reason is None:
+        entries = []
+        for b in sent:
+            x = b.expected
+            entries.append({
+                "event_id": b.event_id, "sent_event_id": b.sent_event_id,
+                "match_id": b.match_id, "event_type": b.event_type, "kind": b.kind,
+                "variant": b.choice.variant, "field": b.choice.field,
+                "expected_class": x.cls,
+                ("expected_reason" if x.cls == "dlq" else "expected_flag"): x.code,
+                "expected_key_kind": x.key_kind,
+                "kafka_partition": offsets[b.event_id][0],
+                "kafka_offset": offsets[b.event_id][1],
+            })
+    return {
+        "bad_fraction": float(config.get("bad_fraction", 0.0)),
+        "enabled_kinds": list(check_kinds(config.get("bad_kinds") or KINDS)),
+        "rules_version_expected": RULES_VERSION_EXPECTED,
+        "new_region_match": region[0] if region else None,
+        "bad_counts": dict(sorted(Counter(b.kind for b in sent).items())),
+        "expected_rejections": dict(sorted(Counter(b.expected.code for b in dlq).items())),
+        "expected_flags": dict(sorted(Counter(b.expected.code for b in flags).items())),
+        "expected_by_key_kind": {k: sum(1 for b in dlq if b.expected.key_kind == k)
+                                 for k in ("id", "offset")},
+        "bad_events_omitted_reason": reason,
+        "bad_events": entries,
+    }
+
+
 def build_manifest(
     *,
     run_id: str,
@@ -152,6 +221,8 @@ def build_manifest(
     interrupted: bool = False,
     planned: Sequence[PlannedSend] | None = None,
     stats: SendStats | None = None,
+    bad: Mapping[str, BadEvent] | None = None,
+    bad_offsets: Mapping[str, tuple[int, int]] | None = None,
 ) -> dict[str, Any]:
     """Assemble the manifest dict.
 
@@ -170,6 +241,10 @@ def build_manifest(
         planned: The send plan (simulator.schedule.build_schedule). Supplies the
             lateness annotations; None means every event was sent on time.
         stats: What the send loop measured; None writes nulls.
+        bad: The run's corrupted events (simulator.corrupt.corrupt_run); None = bad-data
+            mode off (`bad_data` is null).
+        bad_offsets: event_id -> (partition, offset) of the bad events, from the
+            delivery report (DeliveryTracker.message_offsets).
     """
     delivered = set(delivered_ids)
     failed = sorted(set(failed_ids))
@@ -217,6 +292,8 @@ def build_manifest(
         },
         "pacing": _pacing_section(config, stats),
         **_late_sections(planned, delivered, include_event_ids),
+        "bad_data": _bad_section(bad, delivered, bad_offsets or {}, include_event_ids,
+                                 config),
         "matches": matches,
         "failed_event_ids": failed,
     }

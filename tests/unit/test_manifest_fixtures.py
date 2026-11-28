@@ -84,8 +84,8 @@ def test_v3_records_pacing_and_late_events() -> None:
 
 def test_a_future_version_of_a_real_file_is_rejected(tmp_path: Path) -> None:
     data = json.loads(V3.read_text())
-    data["manifest_version"] = 4
-    path = tmp_path / "v4.json"
+    data["manifest_version"] = 5
+    path = tmp_path / "v5.json"
     path.write_text(json.dumps(data))
     with pytest.raises(ManifestError, match="not supported"):
         load_manifest(path)

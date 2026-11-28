@@ -27,7 +27,9 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 from common.logging_setup import setup_logging
+from simulator import corrupt
 from simulator.config import PACE_REALTIME, PACES, SimulatorConfig, load_config
+from simulator.events import GameEvent
 from simulator.generator import generate_events
 from simulator.manifest import build_manifest, find_manifests_for_seed, write_manifest
 from simulator.producer import EventProducer
@@ -60,6 +62,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="share of the late events that are VERY late (0..1, default 0.2)")
     p.add_argument("--assumed-watermark-s", dest="assumed_watermark_s", type=float,
                    help="assumed Phase 2 watermark in seconds; delays are multiples of it")
+    p.add_argument("--bad-fraction", dest="bad_fraction", type=float,
+                   help="share of events that get one deliberate fault (0..1, default 0)")
     p.add_argument("--bootstrap-servers", dest="bootstrap_servers")
     p.add_argument("--topic")
     p.add_argument("--rate", dest="rate_per_s", type=float,
@@ -149,6 +153,13 @@ def _timing_fields(
     return fields
 
 
+def bad_events(cfg: SimulatorConfig, events: list[GameEvent]) -> dict[str, corrupt.BadEvent]:
+    """The run's corrupted events (bad-data mode; {} when off). The send plan is not
+    touched: realtime waits use the real event_time, so a future-time event is not held
+    back."""
+    return corrupt.corrupt_run(events, cfg.seed, cfg.bad_fraction, cfg.enabled_bad_kinds())
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -169,8 +180,11 @@ def run(
         except ValueError as exc:
             log.error("invalid configuration", extra={"fields": {"error": str(exc)}})
             return 2
-        for planned in plan:  # printed in planned send order
-            sys.stdout.write(planned.event.to_json_bytes().decode("utf-8") + "\n")
+        bad = bad_events(cfg, [p.event for p in plan])
+        for planned in plan:  # printed in planned send order (bad events as sent)
+            b = bad.get(planned.event.event_id)
+            value = planned.event.to_json_bytes() if b is None else b.value
+            sys.stdout.write(value.decode("utf-8") + "\n")
         return 0
 
     earlier = find_manifests_for_seed(cfg.manifest_dir, cfg.seed)
@@ -208,13 +222,27 @@ def run(
     log.info("generated events", extra={"fields": {
         "events": len(events), "matches": cfg.num_matches, "seed": cfg.seed, **timing}})
 
+    bad = bad_events(cfg, events)
+    if bad:
+        log.info("bad-data mode", extra={"fields": {
+            "bad_events": len(bad), "bad_fraction": cfg.bad_fraction,
+            "kinds": dict(Counter(b.kind for b in bad.values()))}})
+    producer.tracker.offsets_for = frozenset(bad)
+
+    def send(event: GameEvent) -> None:
+        b = bad.get(event.event_id)
+        if b is None:
+            producer.send(event)
+        else:
+            producer.send(event, b.value)
+
     stats = SendStats()
     interrupted = False
     try:
         if cfg.pace == PACE_REALTIME:
-            send_realtime(plan, producer.send, wait=producer.poll, stats=stats)
+            send_realtime(plan, send, wait=producer.poll, stats=stats)
         else:
-            send_backfill(plan, producer.send, rate_per_s=cfg.rate_per_s, stats=stats)
+            send_backfill(plan, send, rate_per_s=cfg.rate_per_s, stats=stats)
     except KeyboardInterrupt:
         interrupted = True
         log.warning("interrupted; flushing what was already queued")
@@ -237,6 +265,8 @@ def run(
         interrupted=interrupted,
         planned=plan,
         stats=stats,
+        bad=bad if cfg.bad_fraction > 0 else None,
+        bad_offsets=tracker.message_offsets,
     )
     path = write_manifest(manifest, cfg.manifest_dir)
 
@@ -253,6 +283,7 @@ def run(
         "future_events": stats.future_events,
         "max_ahead_ms": stats.max_ahead_ms,
         "max_behind_ms": stats.max_behind_ms,
+        "bad_events": len(bad),
     }
     if interrupted:
         log.warning("run interrupted", extra={"fields": summary})

@@ -138,7 +138,7 @@ def test_manifest_writes_offsets_with_string_partition_keys() -> None:
         partitions_by_match=tracker.partitions_by_match,
         offsets_by_partition=tracker.offsets_by_partition,
     )
-    assert m["manifest_version"] == 3
+    assert m["manifest_version"] == 4   # v4 since slice 2 (bad_data null when off)
     assert set(m["kafka_offsets"]) == {"0", "1"}
     assert sum(o["count"] for o in m["kafka_offsets"].values()) == len(events)
     assert m["kafka_offsets"]["0"]["min"] == 100
@@ -174,7 +174,7 @@ def _v3(
 def test_v3_pacing_section_records_settings_bands_and_measurements() -> None:
     m, plan = _v3(pace="realtime", time_scale=10.0, late_too_late_share=0.5,
                   assumed_watermark_s=20.0)
-    assert m["manifest_version"] == 3
+    assert m["manifest_version"] == 4
     assert m["pacing"] == {
         "mode": "realtime",
         "time_scale": 10.0,
