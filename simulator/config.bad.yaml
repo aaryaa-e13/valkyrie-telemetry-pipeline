@@ -1,0 +1,20 @@
+# smoke-bad (Phase 3 slice 2, DECISIONS D3.7): a backfill run in which about 20 % of the
+# events get exactly one fault (simulator/corrupt.py), plus every event of one whole match
+# gets region "SEA" (new_region). e2e.smoke_bad always passes a fresh --seed that covers
+# every gate (dry-run seed search). About 240 events (8 matches x ~30). Everything not
+# listed here uses the SimulatorConfig defaults (= config.yaml).
+seed: 42
+num_matches: 8
+players_per_team: 3
+kills_per_match_min: 4
+kills_per_match_max: 10
+items_per_player_min: 1
+items_per_player_max: 4
+match_duration_s_min: 60     # short timeline (~3 min): back-to-back runs stay on time
+match_duration_s_max: 120
+match_interval_s: 5
+
+pace: backfill
+late_fraction: 0.0
+bad_fraction: 0.2
+bad_kinds: []                # every kind

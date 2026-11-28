@@ -21,6 +21,7 @@ from typing import Any
 
 import yaml
 
+from simulator import corrupt
 from simulator.catalog import CHAMPIONS
 from simulator.schedule import LatenessConfig
 
@@ -72,6 +73,10 @@ class SimulatorConfig:
     late_too_late_share: float = 0.2    # share of the late events in the "very" band
     assumed_watermark_s: float = 60.0   # = the silver job's WATERMARK_DELAY_S (D2.4)
 
+    # Deliberate bad data (Phase 3 slice 2, simulator/corrupt.py); 0 = off
+    bad_fraction: float = 0.0           # share of events that get one fault
+    bad_kinds: tuple[str, ...] = ()     # enabled fault kinds; empty = every kind
+
     # Output
     manifest_dir: str = "manifests"
     manifest_include_event_ids: bool = True
@@ -114,10 +119,27 @@ class SimulatorConfig:
             errors.append(str(exc))
         if not self.regions:
             errors.append("regions must not be empty")
+        if not 0.0 <= self.bad_fraction <= 1.0:
+            errors.append("bad_fraction must be in [0, 1]")
+        try:
+            corrupt.check_kinds(self.bad_kinds)        # checked even when bad mode is off
+            kinds = self.enabled_bad_kinds()
+        except ValueError as exc:
+            errors.append(str(exc))
+        else:
+            if "new_region" in kinds and corrupt.NEW_REGION in self.regions:
+                errors.append(f"bad kind new_region needs a region that is not in regions "
+                              f"({corrupt.NEW_REGION!r} is)")
         if self.start_time is not None and self.start_time.tzinfo is None:
             errors.append("start_time must include a timezone, e.g. 2026-11-14T12:00:00Z")
         if errors:
             raise ValueError("invalid simulator config: " + "; ".join(errors))
+
+    def enabled_bad_kinds(self) -> tuple[str, ...]:
+        """The bad-data kinds in effect (KINDS order); () when bad_fraction is 0."""
+        if self.bad_fraction == 0.0:
+            return ()
+        return corrupt.check_kinds(self.bad_kinds or corrupt.KINDS)
 
     def lateness(self) -> LatenessConfig:
         """The lateness settings in the form simulator.schedule expects."""

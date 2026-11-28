@@ -35,6 +35,10 @@ late_too_late_share: 0.2     # of the late events, the share that is VERY late
 assumed_watermark_s: 60      # = the silver job's WATERMARK_DELAY_S (D2.4).
                              # slightly late = 0.1-0.5 x W, very late = 2-3 x W
 
+# --- Deliberate bad data (simulator/corrupt.py, DECISIONS D3.7). 0 = off. ---
+bad_fraction: 0.0            # share of events that get exactly one fault
+bad_kinds: []                # enabled kinds; empty = every kind (see corrupt.KINDS)
+
 # --- Output ---
 manifest_dir: manifests
 manifest_include_event_ids: true
