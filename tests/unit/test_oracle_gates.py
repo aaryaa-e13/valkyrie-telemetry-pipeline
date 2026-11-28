@@ -13,10 +13,10 @@ from pathlib import Path
 import pytest
 
 from simulator import corrupt
-from simulator.events import EventType, GameEvent
+from simulator.events import GameEvent
 from streaming import gates
 from streaming import oracle_gates as og
-from tests.gates_corpus import CORPUS, raw
+from tests.gates_corpus import CORPUS, corrupt_cases, corrupt_events, raw
 
 NOW = datetime.now(UTC)
 TOPIC = "game-events"
@@ -69,44 +69,16 @@ def test_the_rule_data_matches_the_job_and_the_simulator() -> None:
 
 # --- three-way test, part 1: corrupt.py's prediction == verify's gates ------------------
 
+MATCH_START = datetime(2026, 11, 27, 10, 0, 0, tzinfo=UTC)
+INGEST = datetime(2026, 11, 27, 10, 0, 31, tzinfo=UTC)      # a backfill ingest time
+
+
 def _events() -> list[GameEvent]:
-    t = datetime(2026, 11, 27, 10, 0, 30, 250000, tzinfo=UTC)
-    per = {
-        "match_start": {},
-        "champion_pick": dict(player_id="p_000001", champion_id="ch_a", team="blue"),
-        "kill": dict(player_id="p_000001", champion_id="ch_a", victim_id="p_000002"),
-        "item_purchase": dict(player_id="p_000001", champion_id="ch_a", item_id="it_x",
-                              gold=850),
-        "match_end": dict(winning_team="red", duration_s=95),
-    }
-    return [GameEvent(event_id=f"e-{k}", event_type=EventType(k), event_time=t,
-                      match_id="m-1", match_seq=i + 2, patch_version="14.3", region="EUW",
-                      **kw) for i, (k, kw) in enumerate(per.items())]
+    return corrupt_events(MATCH_START + timedelta(seconds=30, milliseconds=250))
 
 
 def all_cases() -> list[tuple[GameEvent, corrupt.Choice]]:
-    """Every kind x every type it applies to x every field / variant it can pick."""
-    out = []
-    for e in _events():
-        t = e.event_type.value
-        for kind in corrupt.KINDS:
-            if t not in corrupt.APPLIES_TO[kind]:
-                continue
-            options = corrupt.field_options(kind, t) or (None,)
-            for opt in options:
-                if kind == "wrong_type":
-                    c = corrupt.Choice(kind, variant=opt,
-                                       field="match_seq" if opt == "envelope" else "gold")
-                elif kind == "new_region":
-                    c = corrupt.Choice(kind, field="region")
-                else:
-                    c = corrupt.Choice(kind, field=opt)
-                out.append((e, c))
-    return out
-
-
-MATCH_START = datetime(2026, 11, 27, 10, 0, 0, tzinfo=UTC)
-INGEST = datetime(2026, 11, 27, 10, 0, 31, tzinfo=UTC)      # a backfill ingest time
+    return corrupt_cases(_events())
 
 
 def test_three_way_part1_every_kind_and_variant() -> None:

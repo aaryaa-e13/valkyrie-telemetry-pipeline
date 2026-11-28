@@ -124,3 +124,66 @@ def test_r10_without_ids_or_offsets_is_never_a_pass() -> None:
     assert v == {"R10a": "not checkable: the manifest lists no event ids",
                  "R10b": "not checkable: the manifest has no kafka_offsets (v1)"}
     assert len(notes) == 2 and all(" not checkable: " in n for n in notes)
+
+
+# --- slice 2: R10c, R10d, R11, R14 ---------------------------------------------------------
+
+R10C_OK = {"checkable": True, "expected": 5, "missing": 0, "wrong_reason": 0,
+           "wrong_key_kind": 0, "examples": []}
+
+
+def test_r10c_pass_fail_and_not_checkable() -> None:
+    assert od.r10c_verdict(R10C_OK) == ("PASS", [])
+    for k in ("missing", "wrong_reason", "wrong_key_kind"):
+        v, notes = od.r10c_verdict({**R10C_OK, k: 1})
+        assert v == "FAIL" and notes[0].startswith("R10c: of 5 expected"), k
+    v, notes = od.r10c_verdict({"checkable": False, "reason": "no DLQ table to look in"})
+    assert v == "not checkable: no DLQ table to look in" and notes[0].startswith("R10c not")
+
+
+def test_r10d_null_flags_are_not_checkable_never_pass() -> None:
+    ok = {"rows_checked": 9, "mismatched": 0, "null_flags": 0, "examples": []}
+    assert od.r10d_verdict(ok) == ("PASS", [])
+    assert od.r10d_verdict({**ok, "mismatched": 2})[0] == "FAIL"
+    assert od.r10d_verdict({**ok, "null_flags": 1})[0].startswith("not checkable")
+    assert od.r10d_verdict({"checkable": False, "reason": "x"})[0] == "not checkable: x"
+
+
+def test_r11_compare_counts_each_kind_of_disagreement() -> None:
+    rec = {"id:a": ("bad_enum", ("bad_enum",), 1), "id:b": ("bad_patch_format",
+                                                           ("bad_patch_format",), 1)}
+    act = {"id:a": ("bad_enum", ("bad_enum",), 1), "id:c": ("bad_enum", ("bad_enum",), 1)}
+    c = od.r11_compare(rec, act, {"e": (), "f": ("future_event_time",), "g": ()},
+                        {"e": None, "f": (), "h": ()})
+    assert {k: v for k, v in c.items() if k != "examples"} == {
+        "dlq_missing": 1, "dlq_extra": 1, "dlq_differ": 0, "accepted_missing": 1,
+        "accepted_extra": 1, "flags_differ": 2}
+    same = od.r11_compare(rec, rec, {"e": ()}, {"e": ()})
+    assert not any(v for k, v in same.items() if k != "examples")
+    assert od.r11_compare(rec, {**rec, "id:a": ("bad_enum", ("bad_enum", "x"), 1)},
+                           {}, {})["dlq_differ"] == 1          # reasons are compared too
+
+
+def test_r11_verdict() -> None:
+    clean = od.r11_compare({}, {}, {}, {})
+    assert od.r11_verdict({"checkable": True, "compare": clean}) == ("PASS", [])
+    bad = od.r11_compare({"id:a": ("h", (), 1)}, {}, {}, {})
+    v, notes = od.r11_verdict({"checkable": True, "compare": bad})
+    assert v == "FAIL" and "dlq_missing 1" in notes[0]
+    assert od.r11_verdict({"checkable": False, "reason": "mixed"})[0] == "not checkable: mixed"
+
+
+@pytest.mark.parametrize("ids,counter,verdict,agree", [
+    (0, 0, "PASS", None),
+    (1, 1, "FAIL", "agree"),
+    (1, 0, "FAIL", "DISAGREE"),
+    (0, 2, "FAIL", "DISAGREE"),
+])
+def test_r14_verdict(ids: int, counter: int, verdict: str, agree: str | None) -> None:
+    v, notes = od.r14_verdict({"checkable": True, "stranded_ids": ids,
+                                "stranded_copies": ids, "counter_dup_of_dlq": counter,
+                                "examples": ["x"][:ids]})
+    assert v == verdict
+    if agree:
+        assert notes[0].startswith("R14:") and agree in notes[0]
+    assert od.r14_verdict({"checkable": False, "reason": "r"})[0] == "not checkable: r"

@@ -180,3 +180,102 @@ def r10_verdicts(r10: Mapping[str, Any]) -> tuple[dict[str, str], list[str]]:
     else:
         verdicts["R10b"] = "PASS"
     return verdicts, notes
+
+
+# --- slice 2: R10c, R10d, R11, R14 (pure verdicts; verify_manifest does the reads) ------
+#
+#   R10c  every rejection the manifest expects (v4 bad_data) is in the DLQ under the
+#         expected dlq_key (id:<id> or off:<topic>/<p>/<offset>) with the expected
+#         reason_code. A missing row, a wrong reason or a wrong key kind -> FAIL.
+#   R10d  the flags the manifest expects == the quality_flags on the run's S ∪ L rows:
+#         a flagged event carries exactly its flag, every other run row carries none.
+#   R11   verify's own gates (streaming/oracle_gates.py) on the run's bronze rows give
+#         exactly the run's DLQ rows (dlq_key, reason_code, reasons, rules_version) and
+#         exactly the flags on the run's S ∪ L rows.
+#   R14   stranded valid copy (addendum A): a keyed D_open id with a consumed bronze copy
+#         that passes every hard rule (verify's gates, the DLQ row's rules version), or
+#         sum(dup_of_dlq + late_dup_of_dlq) > 0 over Phase 3 batches -> FAIL.
+# "Not checkable" is never a PASS.
+
+
+def r10c_verdict(r: Mapping[str, Any]) -> tuple[str, list[str]]:
+    """R10c from verify's counts: expected, missing, wrong_reason, wrong_key_kind."""
+    if not r.get("checkable", True):
+        return f"not checkable: {r.get('reason')}", [f"R10c not checkable: {r.get('reason')}"]
+    bad = {k: int(r[k]) for k in ("missing", "wrong_reason", "wrong_key_kind")}
+    if any(bad.values()):
+        return "FAIL", [f"R10c: of {r['expected']} expected rejections, {bad['missing']} are "
+                        f"not in the DLQ ({bad['wrong_key_kind']} of them under the other key "
+                        f"kind) and {bad['wrong_reason']} have another reason_code: "
+                        f"{r.get('examples')}"]
+    return "PASS", []
+
+
+def r10d_verdict(r: Mapping[str, Any]) -> tuple[str, list[str]]:
+    """R10d from verify's counts: rows_checked, mismatched, null_flags."""
+    if not r.get("checkable", True):
+        return f"not checkable: {r.get('reason')}", [f"R10d not checkable: {r.get('reason')}"]
+    if int(r.get("null_flags") or 0) > 0:
+        reason = f"{r['null_flags']} run rows have quality_flags NULL (written before Phase 3)"
+        return f"not checkable: {reason}", [f"R10d not checkable: {reason}"]
+    if int(r["mismatched"]) > 0:
+        return "FAIL", [f"R10d: {r['mismatched']} of the run's {r['rows_checked']} S ∪ L rows "
+                        f"carry other flags than the manifest expects: {r.get('examples')}"]
+    return "PASS", []
+
+
+def r11_compare(recomputed_dlq: Mapping[str, tuple], actual_dlq: Mapping[str, tuple],
+                recomputed_flags: Mapping[str, tuple[str, ...]],
+                actual_flags: Mapping[str, tuple[str, ...] | None]) -> dict[str, Any]:
+    """Compare verify's recompute with the job's tables (R11).
+
+    recomputed_dlq / actual_dlq: dlq_key -> (reason_code, reasons tuple, rules_version).
+    recomputed_flags: event_id -> flags, for the rows verify's gates accept.
+    actual_flags: event_id -> flags (None = NULL) of the run's rows in S ∪ L.
+    """
+    missing = sorted(set(recomputed_dlq) - set(actual_dlq))
+    extra = sorted(set(actual_dlq) - set(recomputed_dlq))
+    differ = sorted(k for k in set(recomputed_dlq) & set(actual_dlq)
+                    if tuple(recomputed_dlq[k]) != tuple(actual_dlq[k]))
+    not_accepted = sorted(set(recomputed_flags) - set(actual_flags))
+    not_expected = sorted(set(actual_flags) - set(recomputed_flags))
+    flag_differ = sorted(e for e in set(recomputed_flags) & set(actual_flags)
+                         if actual_flags[e] is None
+                         or tuple(actual_flags[e] or ()) != tuple(recomputed_flags[e]))
+    examples = [*(f"{k}: recompute {recomputed_dlq[k]}, not in DLQ" for k in missing),
+                *(f"{k}: in DLQ {actual_dlq[k]}, recompute accepts it" for k in extra),
+                *(f"{k}: recompute {recomputed_dlq[k]} != DLQ {actual_dlq[k]}" for k in differ),
+                *(f"{e}: recompute accepts it, not in S ∪ L" for e in not_accepted),
+                *(f"{e}: in S ∪ L, recompute rejects it" for e in not_expected),
+                *(f"{e}: flags {actual_flags[e]} != recompute {recomputed_flags[e]}"
+                  for e in flag_differ)][:MAX_EXAMPLES]
+    return {"dlq_missing": len(missing), "dlq_extra": len(extra), "dlq_differ": len(differ),
+            "accepted_missing": len(not_accepted), "accepted_extra": len(not_expected),
+            "flags_differ": len(flag_differ), "examples": examples}
+
+
+def r11_verdict(r: Mapping[str, Any]) -> tuple[str, list[str]]:
+    if not r.get("checkable"):
+        return f"not checkable: {r.get('reason')}", [f"R11 not checkable: {r.get('reason')}"]
+    c = r["compare"]
+    keys = ("dlq_missing", "dlq_extra", "dlq_differ", "accepted_missing", "accepted_extra",
+            "flags_differ")
+    if any(int(c[k]) for k in keys):
+        return "FAIL", ["R11: verify's own gates disagree with the job on the run's rows ("
+                        + ", ".join(f"{k} {c[k]}" for k in keys) + f"): {c['examples']}"]
+    return "PASS", []
+
+
+def r14_verdict(r: Mapping[str, Any]) -> tuple[str, list[str]]:
+    """R14 from verify's counts: stranded ids/copies (bronze scan) and the job's counters."""
+    if not r.get("checkable"):
+        return f"not checkable: {r.get('reason')}", [f"R14 not checkable: {r.get('reason')}"]
+    ids, counter = int(r["stranded_ids"]), int(r["counter_dup_of_dlq"])
+    if ids == 0 and counter == 0:
+        return "PASS", []
+    agree = "the two signals agree" if (ids > 0) == (counter > 0) else \
+        "the two signals DISAGREE (a bug in the job's counters or in verify)"
+    return "FAIL", [f"R14: {ids} D_open ids have {r['stranded_copies']} consumed bronze "
+                    f"copies that pass every hard rule, and the job counted "
+                    f"dup_of_dlq + late_dup_of_dlq = {counter}; {agree}: valid events "
+                    f"stranded in the DLQ (D3.1): {r.get('examples')}"]

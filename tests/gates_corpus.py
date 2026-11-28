@@ -13,6 +13,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from simulator import corrupt
 from simulator.events import EventType, GameEvent
 
 T0 = datetime(2026, 11, 19, 12, 0, 0, tzinfo=UTC)
@@ -138,3 +139,40 @@ CORPUS: list[tuple[int, Any, bool, str | None, list[str], list[str]]] = [
      []),                                       # a number in a string field is its text
 ]
 
+
+# --- every corrupt.py kind on every type it applies to (three-way test) -------------------
+
+def corrupt_events(t: datetime) -> list[GameEvent]:
+    """One valid event of each type at time t (match m-1), for the corrupt.py cases."""
+    per = {
+        "match_start": {},
+        "champion_pick": dict(player_id="p_000001", champion_id="ch_a", team="blue"),
+        "kill": dict(player_id="p_000001", champion_id="ch_a", victim_id="p_000002"),
+        "item_purchase": dict(player_id="p_000001", champion_id="ch_a", item_id="it_x",
+                              gold=850),
+        "match_end": dict(winning_team="red", duration_s=95),
+    }
+    return [GameEvent(event_id=f"e-{k}", event_type=EventType(k), event_time=t,
+                      match_id="m-1", match_seq=i + 2, patch_version="14.3", region="EUW",
+                      **kw) for i, (k, kw) in enumerate(per.items())]
+
+
+def corrupt_cases(events: list[GameEvent]) -> list[tuple[GameEvent, corrupt.Choice]]:
+    """Every kind x every type it applies to x every field / variant it can pick."""
+    out = []
+    for e in events:
+        t = e.event_type.value
+        for kind in corrupt.KINDS:
+            if t not in corrupt.APPLIES_TO[kind]:
+                continue
+            options = corrupt.field_options(kind, t) or (None,)
+            for opt in options:
+                if kind == "wrong_type":
+                    c = corrupt.Choice(kind, variant=opt,
+                                       field="match_seq" if opt == "envelope" else "gold")
+                elif kind == "new_region":
+                    c = corrupt.Choice(kind, field="region")
+                else:
+                    c = corrupt.Choice(kind, field=opt)
+                out.append((e, c))
+    return out

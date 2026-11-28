@@ -171,3 +171,13 @@ def test_real_manifest_fixtures_of_every_version_verify(spark, tmp_path: Path, n
     assert report["expected_unique_ids"] == len(ids) == raw["totals"]["events_delivered"]
     assert (report["missing_ids"], report["duplicate_rows"]) == (0, 0)
     assert evaluate(report, fail_on_duplicates=True)[0] == "PASS"
+
+
+def test_main_refuses_a_v4_manifest_without_its_bad_event_list(tmp_path: Path) -> None:
+    """Bad events were sent but not listed (the cap): R1, R2, R10 and R11 cannot be
+    judged, so verify refuses (exit 2) before starting a JVM."""
+    m = json.loads(Path("tests/fixtures/bad_run.json").read_text(encoding="utf-8"))["manifest"]
+    m["bad_data"].update(bad_events=None, bad_events_omitted_reason="too_many_bad_events")
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps(m), encoding="utf-8")
+    assert main(["--manifest", str(path)]) == 2

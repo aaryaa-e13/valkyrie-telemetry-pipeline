@@ -79,7 +79,8 @@ def test_verify_r8_r9_and_good_data_rejected(spark: SparkSession, tmp_path: Path
     dl, cons = rep["dlq"], rep["consistency"]
     # Manifest v1 has no kafka_offsets: R10b is not checkable (never a PASS).
     assert dl["verdicts"] == {"R8": "PASS", "R9": "PASS", "R10a": "PASS",
-                              "R10b": "not checkable: the manifest has no kafka_offsets (v1)"}
+                              "R10b": "not checkable: the manifest has no kafka_offsets (v1)",
+                              "R10c": "PASS", "R10d": "PASS", "R11": "PASS", "R14": "PASS"}
 
     assert (dl["phase3_batches"], dl["dlq_rows_for_run"], dl["dlq_total_rows"]) == (1, 0, 2)
     assert dl["versions_after_cut"] == {"silver": 0, "late": 0, "dlq": 0, "resolutions": 0}
