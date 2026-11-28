@@ -1807,3 +1807,31 @@ Built as planned (plan sections 1-2, addenda A and B). The choices made while bu
     checks PASS, 0 DLQ rows.
   - By the rule: no more tuning. Known limit in WHAT_BROKE. The heap change is committed,
     because correctness passed.
+
+### D3.7 Slice 2: bad-data mode, manifest v4, R10c/R10d/R11/R14 (2026-11-28)
+Plan `docs/plans/phase3-slice2-plan.md`, approved with these decisions:
+- **Q1 A:** R11 and R14 use verify's own gate code, `streaming/oracle_gates.py`. It is
+  standard-library Python that re-parses `raw_value`. It imports nothing from the job
+  (`gates.py`, `silver.py`, `schemas.py`), so a bug in the job's parser or rules shows up
+  as an R11 FAIL.
+- **Q2:** piece 3 of the smoke-bad evidence (control `reject_counts` / `flag_counts`) is
+  "not checkable" (exit 2), never PASS, when other producers' rows share the run's batches.
+- **Q3:** `wrong_type` is one kind with two variants: `envelope` (`match_seq: "abc"`,
+  keyless) and `field` (`gold: "100"`, keyed). The coverage search needs both.
+- **Q4:** `new_region` corrupts exactly one whole match per run (the smallest
+  `sha256(f"{seed}:region:{match_id}")`).
+- **Q5:** the live runs are 3 × `make smoke-bad` and then 1 × `make smoke` (about 735 events).
+- **Q6:** the tamper sets derived in plan section 4 are the expectation. Any difference is
+  reported, never bent to fit.
+
+**Three conditions added at approval (fixed before any code):**
+1. **The watermark must ignore bad rows.** A Spark test feeds the same batches twice:
+   once with good rows only, once with the good rows plus DLQ'd (`epoch_time`) and
+   flagged (`future_time`) rows. `m_k` (`batch_max_clamped_event_time`) and the watermark
+   must be equal in both. If the test fails, that is stream code: STOP and report. No
+   stream change in this slice.
+2. **No verdict on the heap line.** The heap line (≤ 1.6 GiB) cannot fire while the job
+   runs with `-Xmx1536m` (D3.6), so the heap peak is reported with no verdict.
+3. **Growth is compared within one target only.** Report the container-peak growth for
+   smoke-bad runs 1 → 2 → 3, with no verdict. Run 4 is a different target (`make smoke`),
+   so 3 → 4 cannot be judged. This replaces plan section 9.3's "growth for run 3 → 4".
