@@ -6,7 +6,6 @@ Split out of test_dlq.py so its tests can run in three JVMs (D3.5, test memory l
 from __future__ import annotations
 
 import contextlib
-import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -17,7 +16,6 @@ pytest.importorskip("pyspark")
 
 from pyspark.sql import DataFrame, SparkSession  # noqa: E402
 
-from simulator.events import EventType, GameEvent  # noqa: E402
 from streaming import dlq  # noqa: E402
 from streaming import oracle_dlq as od  # noqa: E402
 from streaming.bronze import bronze_schema, ensure_bronze_table, to_raw_rows  # noqa: E402
@@ -25,11 +23,11 @@ from streaming.config import SilverJobConfig  # noqa: E402
 from streaming.silver import (  # noqa: E402
     ensure_silver_tables,
 )
+from tests.gates_corpus import DROP, T0, ev, raw  # noqa: E402,F401 (re-exported)
 
 KAFKA_SCHEMA = (
     "key binary, value binary, topic string, partition int, offset long, timestamp timestamp"
 )
-T0 = datetime(2026, 11, 19, 12, 0, 0, tzinfo=UTC)
 TOPIC = "game-events"
 fast = pytest.mark.spark_fast
 # Control fields that legitimately differ per attempt (D2.4 C2 + Phase 3 plan 2.5).
@@ -39,41 +37,6 @@ ATTEMPT_FIELDS = {
     "dlq_keyless_already_present", "dlq_keyed_inserted_this_attempt",
     "dlq_keyed_already_present", "late_already_present", "ontime_already_present",
     "dlq_ms", "d_open_read_ms", "cut_ms"}
-
-
-# --- event builders -------------------------------------------------------------------
-
-def ev(event_id: str | None = "e", when: datetime = T0, kind: str = "item_purchase",
-       **change: Any) -> dict[str, Any]:
-    """A valid simulator event as a dict; `change` overrides fields (DROP removes one)."""
-    base = dict(event_id="x" if event_id is None else event_id, event_time=when,
-                match_id="m-1", match_seq=1, patch_version="14.3", region="EUW")
-    per = {
-        "item_purchase": dict(event_type=EventType.ITEM_PURCHASE, player_id="p_000001",
-                              champion_id="ch_quillon", item_id="it_stormglass", gold=100),
-        "kill": dict(event_type=EventType.KILL, player_id="p_000001", champion_id="ch_quillon",
-                     victim_id="p_000002"),
-        "champion_pick": dict(event_type=EventType.CHAMPION_PICK, player_id="p_000001",
-                              champion_id="ch_quillon", team="blue"),
-        "match_end": dict(event_type=EventType.MATCH_END, winning_team="red", duration_s=1500),
-        "match_start": dict(event_type=EventType.MATCH_START),
-    }[kind]
-    d = GameEvent(**base, **per).to_dict()
-    if event_id is None:
-        d.pop("event_id")
-    for k, v in change.items():
-        if v is DROP:
-            d.pop(k, None)
-        else:
-            d[k] = v
-    return d
-
-
-DROP = object()
-
-
-def raw(d: dict[str, Any] | str) -> bytes:
-    return (d if isinstance(d, str) else json.dumps(d)).encode("utf-8")
 
 
 Msg = tuple[int, "dict[str, Any] | str"]          # (offset, event dict or raw text)

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -29,8 +29,8 @@ from streaming.silver import (  # noqa: E402
     process_batch,
     with_gates,
 )
+from tests.gates_corpus import CORPUS  # noqa: E402 (moved there in slice 2)
 from tests.spark.dlq_helpers import (  # noqa: E402
-    DROP,
     T0,
     _check_disjoint,
     _check_r8,
@@ -46,59 +46,7 @@ from tests.spark.dlq_helpers import (  # noqa: E402
     raw,
 )
 
-# --- 1. the gate corpus (fast, no table) -------------------------------------------------
-
-FUTURE = datetime.now(UTC) + timedelta(days=2)
-# (offset, message, keyed, reason_code, reasons, flags)
-CORPUS: list[tuple[int, Any, bool, str | None, list[str], list[str]]] = [
-    (1, ev("good"), True, None, [], []),
-    (2, ev("g-start", kind="match_start"), True, None, [], []),
-    (3, ev("g-end", kind="match_end"), True, None, [], []),
-    (4, ev("g-pick", kind="champion_pick"), True, None, [], []),
-    (5, ev("g-kill", kind="kill"), True, None, [], []),
-    (10, "{not json", False, "not_json", ["not_json", "missing_event_id", "bad_event_time",
-                                         "missing_required_field"], []),
-    (11, "[1, 2]", False, "not_json", ["not_json", "missing_event_id", "bad_event_time",
-                                      "missing_required_field"], []),
-    (12, ev(None), False, "missing_event_id", ["missing_event_id"], []),
-    (13, ev(""), False, "missing_event_id", ["missing_event_id"], []),
-    (14, ev("   "), False, "missing_event_id", ["missing_event_id"], []),
-    (15, ev("h3", event_time="yesterday"), False, "bad_event_time", ["bad_event_time"], []),
-    (16, ev("h4", event_time="1970-01-01T00:00:01.000Z"), True, "event_time_implausible",
-     ["event_time_implausible"], []),
-    (17, ev("h5", event_type="teleport"), True, "unknown_event_type",
-     ["unknown_event_type"], []),
-    (18, ev("h6", schema_version=99), True, "unsupported_schema_version",
-     ["unsupported_schema_version"], []),
-    (19, ev("h7a", match_id=DROP), False, "missing_required_field",
-     ["missing_required_field"], []),           # envelope field absent: parse_ok false
-    (20, ev("h7b", player_id=None), True, "missing_required_field",
-     ["missing_required_field"], []),
-    (21, ev("h7c", champion_id=""), True, "missing_required_field",
-     ["missing_required_field"], []),
-    (22, ev("h7d", region=DROP), True, "missing_required_field",
-     ["missing_required_field"], []),           # not a parse_ok field: still keyed
-    (23, ev("h7e", schema_version="abc"), False, "missing_required_field",
-     ["missing_required_field"], []),           # wrong type nulls only that field (P1)
-    (24, ev("h7f", event_type=None), False, "missing_required_field",
-     ["missing_required_field"], []),           # NULL type is H7, never H5
-    (25, ev("h8", patch_version="14"), True, "bad_patch_format", ["bad_patch_format"], []),
-    (26, ev("h9a", region="SEA"), True, "bad_enum", ["bad_enum"], []),
-    (27, ev("h9b", kind="champion_pick", team="green"), True, "bad_enum", ["bad_enum"], []),
-    (28, ev("h9c", kind="match_end", winning_team="none"), True, "bad_enum", ["bad_enum"], []),
-    (29, ev("h10a", gold=-5), True, "out_of_range", ["out_of_range"], []),
-    (30, ev("h10b", gold=0), True, "out_of_range", ["out_of_range"], []),
-    (31, ev("h10c", match_seq=0), True, "out_of_range", ["out_of_range"], []),
-    (32, ev("multi", event_time="1970-01-01T00:00:01.000Z", region="XX"), True,
-     "event_time_implausible", ["event_time_implausible", "bad_enum"], []),
-    (40, ev("s1", when=FUTURE), True, None, [], ["future_event_time"]),
-    (41, ev("s2", kind="kill", victim_id="p_000001"), True, None, [], ["self_kill"]),
-    (42, ev("s3", player_id="0"), True, None, [], ["player_id_sentinel"]),
-    (43, ev("s4", kind="kill", gold=50), True, None, [], ["unexpected_field"]),
-    (44, ev("s34", player_id="0", item_id="it_x", team="blue"), True, None, [],
-     ["player_id_sentinel", "unexpected_field"]),
-]
-
+# --- 1. the gate corpus (fast, no table; the corpus is tests/gates_corpus.py) -----------
 
 @fast
 @pytest.mark.parametrize("version", [1, 2])
