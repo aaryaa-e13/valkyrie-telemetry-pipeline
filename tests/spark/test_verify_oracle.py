@@ -48,6 +48,7 @@ KAFKA_SCHEMA = (
 T0 = datetime(2026, 11, 19, 12, 0, 0, tzinfo=UTC)
 S = timedelta(seconds=1)
 MS = timedelta(milliseconds=1)
+_NOW = datetime.now(UTC)          # bronze ingest_time is the write time
 TAIL = ('v1\n{"batchWatermarkMs":0,"batchTimestampMs":0,"conf":{}}\n'
         '{"sourceVersion":1,"reservoirId":"test","reservoirVersion":%d,"index":-1,'
         '"isStartingVersion":false}')
@@ -345,8 +346,10 @@ def test_w_check_not_checkable(spark, tmp_path, lake, manifest, reason: str) -> 
     (("f-fut", T0 + timedelta(days=1), T0), False, -60_000),
     # ... and an unparsable (keyless) row never counts.
     ((None, T0, T0 + timedelta(days=1)), True, (timedelta(days=1) - 60 * S) // MS),
+    # D3.7: event_time > ingest_time (now) + 5 min never counts, whatever its Kafka time.
+    (("f-s1", _NOW + timedelta(days=1), _NOW), True, (timedelta(days=1) - 60 * S) // MS),
 ], ids=["at-boundary", "1ms-below", "null-kafka-time", "clamped-below", "clamped-above",
-        "keyless"])
+        "keyless", "past-s1-tolerance"])
 def test_isolation_uses_the_jobs_clamp(spark, tmp_path, lake, row, isolated: bool,
                                        margin_ms: int) -> None:
     eid, t, k = row

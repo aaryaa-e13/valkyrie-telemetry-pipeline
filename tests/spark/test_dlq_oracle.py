@@ -34,6 +34,7 @@ from streaming.config import SilverJobConfig  # noqa: E402
 from streaming.silver import (  # noqa: E402
     REASON,
     REASONS,
+    beyond_future_tolerance,
     key_ok,
     prepare_silver,
     process_batch,
@@ -124,8 +125,8 @@ def test_three_way_part2_the_jobs_gates_on_corrupted_bytes(spark: SparkSession) 
         msgs.append((i, value, now, e.key))
         by_off[i] = (e, c, value)
     df = with_gates(kafka_df(spark, msgs), corrupt.RULES_VERSION_EXPECTED) \
-        .withColumn("_keyed", key_ok())
-    rows = df.select("kafka_offset", "_keyed", REASON, REASONS, "quality_flags",
+        .withColumn("_keyed", key_ok()).withColumn("_beyond", beyond_future_tolerance())
+    rows = df.select("kafka_offset", "_keyed", REASON, REASONS, "quality_flags", "_beyond",
                      F.unix_micros("ingest_time").alias("ing")).collect()
     assert len(rows) == len(cases) and {c.kind for _, c in cases} == set(corrupt.KINDS)
     for r in rows:
@@ -137,6 +138,8 @@ def test_three_way_part2_the_jobs_gates_on_corrupted_bytes(spark: SparkSession) 
                          ingest_time=EPOCH + timedelta(microseconds=r["ing"]),
                          rules_version=corrupt.RULES_VERSION_EXPECTED)
         assert job == (ov.keyed, ov.reason_code, ov.reasons, ov.flags), (label, job, ov)
+        # D3.7: the m_k exclusion is exactly the S1 condition (flag computed or not)
+        assert r["_beyond"] == ("future_event_time" in r["quality_flags"]), label
         if x.cls == "dlq":
             assert (r[REASON], r["_keyed"]) == (x.code, x.key_kind == "id"), (label, job)
         else:
@@ -157,24 +160,65 @@ def test_dlq_and_flagged_rows_do_not_change_m_k_or_the_watermark(
     n = len(msgs)
     chunks = [msgs[k * n // 3:(k + 1) * n // 3] for k in range(3)]
 
-    def run(name: str, with_bad: bool) -> list[dict[str, Any]]:
+    def run(name: str, with_bad: bool) -> tuple[list[dict[str, Any]], SilverJobConfig]:
         scfg = _ready(spark, tmp_path / name, tail_offsets)
         return [process_batch(fixture_df(spark, [m for m in c if with_bad or not m["bad_kind"]],
                                          pace), b, scfg, "q")
-                for b, c in enumerate(chunks, start=1)]         # batches 1-3: not snapshot
+                for b, c in enumerate(chunks, start=1)], scfg   # batches 1-3: not snapshot
 
-    good, mixed = run("good", False), run("mixed", True)
+    (good, gcfg), (mixed, mcfg) = run("good", False), run("mixed", True)
+    good_ids = {m["event_id"] for m in msgs if m["bad_kind"] is None}
+    late_good = {r["event_id"] for r in _load(spark, gcfg.late_path)}
+    late_mixed = {r["event_id"] for r in _load(spark, mcfg.late_path)}
     per_batch = [{"batch": g["batch_id"],
                   "bad": sorted(m["bad_kind"] for m in c if m["bad_kind"]),
                   "m_k good": g["batch_max_clamped_event_time"],
                   "m_k mixed": x["batch_max_clamped_event_time"],
-                  "wm good": g["watermark_used"], "wm mixed": x["watermark_used"]}
+                  "wm good": g["watermark_used"], "wm mixed": x["watermark_used"],
+                  "late good": g["late_rows"], "late mixed": x["late_rows"]}
                  for g, x, c in zip(good, mixed, chunks, strict=True)]
     print(json.dumps(per_batch, default=str, indent=1))          # the evidence, either way
     assert sum(x["rejected_rows"] for x in mixed) == sum(
         1 for m in msgs if m["bad_kind"] == "epoch_time")
     assert [(x["batch_max_clamped_event_time"], x["watermark_used"]) for x in mixed] == [
         (g["batch_max_clamped_event_time"], g["watermark_used"]) for g in good], per_batch
+    # The same good rows are routed to late (D3.7 decision); no bad row is late.
+    assert late_good <= good_ids and late_mixed == late_good, (late_good, late_mixed)
+    good_s = {r["event_id"] for r in _load(spark, gcfg.table_path)}
+    mixed_s = {r["event_id"] for r in _load(spark, mcfg.table_path)}
+    assert mixed_s & good_ids == good_s
+
+
+@pytest.mark.parametrize(("ahead", "counts"), [
+    (timedelta(minutes=5), True),                                   # == tolerance: counts
+    (timedelta(minutes=5, milliseconds=1), False),                  # past it: never
+], ids=["at-tolerance", "1ms-past"])
+@pytest.mark.parametrize("cls", ["accepted", "flagged-other", "rejected"])
+def test_a_row_past_the_s1_tolerance_never_feeds_m_k(
+        spark: SparkSession, tmp_path: Path, tail_offsets: Any, ahead: timedelta,
+        counts: bool, cls: str) -> None:
+    """One good anchor row + one keyed row with event_time = ingest_time + ahead and a
+    Kafka time after that: m_k is the anchor's unless the row is within the tolerance."""
+    ing = datetime(2026, 11, 28, 12, 0, tzinfo=UTC)
+    anchor_t = ing - timedelta(minutes=1)
+    t = ing + ahead
+    change = {"flagged-other": {"victim_id": "p_000001"},           # + S2 self_kill
+              "rejected": {"region": "XX"}}.get(cls, {})
+    kind = "kill" if cls == "flagged-other" else "item_purchase"
+    msgs = [{"offset": 1, "key": "m-1", "event_time": "", "kafka_timestamp": "",
+             "ingest_time": "", "value_b64": base64.b64encode(
+                 json.dumps(ev("anchor", when=anchor_t)).encode()).decode()},
+            {"offset": 2, "key": "m-1", "value_b64": base64.b64encode(json.dumps(
+                ev("x", when=t, kind=kind, **change)).encode()).decode()}]
+    for m, et in zip(msgs, (anchor_t, t), strict=True):
+        m["kafka_timestamp"] = (ing + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] \
+            + "Z"
+        m["ingest_time"] = ing.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        m["event_time"] = et.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    scfg = _ready(spark, tmp_path, tail_offsets)
+    row = process_batch(fixture_df(spark, msgs), 1, scfg, "q")
+    assert row["rejected_rows"] == (1 if cls == "rejected" else 0)
+    assert row["batch_max_clamped_event_time"] == (t if counts else anchor_t)
 
 
 # --- 3. a v4 lake built by the real stream: every rule PASS ---------------------------------

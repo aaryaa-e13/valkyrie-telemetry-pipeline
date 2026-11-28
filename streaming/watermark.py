@@ -3,7 +3,8 @@
 For batch N of the silver query with id q (W = WATERMARK_DELAY_S, fixed per query):
 
     m_k    = max over the KEYED rows of batch k of least(event_time, kafka_timestamp)
-             (rows with a NULL kafka_timestamp do not count). Stored in batch k's
+             (rows with a NULL kafka_timestamp do not count; D3.7: nor rows with
+             event_time > ingest_time + 5 min, the S1 condition). Stored in batch k's
              control row as batch_max_clamped_event_time.
     wm(N)  = -infinity (None)  if batch N STARTS inside the Delta source's initial
                                snapshot: N == 0, or offsets/N-1 says

@@ -44,16 +44,18 @@ from tests.spark.silver_helpers import (  # noqa: E402
 
 @fast
 def test_batch_counts_per_reason_and_bounds_from_keyed_rows_only(spark: SparkSession) -> None:
+    # ingest_time: bronze always sets it (bronze.py); m_k reads it for the D3.7 S1 skip.
     schema = ("parse_ok boolean, event_id string, event_time timestamp, "
-              "kafka_timestamp timestamp")
+              "kafka_timestamp timestamp, ingest_time timestamp")
     late = datetime(2027, 1, 1, tzinfo=UTC)
     k = T0 + timedelta(seconds=1)
     df = spark.createDataFrame([
-        (True, "a", T0, k), (True, "a", T0 + timedelta(seconds=64), k), (True, "b", T0, k),
-        (False, None, None, k),     # unparsed + null id + null time
-        (True, None, late, late),   # null id only (would widen the bounds if counted)
-        (True, "c", None, late),    # null time only
-        (None, "d", late, late),    # parse_ok NULL counts as unparsed
+        (True, "a", T0, k, k), (True, "a", T0 + timedelta(seconds=64), k, k),
+        (True, "b", T0, k, k),
+        (False, None, None, k, k),         # unparsed + null id + null time
+        (True, None, late, late, late),    # null id only (would widen the bounds if counted)
+        (True, "c", None, late, late),     # null time only
+        (None, "d", late, late, late),     # parse_ok NULL counts as unparsed
     ], schema)
     c = batch_counts(df)
     assert (c.rows_in, c.excluded_unparsed, c.excluded_null_event_id,
@@ -75,10 +77,10 @@ def test_non_keyed_copy_with_lower_offset_does_not_hide_the_keyed_copy(
     """
     schema = ("parse_ok boolean, event_id string, event_time timestamp, "
               "kafka_timestamp timestamp, kafka_topic string, kafka_partition int, "
-              "kafka_offset long")
+              "kafka_offset long, ingest_time timestamp")
     k = T0 + timedelta(seconds=1)
-    df = spark.createDataFrame([(True, "x", None, k, "game-events", 0, 0),
-                                (True, "x", T0, k, "game-events", 0, 1)], schema)
+    df = spark.createDataFrame([(True, "x", None, k, "game-events", 0, 0, k),
+                                (True, "x", T0, k, "game-events", 0, 1, k)], schema)
     kept = dedupe_in_batch(df)
     assert [(row.event_id, row.kafka_offset) for row in kept.collect()] == [("x", 1)]
     c = batch_counts(df)

@@ -839,13 +839,21 @@ def _job_key() -> Column:
             & (F.trim(F.col("event_id")) != F.lit("")) & F.col("event_time").isNotNull())
 
 
+FUTURE_TOLERANCE_US = 300 * 1_000_000      # S1 / D1.13, written again (not imported)
+
+
 def _clamped_us(keyed: Column) -> Column:
     """The job's clamp (streaming/silver.py clamped_event_time), written again here:
     least(event_time, kafka_timestamp) for keyed rows WITH a Kafka time, else NULL.
     least() skips NULLs, so without the explicit check a row with no Kafka time
-    would count unclamped; the job never counts it."""
+    would count unclamped; the job never counts it. D3.7: a row whose event_time is
+    more than 5 min after its ingest_time (the S1 condition) never counts either."""
     kts = F.col("kafka_timestamp")
-    return F.when(keyed & kts.isNotNull(), F.unix_micros(F.least(F.col("event_time"), kts)))
+    future = F.coalesce(F.unix_micros(F.col("event_time"))
+                        > F.unix_micros(F.col("ingest_time")) + F.lit(FUTURE_TOLERANCE_US),
+                        F.lit(False))
+    return F.when(keyed & kts.isNotNull() & ~future,
+                  F.unix_micros(F.least(F.col("event_time"), kts)))
 
 
 def _count(cond: Column) -> Column:
@@ -886,7 +894,8 @@ def _r6_tables(silver: DataFrame, late: DataFrame, control: DataFrame) -> dict[s
     b_ex = [r.event_id for r in sj.where(behind).select("event_id").limit(orc.MAX_EXAMPLES)
             .collect()]
     keyed = F.col("event_id").isNotNull() & F.col("event_time").isNotNull()
-    cols = ["silver_query_id", "silver_batch_id", "event_id", "event_time", "kafka_timestamp"]
+    cols = ["silver_query_id", "silver_batch_id", "event_id", "event_time", "kafka_timestamp",
+            F.col("bronze_ingest_time").alias("ingest_time")]       # D3.7 rule needs it
     inserted = (silver.select(*cols).unionByName(late.select(*cols))
                 .withColumn("c_us", _clamped_us(keyed))
                 .groupBy("silver_query_id", "silver_batch_id").agg(F.max("c_us").alias("rows_max")))

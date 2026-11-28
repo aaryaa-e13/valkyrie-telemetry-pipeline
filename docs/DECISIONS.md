@@ -1835,3 +1835,32 @@ Plan `docs/plans/phase3-slice2-plan.md`, approved with these decisions:
 3. **Growth is compared within one target only.** Report the container-peak growth for
    smoke-bad runs 1 → 2 → 3, with no verdict. Run 4 is a different target (`make smoke`),
    so 3 → 4 cannot be judged. This replaces plan section 9.3's "growth for run 3 → 4".
+
+**Condition 1 failed, then decided (2026-11-28): m_k skips rows past the S1 tolerance.**
+- **What failed:** the condition 1 test, in backfill. A `future_time` row (+24 h) is keyed,
+  so it counted in m_k, clamped to its Kafka time. In backfill that is the send time,
+  after every event of the run. m_k moved by up to 2 min and the wm by 2 min (slice 2
+  report, section 1). Realtime passed only because of its data.
+- **Decision (project owner, option 1 narrowed):** a keyed row with
+  `event_time > ingest_time + 5 min` (the S1 condition, D1.13) **never counts in m_k,
+  whatever its class**: accepted, flagged or rejected. Every other D2.4/D3.4 m_k rule
+  stays: keyed rows only, rejected keyed rows still count, NULL Kafka time never counts,
+  and the clamp to the Kafka time stays.
+- **Why it is safe:**
+  - D3.4 counted rejected rows only to keep D2.4/D2.5 unchanged ("the clamp bounds the
+    effect of a bad row", plan 1.5). In backfill the clamp does not bound it.
+  - D2.4's "same wm on replay" holds: the condition reads only stored bronze columns
+    (`event_time`, `ingest_time`) and a constant (`FUTURE_TOLERANCE_S` = 300). It does
+    not depend on the rules version.
+  - Live bronze had 0 such rows (read-only count, 9,549 keyed rows). Recorded control
+    rows and live routing do not change.
+- **Where:**
+  - the job: `streaming/silver.py` `beyond_future_tolerance` and `clamped_event_time`;
+  - verify, written again: `_clamped_us`, used by R6d and the isolation gate. R6d reads
+    `bronze_ingest_time` from silver/late.
+- **Tests:**
+  - condition 1, now also "the same good rows are routed to late";
+  - a boundary test: +5 min counts, +5 min 1 ms never, for accepted, flagged and
+    rejected rows;
+  - a pin: the exclusion equals the S1 flag on every three-way case;
+  - an isolation case in `test_verify_oracle.py`.

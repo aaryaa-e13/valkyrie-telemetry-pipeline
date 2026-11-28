@@ -212,15 +212,29 @@ class BatchCounts:
         return self.keyed_rows - self.keyed_unique
 
 
+def beyond_future_tolerance() -> Column:
+    """event_time > ingest_time + FUTURE_TOLERANCE_S: the S1 condition (D1.13), NULL-safe.
+
+    The same expression as gates' S1 flag (pinned by tests/spark/test_dlq_oracle.py).
+    """
+    return F.coalesce(F.col("event_time") > F.col("ingest_time")
+                      + F.expr(f"INTERVAL {gates.FUTURE_TOLERANCE_S} SECONDS"), F.lit(False))
+
+
 def clamped_event_time() -> Column:
     """least(event_time, kafka_timestamp) for keyed rows with a Kafka time, else NULL.
 
     The explicit NULL check matters: least() SKIPS NULL arguments (pinned in
     tests/spark/test_late_routing.py), so least(t, NULL) would be the unclamped t.
     A row without a Kafka time therefore never feeds the watermark.
+
+    D3.7: a keyed row past the S1 future tolerance never feeds it either, whatever its
+    class. In backfill its Kafka time (the send time) is after every event of the run,
+    so the clamp alone would push the wm ahead of the good rows.
     """
     kts = F.col("kafka_timestamp")
-    return F.when(key_ok() & kts.isNotNull(), F.least(F.col("event_time"), kts))
+    return F.when(key_ok() & kts.isNotNull() & ~beyond_future_tolerance(),
+                  F.least(F.col("event_time"), kts))
 
 
 def batch_counts(df: DataFrame) -> BatchCounts:
