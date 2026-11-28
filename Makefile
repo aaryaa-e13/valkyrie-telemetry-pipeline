@@ -24,7 +24,7 @@ dirs: ## Create bind-mount folders owned by you (Docker would create them as roo
 
 .PHONY: help env up down ps logs topics describe-topic venv sim-dry sim-local sim-tiny sim \
 	sim-realtime sim-late timing-check consume test-unit lint spark-build spark-image spark-up \
-	spark-stop spark-logs verify test-spark test-spark-fast demo smoke smoke-dupes e2e-images smoke-restart smoke-late smoke-faults faults-config-check \
+	spark-stop spark-logs verify test-spark test-spark-fast demo smoke smoke-dupes e2e-images smoke-restart smoke-late smoke-bad smoke-faults faults-config-check \
 	delta-compat jars-lock
 
 help: ## List available targets
@@ -205,6 +205,9 @@ smoke-restart: dirs up e2e-images ## Graceful stop/restart: no re-read, no skip 
 
 smoke-late: dirs up e2e-images ## Realtime run with late events, judged by R1-R6 (~7-9 min)
 	$(PY) -m e2e.smoke_late $(E2E_ARGS)
+
+smoke-bad: dirs up e2e-images ## Backfill run with ~20 % bad data: every gate H1-H10, S1-S4 must fire (~3 min)
+	$(PY) -m e2e.smoke_bad $(E2E_ARGS)
 
 smoke-faults: dirs up e2e-images ## SIGKILL silver at each write boundary + bronze, restart, judge (~45 min; one point ~10)
 	$(PY) -m e2e.smoke_faults $(E2E_ARGS)

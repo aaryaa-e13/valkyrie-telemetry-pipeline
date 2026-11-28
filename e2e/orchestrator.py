@@ -62,6 +62,8 @@ MODES: dict[str, dict[str, Any]] = {
     # Used by e2e.smoke_late (realtime, ~5-7 min of sending); the timeout counts from
     # the end of the send, so 180 s is generous.
     "late": {"config": "simulator/config.late.yaml", "timeout": 180.0, "matches": None},
+    # Used by e2e.smoke_bad (backfill, about 240 events with about 20 % bad, D3.7).
+    "bad": {"config": "simulator/config.bad.yaml", "timeout": 120.0, "matches": None},
 }
 
 
@@ -342,7 +344,12 @@ def summarize_verify(report: dict[str, Any]) -> dict[str, Any]:
     out["silver"]["dlq"] = {   # Phase 3: good data must give 0 DLQ rows for the run
         "verdicts": dl.get("verdicts"), "dlq_rows_for_run": dl.get("dlq_rows_for_run"),
         "dlq_total_rows": dl.get("dlq_total_rows"), "phase3_batches": dl.get("phase3_batches"),
-        "cut": dl.get("cut")}
+        "cut": dl.get("cut"),
+        # slice 2: R11 / R14 counts for every smoke (verdicts above carry R10c/d too)
+        "r11": {k: (dl.get("r11") or {}).get(k) for k in (
+            "checkable", "reason", "bronze_rows", "recomputed_rejections")},
+        "r14": {k: (dl.get("r14") or {}).get(k) for k in (
+            "checkable", "reason", "stranded_ids", "counter_dup_of_dlq")}}
     return out
 
 
